@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 # Make code_map importable regardless of pytest's cwd.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
 
 import pytest
 

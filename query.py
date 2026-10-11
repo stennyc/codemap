@@ -1,4 +1,4 @@
-"""query.py — code_map_query tool handler (L1.5 cross-file symbol location).
+"""query.py — code_map tool handlers (L1.5 cross-file symbol location).
 
 Gate 10 + owner rule (2026-10-11): a root is only valid if it is
 confirmed in the registry (rootreg). Root and path are separate
@@ -10,12 +10,100 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import PAGE_BUDGET_BYTES, PAGE_MAX_SYMBOLS, root_db_path
+from .config import PAGE_BUDGET_BYTES, PAGE_MAX_SYMBOLS, data_dir, root_db_path
 from .db import init_db, query_symbols, stale_paths
 from .fingerprint import diff_indexed, invalidate_cache, on_disk_files
 from . import rootreg
+
+# ── transcript 兜底 (Q3, owner policy 2026-10-11) ─────────────────────────
+# 宿主 clarify 工具是原生单选卡；其应答在 transcript（session 持久层）里
+# 留痕。插件侧没有宿主 UI 通道，"用户点头"的权威记录就是 evidence log：
+#   1. 模型在 code_map 目标上发起宿主 clarify 时，post_tool_call hook
+#      （on_clarify_post，见 hook.py）把 (目标, 用户应答, 时间) 追加进
+#      data_dir()/_clarify_evidence.jsonl —— 这是"transcript"里插件可
+#      信、可审计的那份留痕（session DB 属宿主，插件不直接读）。
+#   2. code_map_check_root(yes=true) 前扫描该 log：同一目标存在肯定应答
+#      才放行 build，并把证据写进 audit jsonl（transcript_evidence 字段）；
+#      否则 fail-closed 拒绝（blocked_by_policy），指引"先 clarify 再
+#      yes=true"。382k-file 事故的同类风险面由此闭环。
+_EVIDENCE_FILE = "_clarify_evidence.jsonl"
+
+# 宿主单选卡应答的肯定词面（clarify choices 约定：确认保存/确认/yes/...）。
+# 保守匹配：只有明确肯定词才放行，含糊/否定/其他一律视为无证据（fail-closed）。
+_AFFIRMATIVE = ("确认", "确认保存", "同意", "批准", "可以", "好", "好的", "行",
+                "动手", "yes", "y", "ok", "okay", "approve", "approved", "go")
+
+
+def _evidence_log() -> Path:
+    return data_dir() / _EVIDENCE_FILE
+
+
+def _is_affirmative(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # 多词面：整串命中，或作为独立词命中（防 "不确认" 里带 "确认" 的误放行）
+    for w in _AFFIRMATIVE:
+        if t == w.lower():
+            return True
+    # 短应答（单选卡点选）整串比较已覆盖；其余自由文本不猜。
+    return False
+
+
+def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, Any]]:
+    """Latest transcript evidence that the user affirmatively confirmed
+    THIS exact target via the host clarify tool. Returns the evidence
+    record (with ts + user response) or None (no/affirmative-missing).
+    Fail-soft: a missing/corrupt log -> None (fail-closed at the gate)."""
+    target = os.path.abspath(target)
+    best: Optional[Dict[str, Any]] = None
+    log = _evidence_log()
+    if not log.exists():
+        return None
+    try:
+        for line in log.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("target") != target:
+                continue
+            if not rec.get("affirmative"):
+                continue
+            # Newest first wins (ts is host-local ISO from the hook).
+            if best is None or str(rec.get("ts", "")) >= str(best.get("ts", "")):
+                best = rec
+    except OSError:
+        return None
+    return best
+
+
+def record_clarify_evidence(target: str, user_response: str,
+                            ts: Optional[str] = None) -> None:
+    """Append one clarify-evidence record (called by the post_tool_call
+    hook for host clarify calls). Appends ONLY — the gate reads newest.
+    Fail-soft: a log write hiccup must never break a tool call."""
+    if not target:
+        return
+    rec = {
+        "ts": ts or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "target": os.path.abspath(target),
+        "user_response": (user_response or "")[:400],
+        "affirmative": _is_affirmative(user_response or ""),
+    }
+    try:
+        log = _evidence_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _invalid(note: str, limit: int) -> str:
@@ -209,13 +297,41 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             "note": "dry-run: nothing indexed. Pass yes=true to build.",
         }, ensure_ascii=False)
 
+    # ── transcript 兜底（Q3, owner 定：模型推 clarify，transcript 兜底）──
+    # 宿主 clarify 工具是原生单选卡，_sum_clarify 在 context_compressor 里
+    # 保证 clarify 的问答对（user_response）压缩后仍留痕。插件侧没有宿主
+    # UI 通道，"用户点头"的权威记录就是 transcript 里那次 clarify 的应答。
+    # 所以 yes=true 前先做 transcript 扫描：
+    #   本会话对同一 target 存在一条 clarify 记录、且用户应答是肯定的
+    #   （yes/confirm/approve 等；宿主应答文本在 transcript 里可检索）
+    #   → 放行 build，并把该证据写进 audit jsonl（transcript_evidence 字段）。
+    #   找不到肯定应答 → 拒绝 build，返回 blocked_by_policy + 明确的
+    #   "先 clarify 再 yes=true" 指引。这是 fail-closed：宁可挡一次 build，
+    #   不放行一个没有用户点头的 confirm（382k-file 事故的同类风险面）。
+    evidence = _clarify_evidence(target, root, path)
+    if evidence is None:
+        return json.dumps({
+            "status": "blocked_by_policy",
+            "root": target,
+            "note": ("yes=true requires a prior user confirmation for this "
+                     "exact target. Call code_map_check_root (dry-run) and "
+                     "ask the user via the host `clarify` tool first; the "
+                     "user's affirmative reply is the transcript evidence "
+                     "this gate accepts. (Owner policy 2026-10-11: 模型推 "
+                     "clarify, transcript 兜底.)"),
+            "next": "code_map_check_root(root, path) + clarify, then yes=true",
+        }, ensure_ascii=False)
+
     # Confirm-gated build
     from .state import confirm_root
     res = confirm_root(root, path)
     if res.get("status") != "build_started":
         return json.dumps(res, ensure_ascii=False)
 
-    # Audit trail (Step 3, mandatory on every successful confirm)
+    # Audit trail (Step 3, mandatory on every successful confirm). The
+    # transcript evidence (which clarify reply justified this build) is
+    # written INTO the audit line, so a later reviewer can replay the
+    # confirmation chain from data/confirm_root_log.jsonl alone.
     digest = hashlib.sha1(target.encode("utf-8")).hexdigest()[:16]
     log_path = data_dir() / "confirm_root_log.jsonl"
     with open(log_path, "a") as f:
@@ -226,6 +342,7 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             "boundary": root, "rel_path": path,
             "files_indexed": len(indexable),
             "db_path": f"{digest}.db",
+            "transcript_evidence": evidence,
         }) + "\n")
 
     res["files_indexed"] = len(indexable)

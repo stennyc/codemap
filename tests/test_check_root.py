@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
 
 import pytest
 
@@ -79,13 +79,31 @@ def test_check_root_default_is_dry_run(monkeypatch):
 
 
 def test_check_root_yes_writes_audit_and_builds(monkeypatch):
-    """yes=True must call confirm_root and append exactly one audit line."""
+    """yes=True must call confirm_root and append exactly one audit line.
+
+    Q3 gate (owner policy 2026-10-11): a yes=true build is only released
+    when the transcript has an affirmative clarify reply FOR THIS TARGET.
+    The test plays the host: record the evidence the way the
+    post_tool_call hook does (the model's clarify call, user said 确认),
+    then the gate must pass and the audit line must carry the evidence."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
     _cleanup(_mk_home("apply"), _mk_proj("apply"))
     home = _mk_home("apply")
     monkeypatch.setenv("HERMES_HOME", str(home))
     proj = _mk_proj("apply")
     (proj / "a.py").write_text("def fa(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
 
+    # No evidence yet -> the gate must REFUSE (fail-closed).
+    res0 = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res0["status"] == "blocked_by_policy", res0
+    assert len(_audit_lines(home)) == 0, "refused build writes no audit line"
+
+    # The model asked the user (host clarify) and the user said 确认 ->
+    # the host hook records it. Then the gate passes.
+    record_clarify_evidence(str(proj), "确认")
     res = json.loads(code_map_check_root(
         {"root": "/tmp", "path": proj.name, "yes": True}))
     assert res["dry_run"] is False
@@ -98,6 +116,10 @@ def test_check_root_yes_writes_audit_and_builds(monkeypatch):
     assert line["root"] == str(proj)
     assert line["files_indexed"] == 1
     assert "ts" in line and "db_path" in line
+    # Q3: the audit line now carries the transcript evidence that
+    # justified the build.
+    assert "transcript_evidence" in line
+    assert line["transcript_evidence"]["affirmative"] is True
 
     _cleanup(home, proj)
 
@@ -114,6 +136,111 @@ def test_check_root_gate_invalid_pair_refused_even_with_yes(monkeypatch):
     assert audit == [], "refused pair must not write audit"
 
     _cleanup(home)
+
+
+# ── Q3 transcript gate (owner policy 2026-10-11) ──────────────────────────
+
+def test_check_root_blocked_by_policy_without_clarify_evidence(monkeypatch):
+    """yes=true with NO clarify evidence for the target -> blocked.
+
+    This is the fail-closed half: a build the user never explicitly
+    confirmed (no clarify reply in the transcript) must not start, even
+    though the pair passes gate 10 and the target is a valid dir."""
+    from code_map import rootreg
+    home = _mk_home("q3blocked")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3blocked")
+    (proj / "a.py").write_text("def fa(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+    assert "clarify" in res["note"], res["note"]
+    # a blocked build must NOT have started a background build and must
+    # NOT have written an audit line (nothing was confirmed).
+    assert len(_audit_lines(home)) == 0
+
+    # The dry-run path is UNCHANGED by the gate (it never builds): it must
+    # still work with no evidence.
+    dry = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name}))
+    assert dry["dry_run"] is True and dry["files_indexable"] == 1
+
+    _cleanup(home, proj)
+
+
+def test_check_root_rejects_non_affirmative_reply(monkeypatch):
+    """A clarify reply that is NOT an explicit yes (e.g. '再想想' / a
+    refusal) must NOT count as evidence — the gate stays blocked
+    (conservative: only affirmative words unlock a build)."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
+    home = _mk_home("q3neg")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3neg")
+    (proj / "a.py").write_text("def fa(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    record_clarify_evidence(str(proj), "再想想，先不动手")
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+
+    # A later affirmative reply for the SAME target unlocks it.
+    record_clarify_evidence(str(proj), "确认")
+    res2 = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res2["status"] == "build_started", res2
+    assert len(_audit_lines(home)) == 1
+
+    _cleanup(home, proj)
+
+
+def test_clarify_hook_records_evidence_for_mentioned_target(monkeypatch):
+    """The post_tool_call hook records a host clarify call as transcript
+    evidence ONLY when the question mentions a confirmed target path and
+    the reply is affirmative — the join key that lets a later yes=true
+    build know which target the user approved."""
+    from code_map import hook, rootreg
+    from code_map.query import _evidence_log
+    home = _mk_home("q3hook")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3hook")
+    (proj / "a.py").write_text("def fa(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+    target = str(proj)
+
+    # A clarify that does NOT mention any confirmed target -> no record.
+    hook._post_tool_call("clarify",
+                         {"question": "要装个新插件吗？", "choices": ["装", "不装"]},
+                         result=json.dumps({"response": "装"}), status="ok")
+    assert not _evidence_log().exists(), "non-target clarify records nothing"
+
+    # A clarify that mentions the target but the user declines -> recorded,
+    # but as a NON-affirmative record (the gate still blocks).
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index {target} 吗？", "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": "取消"}), status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    assert len(recs) == 1 and recs[0]["target"] == target
+    assert recs[0]["affirmative"] is False
+
+    # ... and an affirmative one -> affirmative=True, which the gate accepts.
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index {target} 吗？", "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": "确认"}), status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    assert recs[-1]["affirmative"] is True
+
+    # A FAILED/cancelled clarify call must NOT be recorded as consent.
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index {target} 吗？"},
+                         result=json.dumps({"response": "确认"}), status="error")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    assert len(recs) == 2, "an errored clarify is not evidence"
+
+    _cleanup(home, proj)
 
 
 if __name__ == "__main__":

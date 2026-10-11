@@ -14,12 +14,9 @@ from pathlib import Path
 
 import pytest
 
-# Plugin dir on sys.path — mirrors the other code_map tests EXACTLY: they
-# insert ONLY the plugins dir (the code_map package's parent), so `code_map`
-# resolves as a regular package from a single location.
-_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-if str(_PLUGIN_ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_ROOT.parent))
+# Unified sys.path bootstrap via the package __init__ (works from any
+# checkout location — the real profile path, a git worktree, anywhere):
+import code_map.tests  # noqa: F401
 
 # e-1 hygiene: per-test /var/tmp/cm_hooks_* seed bases, cleaned up by the
 # autouse fixture's teardown (one base registered per test, LIFO == that

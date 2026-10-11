@@ -18,7 +18,7 @@ import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
 
 import pytest
 

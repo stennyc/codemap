@@ -25,6 +25,7 @@ never block the tool result from reaching the LLM):
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -60,6 +61,66 @@ _WRITE_TOOLS = ("write_file", "patch")
 
 # ── write/patch side: synchronous single-file reindex (件 1) ────────────────
 
+def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
+    """Record a host clarify call as transcript evidence for the code_map
+    target it asked about (Q3, owner policy: 模型推 clarify, transcript 兜底).
+
+    Shape (verified against the host clarify tool):
+      args: {"question": "...", "choices": [...]}  — the question is
+            REQUIRED to mention the code_map target (the policy text
+            instructs the model to phrase it as: "要 index <target> 吗？"
+            so the target path is in the question).
+      result: the user's reply (a choice label or free text), possibly
+            JSON-encoded depending on the host renderer.
+
+    Only successful clarify calls are recorded (a cancelled/errored one is
+    NOT evidence the user consented). The target is extracted from the
+    question via the confirmed-target registry: the question must mention
+    a path that lies under a confirmed target — that is the join key
+    between "this clarify" and "that later code_map_check_root(yes=true)".
+    Fail-soft: any parse hiccup -> no record, never breaks the tool call.
+    """
+    if status is not None and str(status).lower() not in ("ok", "success", "completed"):
+        return
+    try:
+        q = (args or {}).get("question") if isinstance(args, dict) else None
+        if not q:
+            return
+        # The user's reply: result is the tool's result payload (str or
+        # JSON str). Extract the reply TEXT (not its JSON encoding) so the
+        # affirmative match sees "确认", not the quoted '"确认"'.
+        reply = ""
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except ValueError:
+                parsed = result
+            if isinstance(parsed, dict):
+                reply = str(parsed.get("response", ""))
+            elif isinstance(parsed, list) and parsed:
+                reply = str(parsed[0])
+            else:
+                reply = str(parsed)
+        elif isinstance(result, dict):
+            reply = str(result.get("response", ""))
+        if not reply:
+            return
+        # Join key: which confirmed target does the question ask about?
+        # The question must contain the target's path verbatim (policy:
+        # "把目标写进 clarify 的问题里"). Longest match wins.
+        best: Optional[str] = None
+        for target in rootreg.confirmed_targets():
+            if target and target in q:
+                if best is None or len(target) > len(best):
+                    best = target
+        if best is None:
+            return
+        from .query import record_clarify_evidence
+        record_clarify_evidence(best, reply)
+    except Exception as exc:
+        _log.debug("code_map clarify evidence record fail-soft: %s", exc)
+
+
 def _post_tool_call(tool_name: str = "", args: Any = None,
                     result: Any = None, **_: Any) -> Optional[str]:
     """post_tool_call dispatcher.
@@ -73,6 +134,13 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
     callers that don't pass status).
     """
     try:
+        # Q3 transcript 兜底：宿主 clarify 工具的一次调用 = "用户被问到且
+        # 已应答"的权威 transcript 证据。args 里携带 code_map 目标
+        # （策略文本要求模型把目标写进 clarify 的问题里），result 里是
+        # 用户的应答文本。两者齐全且调用成功才落 evidence log。
+        if tool_name == "clarify":
+            _record_clarify_evidence(args, result, _.get("status"))
+            return None
         if tool_name not in _WRITE_TOOLS:
             return None
         # Success gate (件 1): only reindex a write that actually SUCCEEDED.
@@ -106,7 +174,6 @@ def _maybe_reindex(tool_name: str, args: Any) -> Optional[str]:
     """
     if tool_name not in _WRITE_TOOLS:
         return None
-    # Host tool arg keys: write_file uses `path`; patch uses `path` too
     # (verified against the host tool schemas). The `.get("target")`
     # fallback covers no current host tool and is removed (reviewer F3).
     file_path = (args or {}).get("path")
