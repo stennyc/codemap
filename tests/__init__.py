@@ -1,15 +1,28 @@
 """Tests package for code_map.
 
 Auto sys.path bootstrap: make `code_map` importable regardless of where
-this repo physically lives (the real profile path, a git worktree under a
-scratch dir, or any other checkout location). Search upward from this
-file for a `code_map` package dir and register its PARENT (the plugin
-root, i.e. the dir that contains `code_map/`) on sys.path exactly once.
+this repo physically lives. Each test file inserts the plugin root
+(this file's `parent.parent.parent`, i.e. the dir that physically
+contains `code_map/`) into sys.path inline before importing anything
+from code_map — see the `sys.path.insert` line in every test_*.py.
 
-After importing this package, `import code_map` and
-`from code_map.tests import fixtures` resolve to the SAME physical
-package — the double-module split (tree-sitter grammar cache split) that
-caused the 0-symbol test incident is prevented by this single-root rule.
+This package's `__init__` additionally runs when any test does
+`from code_map.tests import ...` (e.g. `fixtures`); it enforces the
+single-root rule: if the plugin root is already on sys.path it does
+nothing, otherwise it inserts it — preventing a second `code_map`
+module object (the tree-sitter grammar-cache split that caused the
+0-symbol test incident).
+
+Known layout boundary (reviewer defect 2026-10-11 #3):
+  - `parent.parent.parent` works when the repo physically sits at
+    <plugin_root>/code_map (the real profile path: /root/.hermes/plugins).
+  - It does NOT work in a bare `git worktree add <scratch>/cm_vt`
+    checkout, where the repo root IS the code_map package dir and there
+    is no enclosing <plugin_root> level.  In that case `import code_map`
+    cannot resolve at all (the directory is not named `code_map`), and
+    the test suite cannot run without first creating a symlink
+    `<scratch>/code_map -> cm_vt` or installing with `pip install -e`.
+    This is a directory-naming constraint, not a code bug.
 """
 from __future__ import annotations
 

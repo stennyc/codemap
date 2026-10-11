@@ -7,16 +7,16 @@ dirty flags, heal attempts, per-root dbs) is fully isolated from the live
 production data.
 """
 import os
-import sys
 import json
 import shutil
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # 自适应 bootstrap: plugin 根
 import pytest
 
 # Unified sys.path bootstrap via the package __init__ (works from any
 # checkout location — the real profile path, a git worktree, anywhere):
-import code_map.tests  # noqa: F401
 
 # e-1 hygiene: per-test /var/tmp/cm_hooks_* seed bases, cleaned up by the
 # autouse fixture's teardown (one base registered per test, LIFO == that

@@ -6,13 +6,14 @@ Run from /root/.hermes/plugins/ (shared conftest/pytest root), per standing rule
 from __future__ import annotations
 
 import os
-import sys
 import time
+import sys
 from pathlib import Path
 
 # Make code_map importable regardless of pytest's cwd.
-import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # 自适应 bootstrap: plugin 根
 import pytest
 
 from code_map.parser import parse_bytes, available_for

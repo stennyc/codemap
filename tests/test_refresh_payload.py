@@ -13,8 +13,9 @@ import json
 import sys
 from pathlib import Path
 
-import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # 自适应 bootstrap: plugin 根
 import pytest
 
 from code_map.query import code_map_refresh
