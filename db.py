@@ -6,6 +6,7 @@ hook/refresh path commits per file (gate ⑦ semantics preserved).
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -81,14 +82,21 @@ def query_symbols(conn: sqlite3.Connection, root: str,
                   kind: Optional[str] = None,
                   limit: int = 200,
                   offset: int = 0) -> list:
+    """Query symbol rows for `root`. `path` must be an ABSOLUTE file path —
+    it matches EXACTLY one indexed file (the symbols table stores absolute
+    paths, see insert_symbols / _reindex_single_file_sync). A relative or
+    suffix-style path used to under-match or over-match sibling files with
+    the same basename (the b-1 attach contamination: `__init__.py` pulled
+    in every subpackage's __init__ symbols); exact match removes both.
+    """
     query = "SELECT root, path, name, kind, line, sig FROM symbols WHERE root = ?"
     params: list = [root]
     if name:
         query += " AND name = ?"
         params.append(name)
     if path:
-        query += " AND path LIKE ?"
-        params.append(f"%{path}")
+        query += " AND path = ?"
+        params.append(os.path.abspath(path))
     if kind:
         query += " AND kind = ?"
         params.append(kind)

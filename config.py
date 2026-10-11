@@ -65,10 +65,48 @@ ROOT_MARKERS = (
     "CMakeLists.txt",
 )
 
+# Gate ⑩ (entry-legality, new): hard-refuse these as `confirm_root`/
+# `refresh_root` inputs. A root at or under any of these is a whole-
+# filesystem / home-dir level, not a project root — the 2026-10-10
+# `/root` mis-confirm (382k files, 4.2GB db) is the recorded incident that
+# motivated this constant.
+BLOCKED_ROOT_PREFIXES = ("/", "/root", "/home", "/usr", "/etc", "/opt")
+
 # SQLite tuning (contract ⑦): WAL + busy_timeout + per-file single-writer lock.
 WAL_BUSY_TIMEOUT_MS = 5000
 # Tier-1 save-hook debounce: agent writes N files in a burst -> one parse job.
 HOOK_DEBOUNCE_S = 0.25
+
+# Read-side auto map-attach (code_map auto-indexing, owner 2026-10-11):
+# when read_file/search_files lands on a source file UNDER a confirmed target,
+# the result is auto-augmented with that file's own symbol outline (top
+# READ_SELF_SYMBOLS) + its cross-file import edges (top READ_IMPORT_EDGES),
+# so the model gets project-aware context without a separate code_map_query
+# round-trip. Triggers ONLY for extensions in INDEXED_EXTENSIONS that are
+# actually source (not .md/.json/.lock/binary). Total attached payload is
+# capped at READ_SYMBOL_MAX_BYTES (~375 tokens) so the hot path never bloats.
+READ_SELF_SYMBOLS = 30
+READ_IMPORT_EDGES = 8
+READ_SYMBOL_MAX_BYTES = 1500
+# 件3 review fix (reviewer F1/F2, 2026-10-11): the hot-path dirty heal runs a
+# FULL rebuild of the target (state._run_build — walk + parse). The host's
+# transform_tool_result / post_tool_call are in _HOOK_TIMEOUT_BOUNDED_HOOKS
+# (default 30s, fail-open skip + 60s suppression). A full rebuild on a LARGE
+# target (reviewer measured 28.9s for 30k files cold) exceeds that budget and
+# gets the hook skipped, leaving the worker abandoned mid-build AND the dirty
+# stamp uncleared -> every subsequent read re-triggers a full rebuild. The
+# two guards below bound this:
+# - READ_HEAL_MAX_FILES: only attempt the sync heal when the target's current
+#   index has <= this many files (the ms-scale regime the design comment
+#   assumes). Above the threshold, skip the heal, attach from the STALE db
+#   as-is, and CLEAR the dirty stamp so reads stop hammering full rebuilds.
+READ_HEAL_MAX_FILES = 2000
+# - READ_HEAL_MAX_ATTEMPTS: give up on the stamp after N consecutive failed
+#   heals (corrupt db / lock). Without this, a persistently failing rebuild
+#   turns every source-file read into a full-walk attempt. After the cap the
+#   target stays dirty (code_map_refresh can still clear it on demand); reads
+#   just stop trying.
+READ_HEAL_MAX_ATTEMPTS = 3
 
 # Build-path commit batching (gate ① wall-time fix). The build loop upserts
 # files with the NO-COMMIT variant and issues one WAL commit per this many
@@ -81,7 +119,18 @@ BUILD_COMMIT_BATCH = 32
 
 
 def data_dir() -> Path:
-    """Where per-root SQLite DBs live. Honors HERMES_HOME so tests isolate."""
+    """Where per-root SQLite DBs live. Honors HERMES_HOME so tests isolate.
+
+    NOTE (F7a / concurrency harden): every host/profile process MUST resolve
+    this to the SAME physical directory — the cross-process write lock
+    (fcntl.flock on data/_proc.lock) only works if the lock file itself is
+    a single physical file shared by all writers. The deploy hardlinks the
+    profile-specific `plugins/code_map/data` path onto a shared physical dir;
+    register() (in __init__.py) writes data/_data_dir_fingerprint (dev/ino)
+    on every startup and warns LOUDLY if the physical identity has changed
+    since the last register. A broken hardlink (e.g. a copy instead of a
+    link) silently defeats the whole lock scheme — that warning is the
+    deploy's only alarm."""
     home = os.environ.get("HERMES_HOME")
     if home:
         base = Path(home)

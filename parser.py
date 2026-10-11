@@ -22,6 +22,13 @@ Kinds emitted (per-language):
 No LSP: names are emitted as-is. Reverse-references elsewhere resolve by
 symbol NAME only (alias-import, overloads, dynamic dispatch are NOT
 disambiguated — the L1.5 honest upper bound, disclosed in payloads).
+
+L2 addition: call-site edges.  `kind="call_site"` rows record every bare
+call expression (``lhs(...)``) and method/qualified call (``receiver.lhs(...)``)
+so that "who calls X" is answerable by symbol-name lookup, not just by import
+edges.  This is a NAME-level approximation (same class of approximation as
+the import rows — alias-shadowing and dynamic dispatch are not disambiguated)
+and is disclosed in the query payload alongside the L1.5 disclosure line.
 """
 from __future__ import annotations
 
@@ -152,11 +159,87 @@ def _extract_name(child) -> Optional[str]:
     return None
 
 
+def _call_site_row(node, in_class: bool, lang: str) -> Optional[SymbolRow]:
+    """Extract a call_site row from a call-ish node, or None.
+
+    Rule: take the LAST identifier-type child of the LHS ("function"/"name"
+    field, or the node itself for java/dart) — this is the called symbol name
+    for both bare calls (`g()`) and receiver-qualified calls (`obj.m()` →
+    "m", `std::puts()` → "puts", `System.out.println()` → "println").  Pure
+    NAME-level; receiver/namespace qualification is not resolved into a
+    fully-qualified symbol, matching the import-row approximation class.
+
+    Dart has no call-named node: a call sits under an `expression_statement`
+    as `identifier + selector(argument_part)`, handled in its own branch.
+    """
+    if lang == "dart":
+        # expression_statement wraps: identifier (base) + selector
+        #   (unconditional_assignable_selector `.m` + argument_part `(args)`)
+        # A row is emitted only when a `(` argument_part is actually present,
+        # i.e. `g(1)` / `obj.m(2)` — a bare `obj.m` selector without args is
+        # not a call and yields no row.
+        base_name = None
+        has_args = False
+        for sub in node.children:
+            if sub.type == "identifier":
+                base_name = sub.text.decode("utf-8", "replace")
+            elif sub.type == "selector":
+                for ssub in sub.children:
+                    if ssub.type in ("argument_part", "unconditional_assignable_selector"):
+                        has_args = True
+                    if ssub.type == "unconditional_assignable_selector":
+                        # `.m` — the called member name is the last identifier under it
+                        for ssss in ssub.children:
+                            if ssss.type == "identifier":
+                                base_name = ssss.text.decode("utf-8", "replace")
+        if not has_args or base_name is None:
+            return None
+        return (base_name, "call_site", node.start_point[0] + 1, _sig_for(node))
+
+    # python / typescript / javascript / go / rust / c / cpp / java
+    fn = node.child_by_field_name("function")
+    if fn is None:
+        fn = node.child_by_field_name("name")  # java method_invocation
+    if fn is None:
+        return None
+
+    # Collect all identifier-type children, then take the LAST one (the called
+    # name, not the receiver/namespace qualifier).
+    id_children = [c for c in fn.children if c.type in (
+        "identifier", "property_identifier", "field_identifier",
+        "type_identifier", "namespace_identifier", "field_identifier")]
+    if fn.type in ("identifier", "property_identifier", "field_identifier",
+                   "type_identifier"):
+        id_children = [fn]
+    if not id_children:
+        return None
+    nm = id_children[-1].text.decode("utf-8", "replace")
+    if not nm:
+        return None
+    return (nm, "call_site", node.start_point[0] + 1, _sig_for(node))
+
+
 def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -> List[SymbolRow]:
     """Recurse a tree node, emitting symbol rows for the MVP kind set."""
     rows: List[SymbolRow] = []
     for child in node.children:
         ctype = child.type
+        # L2 call-site edges: check before any language-specific dispatch so a
+        # call node inside a block / expression_statement is captured regardless
+        # of surrounding structure.  Dart's call shape has no "call"-named node
+        # (expression_statement + identifier + selector/argument_part), so it is
+        # handled in the `lang == "dart"` branch just below.
+        _call_node_types = (
+            "call",                # python
+            "call_expression",    # typescript, javascript, go, rust, c, cpp
+            "method_invocation",   # java
+        )
+        if ctype in _call_node_types or (lang == "dart" and ctype == "expression_statement"):
+            row = _call_site_row(child, in_class, lang)
+            if row is not None:
+                rows.append(row)
+            continue
+
         # decorated_definition wraps the real def/class; unwrap one level.
         if ctype == "decorated_definition":
             rows.extend(_symbol_rows_from_node(child, in_class, lang))
@@ -260,7 +343,14 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                                 if nm:
                                     rows.append((nm, "import", line, sig))
                 continue
-            if ctype in ("module", "block", "class_body"):
+            if ctype in ("module", "block", "class_body",
+                         "program", "function_body",
+                         "statement_block", "statement_list"):
+                # program/function_body/statement_block/statement_list added for
+                # L2: dart's call-bearing expression_statements sit inside
+                # function_body>block; ts/js call_expressions inside
+                # statement_block; rust call_expressions inside blocks under
+                # source_file (block already covered by L627 fallback).
                 rows.extend(_symbol_rows_from_node(child, in_class, lang))
                 continue
 
@@ -312,7 +402,10 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                         if idents:
                             rows.append((idents[0].text.decode("utf-8"), "type", idents[0].start_point[0] + 1, _sig_for(idents[0])))
                 continue
-            if ctype in ("source_file", "program"):
+            if ctype in ("source_file", "program", "block", "statement_list", "expression_statement"):
+                # block/statement_list/expression_statement added for L2: Go
+                # call_expression nodes sit inside expression_statement inside a
+                # statement_list inside a function body block
                 rows.extend(_symbol_rows_from_node(child, in_class, lang))
                 continue
 
@@ -403,8 +496,9 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                 rows.extend(_symbol_rows_from_node(child, in_class, lang))
                 continue
 
-        # ---- Dart ---- (handled in Python/TS/JS/Java/Dart block above)
-        # Dart uses function_signature + function_body for top-level functions
+        # ---- Dart ---- (call-site rows are emitted by the L2 gate at the top of
+        # the loop for `expression_statement`; the branches below only add the
+        # function_signature/function_body symbol rows that L1.5 already had)
         if lang == "dart" and ctype == "function_signature":
             idents = [c for c in child.children if c.type == "identifier"]
             if idents:
@@ -505,8 +599,11 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                 rows.extend(_symbol_rows_from_node(child, in_class, lang))
                 continue
 
-        # Fallback: recurse into compound nodes
-        if ctype in ("module", "block", "source_file", "program", "body", "declaration_list"):
+        # Fallback: recurse into compound/statement nodes (expression_statement
+        # added for L2: bare call nodes in Python/C-family sit directly under it,
+        # not under a container already listed)
+        if ctype in ("module", "block", "source_file", "program", "body",
+                     "declaration_list", "expression_statement"):
             rows.extend(_symbol_rows_from_node(child, in_class, lang))
 
     return rows

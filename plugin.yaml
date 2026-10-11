@@ -7,5 +7,7 @@ provides_tools:
   - code_map_query
   - code_map_confirm_root
   - code_map_refresh
+  - code_map_check_root
 provides_hooks:
   - transform_tool_result
+  - post_tool_call
