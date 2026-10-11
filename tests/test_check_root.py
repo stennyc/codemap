@@ -49,6 +49,8 @@ def _audit_lines(home: Path) -> list:
 
 def _cleanup(*paths: Path) -> None:
     import shutil
+    from code_map import state as _state
+    _state.join_live_build_threads(timeout=5.0)  # let any in-flight build thread finish before we rmtree its db dir
     for p in paths:
         try:
             shutil.rmtree(p)

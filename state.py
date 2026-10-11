@@ -22,6 +22,39 @@ import logging
 
 _log = logging.getLogger("code_map.state")
 
+# Live fire-and-forget build threads, so callers that need to quiesce a
+# target before e.g. rmtree'ing its db dir can join them (test hygiene;
+# production callers may ignore this list entirely).
+_live_build_threads: "list[threading.Thread]" = []
+_live_threads_lock = threading.Lock()
+
+
+def join_live_build_threads(timeout: Optional[float] = 30.0) -> bool:
+    """Wait for all in-flight fire-and-forget build threads to finish.
+
+    Returns True if every live thread finished within `timeout` seconds
+    (or there were none), False if at least one is still running past
+    the deadline (the caller then proceeds at its own risk — daemon
+    threads will still be reaped at interpreter exit, but any dir/file
+    cleanup racing them may observe partial/leaked paths)."""
+    with _live_threads_lock:
+        threads = [t for t in _live_build_threads if t.is_alive()]
+    for t in threads:
+        t.join(timeout)
+        if timeout is not None:
+            timeout = max(0.0, timeout - 0.1)  # crude budget split
+    with _live_threads_lock:
+        _live_build_threads[:] = [t for t in _live_build_threads if t.is_alive()]
+    return not any(t.is_alive() for t in threads)
+
+
+def _start_build_thread(target: str) -> threading.Thread:
+    t = threading.Thread(target=_safe_run_build, args=(target,), daemon=True)
+    with _live_threads_lock:
+        _live_build_threads.append(t)
+    t.start()
+    return t
+
 
 def _safe_run_build(root: str, on_fail: Any = None) -> bool:
     """Thread-safety wrapper around `_run_build`. Returns True iff the
@@ -39,7 +72,7 @@ def _safe_run_build(root: str, on_fail: Any = None) -> bool:
     read path (reviewer F2)."""
     try:
         _run_build(root)
-        return True
+        ok = True
     except Exception as exc:
         _log.warning("code_map build failed for %s: %s", root, exc)
         if on_fail is not None:
@@ -47,7 +80,19 @@ def _safe_run_build(root: str, on_fail: Any = None) -> bool:
                 on_fail(root)
             except Exception:
                 pass  # a callback hiccup must not mask the original failure
-        return False
+        ok = False
+    finally:
+        # Drop ourselves from the live list once we're done, no matter
+        # what — otherwise _live_build_threads grows unbounded over the
+        # process lifetime (fire-and-forget builds never re-run, so a
+        # dead thread's entry would linger forever).
+        with _live_threads_lock:
+            t = threading.current_thread()
+            try:
+                _live_build_threads.remove(t)
+            except ValueError:
+                pass
+    return ok
 
 
 def _gate10(root: str, path: str) -> Optional[Dict[str, Any]]:
@@ -102,10 +147,7 @@ def confirm_root(root_path: str = "", path: str = "") -> Dict[str, Any]:
     target = rootreg._join_target(root_path, path)
     assert target is not None  # gate returned None (pass) above
     rootreg.write_confirmed_root(target)
-    _build_thread = threading.Thread(
-        target=_safe_run_build, args=(target,), daemon=True
-    )
-    _build_thread.start()
+    _start_build_thread(target)
     return {"root": target, "path": path, "status": "build_started",
             "build_id": str(uuid.uuid4())}
 
@@ -133,8 +175,7 @@ def refresh_root(root_path: str, path: str = "") -> Dict[str, Any]:
         return {"root": target, "status": "invalid",
                 "note": "root not confirmed; call code_map_confirm_root first"}
     invalidate_cache(target)
-    t = threading.Thread(target=_safe_run_build, args=(target,), daemon=True)
-    t.start()
+    _start_build_thread(target)
     # Enrich the return so the caller can verify the refresh WITHOUT a
     # terminal/log tail: db_path is deterministic from the target, and
     # files_indexed is a cheap sqlite COUNT of the current index state
