@@ -153,6 +153,22 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
             return
         from .query import record_clarify_evidence
         record_clarify_evidence(best, reply)
+        # 'Other' free-text correction channel (owner's 2026-10-12 ruling):
+        # the host clarify UI auto-appends an 'Other' free-text row; if the
+        # user's reply TYPES an absolute path that the QUESTION itself did
+        # not mention, that typed path is the user's own explicit consent
+        # to index THAT path — record it as an additional evidence line
+        # (same reply, same ts). Only when the reply is affirmative
+        # (a refusal that mentions a path is not consent to that path, so
+        # this arm is skipped when the reply is negative — see
+        # test_hook_user_negative_reply_mints_no_evidence_even_with_path).
+        from .query import _is_affirmative
+        if _is_affirmative(reply):
+            q_mentions = set(_extract_path_mentions(q))
+            from .query import record_clarify_evidence as _rec
+            for cand in _extract_path_mentions(reply):
+                if cand not in q_mentions:
+                    _rec(os.path.abspath(cand), reply)
     except Exception as exc:
         _log.debug("code_map clarify evidence record fail-soft: %s", exc)
 

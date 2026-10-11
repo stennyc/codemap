@@ -507,5 +507,90 @@ def test_hook_new_path_fallback_never_crosses_unrelated_paths(monkeypatch):
     _cleanup(home, a, b)
 
 
+def test_hook_user_other_free_text_correction_mints_evidence(monkeypatch):
+    """Owner's 2026-10-12 follow-up to the whitelist ruling: the host
+    clarify tool's auto-appended 'Other' free-text row is a real
+    correction channel — if the user types a DIFFERENT absolute path
+    (the correct project root) into that free-text reply, that typed
+    path itself is affirmative consent to index THAT path. The hook
+    must record an evidence line for the user-typed path (on top of the
+    question-mentioned path), so a later
+    code_map_check_root(root=<corrected parent>, path=<corrected name>,
+    yes=true) passes the Q3 gate for the corrected target — not just
+    the footer's originally proposed one."""
+    from code_map import hook, rootreg
+    from code_map.query import _evidence_log
+    home = _mk_home("q3other")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    base = _mk_proj("q3other_base")
+    (base / "a.py").write_text("def fa(): pass\n")
+    # A sibling directory the footer's detect_root would NOT have found:
+    corrected = _mk_proj("q3other_corrected")
+    (corrected / "a.py").write_text("def fc(): pass\n")
+    abs_base = os.path.abspath(str(base))
+    abs_corrected = os.path.abspath(str(corrected))
+    frag = f"{base.parent.name}/{base.name}"
+
+    _evidence_log().unlink(missing_ok=True)
+
+    # Question mentions the base path (footer's proposal); the user, via
+    # the host clarify's auto-appended 'Other' free-text row, replies
+    # with a correction: "yes, but the real root is <abs_corrected>"
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index 一下 {abs_base} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response":
+                                            f"确认，不过根目录其实是 {abs_corrected}"}),
+                         status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    targets = {r["target"] for r in recs}
+    assert abs_base in targets, f"question-mentioned path must still be recorded: {targets}"
+    assert abs_corrected in targets, \
+        f"user's 'Other' free-text correction must ALSO be recorded: {targets}"
+
+    # The corrected target must now unlock a real build (gate passes
+    # without any further clarify round-trip — the user already
+    # consented, in the same reply).
+    res = json.loads(code_map_check_root(
+        {"root": str(corrected.parent), "path": corrected.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    assert rootreg.is_confirmed_root(abs_corrected)
+
+    _cleanup(home, base, corrected)
+
+
+def test_hook_user_negative_reply_mints_no_evidence_even_with_path(monkeypatch):
+    """A user 'Other' free-text reply that REFUSES (哪怕句子里提了路径)
+    must NOT mint evidence: a refusal mentioning a path is not consent
+    to that path."""
+    from code_map import hook
+    from code_map.query import _evidence_log
+    home = _mk_home("q3other_neg")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    base = _mk_proj("q3other_neg_base")
+    (base / "a.py").write_text("def fa(): pass\n")
+    abs_base = os.path.abspath(str(base))
+    other = _mk_proj("q3other_neg_other")
+    abs_other = os.path.abspath(str(other))
+
+    _evidence_log().unlink(missing_ok=True)
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index 一下 {abs_base} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response":
+                                            f"不要，{abs_other} 也不用管"}),
+                         status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()] if _evidence_log().exists() else []
+    # 取消/negative -> no affirmative record for either path
+    for r in recs:
+        assert not r["affirmative"], f"refusal reply must never mint affirmative evidence: {r}"
+    # And specifically, the refused-mentioned path must not be unlockable:
+    res = json.loads(code_map_check_root(
+        {"root": str(other.parent), "path": other.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+
+    _cleanup(home, base, other)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
