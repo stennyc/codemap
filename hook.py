@@ -149,10 +149,17 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
             if cand in q:
                 best = os.path.abspath(cand)
                 break
-        if best is None:
-            return
-        from .query import record_clarify_evidence
-        record_clarify_evidence(best, reply)
+        # RISK #3 fix (reviewer deleg_1993fe7a, 2026-10-12): the host
+        # clarify tool supports OPEN-ENDED questions (no choices, and a
+        # question text that names NO path at all — e.g. "要建
+        # code_map 索引吗？"). If such a question's reply TYPES an
+        # absolute path, that typed path must mint evidence even though
+        # the question arm found no `best` above — previously this whole
+        # block was unreachable (early `return` when `best is None`),
+        # silently dropping the evidence.
+        from .query import _is_affirmative, record_clarify_evidence
+        if best is not None:
+            record_clarify_evidence(best, reply)
         # 'Other' free-text correction channel (owner's 2026-10-12 ruling):
         # the host clarify UI auto-appends an 'Other' free-text row; if the
         # user's reply TYPES an absolute path that the QUESTION itself did
@@ -162,13 +169,11 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
         # (a refusal that mentions a path is not consent to that path, so
         # this arm is skipped when the reply is negative — see
         # test_hook_user_negative_reply_mints_no_evidence_even_with_path).
-        from .query import _is_affirmative
         if _is_affirmative(reply):
             q_mentions = set(_extract_path_mentions(q))
-            from .query import record_clarify_evidence as _rec
             for cand in _extract_path_mentions(reply):
                 if cand not in q_mentions:
-                    _rec(os.path.abspath(cand), reply)
+                    record_clarify_evidence(os.path.abspath(cand), reply)
     except Exception as exc:
         _log.debug("code_map clarify evidence record fail-soft: %s", exc)
 

@@ -244,9 +244,50 @@ def _aff_case(reply: str, expect: bool, monkeypatch, tag: str) -> None:
     ("no, skip it", False),
     ("", False),
     ("随便吧", False),
+    # --- RISK #1 (2026-10-12): 混合 token 碰撞，否定词短路必须拦住 ---
+    ("确认 取消", False),
+    ("yes but no", False),
+    ("好，取消", False),
+    ("确认。取消。", False),
+    ("可以，不过先取消", False),
+    # --- 肯定 + 路径纠正（无否定词）仍放行 ---
+    ("确认，不过根其实是 /x/y", True),
 ])
 def test_check_root_affirmative_wordlist(monkeypatch, reply: str, expect: bool):
     _aff_case(reply, expect, monkeypatch, "aff")
+
+
+def test_open_ended_question_mints_evidence_from_reply_path(monkeypatch):
+    """RISK #3 修复（reviewer deleg_1993fe7a，2026-10-12）：宿主 clarify
+    支持纯开放题（question 不含任何路径，choices 可空）。若用户肯定
+    应答里 typed 了一个全 abspath，该路径必须落成证据——即使 question
+    本身提不到任何 target（现状的 new-path arm 会在 best is None 时
+    提前 return，纠正 arm 永不执行，证据静默丢失）。"""
+    from code_map import hook, rootreg
+    from code_map.query import _evidence_log
+    home = _mk_home("q3open")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3open_proj")
+    (proj / "a.py").write_text("def fo(): pass\n")
+    abs_proj = os.path.abspath(str(proj))
+
+    _evidence_log().unlink(missing_ok=True)
+    # 纯开放题：question 里没有任何路径（连 confirmed target 都没提）
+    hook._post_tool_call("clarify",
+                         {"question": "要建 code_map 索引吗？"},
+                         result=json.dumps({"response":
+                                            f"好，建 {abs_proj}"}),
+                         status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()] if _evidence_log().exists() else []
+    assert any(r["target"] == abs_proj and r["affirmative"] for r in recs), \
+        f"open-ended question + affirmative reply with typed path must mint evidence: {recs}"
+
+    res = json.loads(code_map_check_root(
+        {"root": str(proj.parent), "path": proj.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    assert rootreg.is_confirmed_root(abs_proj)
+
+    _cleanup(home, proj)
 
 
 def test_check_root_gate_passes_on_partial_path_evidence(monkeypatch):

@@ -47,6 +47,31 @@ _TOKEN_RE = re.compile(
     r"[A-Za-z0-9_]+|[\u4e00-\u9fff\u3400-\u4dbf]+"
 )
 
+# RISK #1 (reviewer deleg_1993fe7a, 2026-10-12): mixed-token collision.
+# The token matcher above returns True as soon as ANY affirmative token
+# appears, so "确认 取消" (user typed both, or a copy-paste artifact) was
+# misjudged as consent. A reply that also contains an explicit NEGATIVE
+# token is not a clean yes — short-circuit to False before consulting
+# the affirmative word list. Negatives are matched as whole tokens too
+# (not raw substrings), so "可以" inside "不可以" is already safe via
+# the CJK-run token rule and this list adds the explicit "user said no
+# in the same reply" case.
+# Negative tokens (ASCII) — matched as whole tokens against _TOKEN_RE,
+# same rule as the affirmative list (no raw-substring matching, so "no"
+# inside "non" / "now" never trips it).
+_NEGATIVE_ASCII = frozenset({
+    "no", "nope", "nvm", "not now", "reject", "denied", "deny", "stop",
+    "canc", "cancel",
+})
+# CJK multi-char negation markers — matched as plain substrings of the
+# lowercased text (deliberately NOT whole-token): a CJK run like
+# "不过先取消" or "先不建" hides the marker inside a longer run, and
+# these specific multi-char words are unambiguous enough that a substring
+# hit IS a real negation. Single-char "不" is NOT in this set (too many
+# false-positive substrings: "不行" inside "不太行得通" etc. — keep the
+# token-level CJK guard for that one instead).
+_NEGATIVE_CJK_SUBSTR = ("取消", "拒绝", "不要", "不用", "不建", "不索引", "否决")
+
 # RISK #6 fallback: a clarify question may mention the target by a TRAILING
 # sub-path (>= 2 consecutive path segments) instead of the full abspath;
 # both the hook (record side) and the gate (lookup side) use this rule.
@@ -108,6 +133,16 @@ def _is_affirmative(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
+    # RISK #1 negative short-circuit: an explicit negative in the reply
+    # voids any affirmative in the same reply (mixed-token collision,
+    # e.g. "确认 取消" / "yes but no"). Two matching rules, chosen per
+    # language family (see _NEGATIVE_* comments): ASCII negatives as
+    # whole tokens, CJK multi-char negation markers as plain substrings.
+    if any(marker in t for marker in _NEGATIVE_CJK_SUBSTR):
+        return False
+    tokens = _TOKEN_RE.findall(t)
+    if any(tok in _NEGATIVE_ASCII for tok in tokens):
+        return False
     # Whole-string match (the single-choice-tap case).
     if t in _AFFIRMATIVE:
         return True
@@ -115,7 +150,6 @@ def _is_affirmative(text: str) -> bool:
     # when an affirmative word stands as its own token — never as a raw
     # substring, preserving the "不确认" / "不可以" guard. ASCII tokens are
     # word runs; CJK tokens are single CJK chars/punct runs.
-    tokens = _TOKEN_RE.findall(t)
     return any(tok in _AFFIRMATIVE for tok in tokens)
 
 
