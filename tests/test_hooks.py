@@ -7,6 +7,7 @@ dirty flags, heal attempts, per-root dbs) is fully isolated from the live
 production data.
 """
 import os
+import sys
 import json
 import shutil
 from pathlib import Path

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import code_map.tests  # noqa: F401  (sys.path bootstrap, see tests/__init__.py)
