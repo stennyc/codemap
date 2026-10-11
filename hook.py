@@ -353,66 +353,51 @@ def _unindexed_footer(target: str) -> Optional[str]:
     project. The model decides; the plugin only nudges — no state, no
     auto-inject, exactly like filemem's `_pending_drafts` footer.
 
+    The footer layer deliberately does NO path heuristics of its own
+    (owner's 2026-10-12 ruling: "回归白名单，只有用户通过 clarify 的才
+    进行索引" — revert to a pure whitelist design): index permission is
+    determined SOLELY by the Q3 clarify-evidence gate inside
+    code_map_check_root (fail-closed, evidence log = the whitelist).
+    This footer only proposes a boundary (detect_root or the file's
+    parent dir, whichever contains the target) so the user has something
+    concrete to confirm; whether that proposal is actually permitted to
+    build is the Q3 gate's call, not the footer's.
+
     Returns None (the pre-existing behaviour for this branch) when ANY
-    of these hold — i.e. we do NOT invite an index:
+    of these hold — i.e. we do NOT even nudge:
       - the file is not a source file (extension not in INDEXED_EXTENSIONS
         or it's a binary);
-      - the target lives under a BLOCKED_ROOT_PREFIXES dir (/etc, /usr,
-        /root, /home, /opt, ...) — the same prefixes the 382k-file
-        incident's gate forbids as a confirm root; we must not nudge an
-        index of a whole system/home tree just because someone read a
-        file there;
       - the enclosing project root (marker-detected, or the file's
-        parent dir as a last resort) already has a code_map db record
-        (root_db_path exists) — the project WAS indexed before, just
-        not confirmed under this registry; that's a refresh case, not
-        a "never indexed" case, and the footer would mislead.
+        parent dir as a last resort) is already a confirmed target, or
+        already has a code_map db record — the project WAS indexed before
+        (or is confirmed under this registry); that's a refresh/attach
+        case, not a "never indexed" case, and the footer would mislead.
 
     The footer's `root=`/`path=` split: use `rootdetect.detect_root`
-    (marker-based project root) as the boundary root when it returns a
-    non-BLOCKED dir that actually contains the target; otherwise fall
-    back to the target's immediate parent dir — never a BLOCKED prefix.
-    `path=` is the target's path relative to that chosen root.
+    (marker-based project root) as the boundary root when it actually
+    contains the target; otherwise fall back to the target's immediate
+    parent dir. `path=` is the target's path relative to that chosen
+    root. The footer does not second-guess that choice against
+    BLOCKED_ROOT_PREFIXES — that guard, if any, belongs to the confirm
+    gate, not to a read-side nudge.
     """
-    from .config import INDEXED_EXTENSIONS, BLOCKED_ROOT_PREFIXES, root_db_path
+    from .config import INDEXED_EXTENSIONS, root_db_path
     ext = os.path.splitext(target)[1].lower()
     if ext not in INDEXED_EXTENSIONS or _is_binary(target):
         return None
 
-    # (A read landing UNDER a /root / /home / /usr / /etc / /opt tree is
-    # NOT a reason to skip the footer — every real project under this
-    # host's home dir lives under /root. The BLOCKED-prefix guard applies
-    # to the PROPOSED boundary root below (proj_root), never to the file
-    # path itself: the 382k-file incident was about CONFIRMING a whole
-    # system tree as an index target, not about reading a file that
-    # happens to sit somewhere under it.)
-
-    # Two-step "never indexed" check (owner's exact wording: "还没有它的
-    # 代码地图" = 完全没有 confirm 过 + 数据库没有记录).
     from .rootdetect import detect_root
-    def _is_blocked(d: str) -> bool:
-        return any(d == b or d.startswith(b + os.sep)
-                  for b in BLOCKED_ROOT_PREFIXES if b != "/")
-
     proj_root = detect_root(target)
-    if proj_root is None or _is_blocked(proj_root):
-        # No marker found, OR marker detection climbed up to a BLOCKED
-        # prefix (e.g. /root — nearly universal in this container, since
-        # the host user's whole home tree lives under /root). Fall back
-        # to the file's IMMEDIATE PARENT dir as the smallest sensible
-        # boundary that still "contains the project" without swallowing a
-        # whole system tree. BUT that parent dir is itself almost always
-        # under /root too — so only accept it if it is NOT one of the
-        # BLOCKED prefixes *as a boundary root itself*: i.e. reject only
-        # when the parent dir is EXACTLY /etc, /usr, /opt, /home, or /root
-        # (a whole-system-tree root), not when it merely lives somewhere
-        # under /root (every real user project does; that is fine and is
-        # the whole point of the footer — to invite indexing of a specific
-        # project dir, not the home tree).
+    # detect_root's last-resort fallback is always $HOME (never None),
+    # so it may return a boundary that does NOT actually contain the
+    # target (e.g. reading a file under /etc -> it climbs past / and
+    # falls back to $HOME as the "cap"). Use it only when it truly
+    # encloses the file; otherwise the file's own parent dir is the
+    # honest, smallest boundary that "contains the project".
+    if proj_root is None or not (target == proj_root or target.startswith(proj_root + os.sep)):
         proj_root = os.path.dirname(target)
-        blocked_exactly = {b for b in BLOCKED_ROOT_PREFIXES if b != "/"}
-        if proj_root in ("", os.sep) or proj_root in blocked_exactly:
-            return None  # file sits directly in a BLOCKED dir -> don't nudge
+    if proj_root in ("", os.sep):
+        return None  # target is at the filesystem root itself -> no meaningful boundary
 
     # "还没 confirm 过": the chosen project root (or its containing
     # sub-tree) is not a confirmed target.

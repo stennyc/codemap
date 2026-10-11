@@ -234,52 +234,53 @@ def test_read_non_source_outside_confirmed_target_still_none(tmp_path):
     assert hook._maybe_nudge("read_file", {"path": str(md)}) is None
 
 
-def test_read_system_dir_file_outside_confirmed_target_still_none(tmp_path):
-    """A source file that literally lives at a BLOCKED root prefix itself
-    (i.e. the PROPOSED boundary root would be /etc or similar, not just a
-    file somewhere under a home tree) must still return None — the footer's
-    own guard on `proj_root` (never /etc /usr /opt as the boundary) is what
-    protects against inviting a whole-system-tree index. A file merely
-    *named* like a system path (e.g. <tmp>/etc/x.py) does NOT trip this —
-    it is a normal user file and SHOULD get the footer.
-    """
+def test_read_system_dir_file_outside_confirmed_target_still_footer(tmp_path):
+    """Owner's 2026-10-12 "回归白名单" ruling: the footer layer does NO
+    path heuristics of its own — index permission is decided SOLELY by
+    the Q3 clarify-evidence gate inside code_map_check_root. So a source
+    file that literally sits at a BLOCKED root prefix (/etc/...) now
+    DOES get the footer (previously this returned None via a footer
+    self-guard that the owner ruled over-complex): the footer proposes
+    /etc as the concrete boundary for the user to confirm or reject
+    via clarify; whether that proposal is actually permitted to build
+    is the Q3 gate's call, not the footer's."""
     from code_map import hook
-    import os
-    # A file literally at /etc/... (only reachable when running as root in
-    # this container; the test is written to be safe either way — if we
-    # cannot create the file, the guard is still exercised the same way,
-    # because _unindexed_footer only needs the path string to compute the
-    # proposed proj_root, not for the file to exist on disk).
-    sysfile = "/etc/_cm_test_stub.py"
+    # A file literally at /etc/... (the test only needs the path string —
+    # _unindexed_footer computes its proposed boundary from the path, it
+    # does not require the file to exist on disk).
+    sysfile = "/etc/some_module.py"
     out = hook._maybe_nudge("read_file", {"path": sysfile})
-    # The footer's boundary-root guard must reject this: the only sensible
-    # proj_root for a file at /etc/x.py IS /etc (a BLOCKED prefix), so no
-    # footer should be emitted — regardless of whether the file exists.
-    assert out is None, f"reads at a BLOCKED prefix must not invite an index: {out}"
+    assert out is not None, "blocked-prefix source files must also get the footer now"
+    assert "[code_map]" in out
+    # The proposed boundary must be the file's own parent dir (/etc), not
+    # detect_root's last-resort $HOME fallback (which does not actually
+    # contain a /etc file).
+    assert "root='/etc'" in out, f"footer must propose the file's own parent dir: {out}"
+    assert "path='some_module.py'" in out, f"path must be relative to /etc: {out}"
 
 
-def test_unindexed_footer_root_avoids_blocked_prefixes(tmp_path):
-    """The footer's suggested `root=` must never be a BLOCKED prefix
-    (/, /root, /home, /usr, /etc, /opt) — the owner's Gate-10 rule that
-    motivated the 382k-file incident. For a file whose enclosing project
-    root WOULD be /root (no marker found anywhere up the tree), the
-    footer must fall back to a non-blocked boundary so the confirm call
-    the model makes actually passes the gate."""
+def test_footer_boundary_is_honest_smallest_containing_dir(tmp_path):
+    """For a source file under a dir with no project marker, the footer's
+    proposed `root=` must be the smallest honest boundary that ACTUALLY
+    contains the file — its immediate parent dir — not detect_root's
+    last-resort $HOME fallback (which may not contain the file at all).
+    This is the property that makes a confirm call the user approves on
+    the basis of the footer actually index the right thing."""
+    import os
     from code_map import hook
-    _seed_confirmed(tmp_path, ["e.py"], "def e(): pass\n")
-    # A source file whose path sits directly under a /home-like dir we can
-    # actually create: tmp_path itself is a good stand-in since the test's
-    # 'other/' sibling has no marker and its nearest project-boundary
-    # candidate (the tmp base) is NOT in BLOCKED_ROOT_PREFIXES.
-    deep = tmp_path / "proj_a" / "mod.py"
-    deep.parent.mkdir(parents=True, exist_ok=True)
-    deep.write_text("def f(): pass\n", encoding="utf-8")
-    out = hook._maybe_nudge("read_file", {"path": str(deep)})
-    assert out is not None
-    # The footer must propose a `root=` that is NOT a blocked prefix.
-    assert "root=/" not in out or "root=/" + "root" not in out  # no /root
-    for bad in ("/root", "/home", "/usr", "/etc", "/opt"):
-        assert f"root={bad}" not in out, f"footer must not propose {bad}: {out}"
+    # A file literally under /usr/local (a BLOCKED prefix's SUBTREE —
+    # reviewer N1's case: the old footer self-guard would have proposed
+    # this anyway; the new design has no such guard, and the boundary
+    # must still be honest, i.e. the file's own parent dir).
+    target = "/usr/local/lib/hermes_plugin/stub.py"
+    out = hook._maybe_nudge("read_file", {"path": target})
+    # /usr/local/lib/hermes_plugin does not exist on disk, but
+    # _unindexed_footer only needs the path string (same as the /etc
+    # test above) — no marker will be found, so detect_root's
+    # last-resort fallback is $HOME, which does NOT contain a /usr path;
+    # the footer must fall back to the file's own parent dir.
+    assert out is not None, "out-of-home source files must also get the footer"
+    assert "root='/usr/local/lib/hermes_plugin'" in out, f"boundary must be the file's own parent dir: {out}"
 
 
 # ── 件 3: bounded self-heal (reviewer F1/F2) ────────────────────────────────
