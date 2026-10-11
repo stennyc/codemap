@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,24 +34,74 @@ _EVIDENCE_FILE = "_clarify_evidence.jsonl"
 
 # 宿主单选卡应答的肯定词面（clarify choices 约定：确认保存/确认/yes/...）。
 # 保守匹配：只有明确肯定词才放行，含糊/否定/其他一律视为无证据（fail-closed）。
-_AFFIRMATIVE = ("确认", "确认保存", "同意", "批准", "可以", "好", "好的", "行",
-                "动手", "yes", "y", "ok", "okay", "approve", "approved", "go")
+_AFFIRMATIVE = frozenset({
+    # Chinese
+    "确认", "确认保存", "同意", "批准", "可以", "好", "好的", "行", "动手",
+    "就按这个来",
+    # English (incl. the colloquial forms RISK #5 flagged as missed)
+    "yes", "y", "ok", "okay", "approve", "approved", "go",
+    "sure", "yep", "yeah", "sounds good", "sounds fine", "great", "go for it",
+})
+
+_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9_]+|[\u4e00-\u9fff\u3400-\u4dbf]+"
+)
+
+# RISK #6 fallback: a clarify question may mention the target by a TRAILING
+# sub-path (>= 2 consecutive path segments) instead of the full abspath;
+# both the hook (record side) and the gate (lookup side) use this rule.
+_MIN_PARTIAL_MATCH_SEGMENTS = 2
 
 
 def _evidence_log() -> Path:
     return data_dir() / _EVIDENCE_FILE
 
 
+def _path_segments(target: str):
+    return [s for s in target.replace("\\", "/").split("/") if s]
+
+
+def target_match(question: str, target: str) -> bool:
+    """Does `question` reference `target`?
+
+    Primary: the full abspath appears verbatim (original, strict rule).
+    Fallback (RISK #6): a TRAILING run of >= 2 consecutive path segments of
+    `target` appears contiguously in the question — the realistic case where
+    the model says 'plugins/code_map' instead of the full abspath. A single
+    bare segment is NOT enough (collision-prone: any project named
+    'code_map' would match)."""
+    q = (question or "")
+    t = (target or "").replace("\\", "/")
+    if not q or not t:
+        return False
+    if t in q:
+        return True
+    segs = _path_segments(t)
+    if len(segs) < _MIN_PARTIAL_MATCH_SEGMENTS:
+        return False
+    # A TRAILING run (suffix) of >= _MIN_PARTIAL_MATCH_SEGMENTS consecutive
+    # segments of the target appearing contiguously in the question is enough.
+    # Checked longest-suffix-first; the "last N segments" phrasing is the
+    # realistic model case ('plugins/code_map' for a deep target).
+    for nseg in range(len(segs), _MIN_PARTIAL_MATCH_SEGMENTS - 1, -1):
+        if "/".join(segs[-nseg:]) in q:
+            return True
+    return False
+
+
 def _is_affirmative(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
-    # 多词面：整串命中，或作为独立词命中（防 "不确认" 里带 "确认" 的误放行）
-    for w in _AFFIRMATIVE:
-        if t == w.lower():
-            return True
-    # 短应答（单选卡点选）整串比较已覆盖；其余自由文本不猜。
-    return False
+    # Whole-string match (the single-choice-tap case).
+    if t in _AFFIRMATIVE:
+        return True
+    # Token-boundary match (RISK #5): phrase/paragraph replies count ONLY
+    # when an affirmative word stands as its own token — never as a raw
+    # substring, preserving the "不确认" / "不可以" guard. ASCII tokens are
+    # word runs; CJK tokens are single CJK chars/punct runs.
+    tokens = _TOKEN_RE.findall(t)
+    return any(tok in _AFFIRMATIVE for tok in tokens)
 
 
 def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, Any]]:

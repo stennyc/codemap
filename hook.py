@@ -106,11 +106,15 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
         if not reply:
             return
         # Join key: which confirmed target does the question ask about?
-        # The question must contain the target's path verbatim (policy:
-        # "把目标写进 clarify 的问题里"). Longest match wins.
+        # Rule (shared with the gate-side lookup, RISK #6 fallback): the
+        # question may mention the target verbatim OR by a trailing sub-path
+        # of >= 2 consecutive path segments (e.g. 'plugins/code_map' for a
+        # deep target) — that is enough for the join; a bare single segment
+        # is not. Longest-matching target still wins.
         best: Optional[str] = None
+        from .query import target_match
         for target in rootreg.confirmed_targets():
-            if target and target in q:
+            if target and target_match(q, target):
                 if best is None or len(target) > len(best):
                     best = target
         if best is None:
