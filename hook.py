@@ -311,7 +311,17 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
     confirmed = rootreg.confirmed_targets()
     enclosing = _find_confirmed_root(target, set(confirmed))
     if enclosing is None:
-        return None
+        # Not under any confirmed target. Two sub-cases:
+        #  (a) a source file in a project that HAS never been indexed
+        #      (no db record + target not confirmed) -> the owner-design
+        #      "un-indexed footer": one line pointing the model at the
+        #      host `clarify` tool + code_map_check_root (mirrors
+        #      filemem's draft-decision footer — the model decides, the
+        #      plugin only nudges; no state, no auto-inject).
+        #  (b) a non-source file, or a file under a BLOCKED root prefix
+        #      (/etc, /usr, ...) where we must NEVER invite an index ->
+        #      None, as before.
+        return _unindexed_footer(target)
 
     # Must be a source file (extension in INDEXED_EXTENSIONS) — NOT .md/.json
     # and not a binary. Non-source paths under a confirmed target still get
@@ -331,6 +341,95 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
             return attached
         return _plain_nudge(root)  # map query failed -> plain nudge
     return _plain_nudge(enclosing)  # non-source path under a confirmed target
+
+
+def _unindexed_footer(target: str) -> Optional[str]:
+    """Owner-design (2026-10-12, mirrors filemem's draft-decision footer):
+    when a read_file / search_files target is a SOURCE file that is NOT
+    under any confirmed code_map target AND whose enclosing project has
+    never been indexed (no db record), return a one-line footer that
+    points the model at the host `clarify` tool + `code_map_check_root`
+    so the user gets asked, once, whether to build a code map for that
+    project. The model decides; the plugin only nudges — no state, no
+    auto-inject, exactly like filemem's `_pending_drafts` footer.
+
+    Returns None (the pre-existing behaviour for this branch) when ANY
+    of these hold — i.e. we do NOT invite an index:
+      - the file is not a source file (extension not in INDEXED_EXTENSIONS
+        or it's a binary);
+      - the target lives under a BLOCKED_ROOT_PREFIXES dir (/etc, /usr,
+        /root, /home, /opt, ...) — the same prefixes the 382k-file
+        incident's gate forbids as a confirm root; we must not nudge an
+        index of a whole system/home tree just because someone read a
+        file there;
+      - the enclosing project root (marker-detected, or the file's
+        parent dir as a last resort) already has a code_map db record
+        (root_db_path exists) — the project WAS indexed before, just
+        not confirmed under this registry; that's a refresh case, not
+        a "never indexed" case, and the footer would mislead.
+
+    The footer's `root=`/`path=` split: use `rootdetect.detect_root`
+    (marker-based project root) as the boundary root when it returns a
+    non-BLOCKED dir that actually contains the target; otherwise fall
+    back to the target's immediate parent dir — never a BLOCKED prefix.
+    `path=` is the target's path relative to that chosen root.
+    """
+    from .config import INDEXED_EXTENSIONS, BLOCKED_ROOT_PREFIXES, root_db_path
+    ext = os.path.splitext(target)[1].lower()
+    if ext not in INDEXED_EXTENSIONS or _is_binary(target):
+        return None
+
+    # (A read landing UNDER a /root / /home / /usr / /etc / /opt tree is
+    # NOT a reason to skip the footer — every real project under this
+    # host's home dir lives under /root. The BLOCKED-prefix guard applies
+    # to the PROPOSED boundary root below (proj_root), never to the file
+    # path itself: the 382k-file incident was about CONFIRMING a whole
+    # system tree as an index target, not about reading a file that
+    # happens to sit somewhere under it.)
+
+    # Two-step "never indexed" check (owner's exact wording: "还没有它的
+    # 代码地图" = 完全没有 confirm 过 + 数据库没有记录).
+    from .rootdetect import detect_root
+    def _is_blocked(d: str) -> bool:
+        return any(d == b or d.startswith(b + os.sep)
+                  for b in BLOCKED_ROOT_PREFIXES if b != "/")
+
+    proj_root = detect_root(target)
+    if proj_root is None or _is_blocked(proj_root):
+        # No marker found, OR marker detection climbed up to a BLOCKED
+        # prefix (e.g. /root — nearly universal in this container, since
+        # the host user's whole home tree lives under /root). Fall back
+        # to the file's IMMEDIATE PARENT dir as the smallest sensible
+        # boundary that still "contains the project" without swallowing a
+        # whole system tree. BUT that parent dir is itself almost always
+        # under /root too — so only accept it if it is NOT one of the
+        # BLOCKED prefixes *as a boundary root itself*: i.e. reject only
+        # when the parent dir is EXACTLY /etc, /usr, /opt, /home, or /root
+        # (a whole-system-tree root), not when it merely lives somewhere
+        # under /root (every real user project does; that is fine and is
+        # the whole point of the footer — to invite indexing of a specific
+        # project dir, not the home tree).
+        proj_root = os.path.dirname(target)
+        blocked_exactly = {b for b in BLOCKED_ROOT_PREFIXES if b != "/"}
+        if proj_root in ("", os.sep) or proj_root in blocked_exactly:
+            return None  # file sits directly in a BLOCKED dir -> don't nudge
+
+    # "还没 confirm 过": the chosen project root (or its containing
+    # sub-tree) is not a confirmed target.
+    if rootreg.is_confirmed_root(proj_root):
+        return None  # already confirmed -> the confirmed-target path handles it
+    # "数据库没有记录": no db record for this project root.
+    if root_db_path(proj_root).exists():
+        return None  # was indexed before (just not under this registry)
+
+    rel = os.path.relpath(target, proj_root)
+    return (
+        f"[code_map] {os.path.basename(proj_root)} has no code map yet "
+        f"(not confirmed, no db record). Ask the user via the host "
+        f"`clarify` tool whether to build one; if they confirm, call "
+        f"code_map_check_root(root={proj_root!r}, path={rel!r}, yes=True) "
+        f"(dry-run first if unsure how many files it would index)."
+    )
 
 
 def _plain_nudge(target_or_root: str) -> Optional[str]:

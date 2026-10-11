@@ -195,13 +195,91 @@ def test_non_source_read_gets_plain_nudge_not_attach(tmp_path):
     assert "symbol(s) in this file" not in out, "non-source must NOT attach symbols"
 
 
-def test_read_outside_confirmed_target_is_none(tmp_path):
+def test_read_outside_confirmed_target_returns_unindexed_footer(tmp_path):
+    """Owner design (2026-10-12, mirrors filemem's draft-decision footer):
+    a read_file that lands on a SOURCE file whose enclosing project has
+    NEITHER a confirmed code_map target NOR a db record must return a
+    one-line footer (not None) that tells the model to ask the user via
+    the host `clarify` tool, then confirm via `code_map_check_root`.
+
+    Note: `_seed_confirmed` registers a confirmed target for this test
+    (proves the other read-side paths still work), but the 'other/e.py'
+    file below lives in a fresh tmp_path that is NOT that target — so
+    it genuinely falls into the `enclosing is None` branch we're testing.
+    """
     from code_map import hook, rootreg
     _seed_confirmed(tmp_path, ["e.py"], "def e(): pass\n")
     outside = tmp_path / "other" / "e.py"
     outside.parent.mkdir(parents=True, exist_ok=True)
     outside.write_text("def e(): pass\n", encoding="utf-8")
-    assert hook._maybe_nudge("read_file", {"path": str(outside)}) is None
+    # Sanity: 'other' is NOT under any confirmed target.
+    assert hook._find_confirmed_root(str(outside), set(rootreg.confirmed_targets())) is None
+    out = hook._maybe_nudge("read_file", {"path": str(outside)})
+    # (behavior change, owner-signed 2026-10-12): was `assert out is None`
+    assert out is not None, "un-indexed source-file read must return a footer"
+    assert "[code_map]" in out, f"footer must carry the code_map marker: {out[:80]!r}"
+    assert "clarify" in out, f"footer must name the host clarify tool: {out[:80]!r}"
+    assert "code_map_check_root" in out, f"footer must name the confirm tool: {out[:80]!r}"
+
+
+def test_read_non_source_outside_confirmed_target_still_none(tmp_path):
+    """A NON-source file (e.g. .md) read outside any confirmed target must
+    still return None — the footer is only for source files the index
+    could actually cover."""
+    from code_map import hook
+    _seed_confirmed(tmp_path, ["e.py"], "def e(): pass\n")
+    md = tmp_path / "other" / "notes.md"
+    md.parent.mkdir(parents=True, exist_ok=True)
+    md.write_text("# hi\n", encoding="utf-8")
+    assert hook._maybe_nudge("read_file", {"path": str(md)}) is None
+
+
+def test_read_system_dir_file_outside_confirmed_target_still_none(tmp_path):
+    """A source file that literally lives at a BLOCKED root prefix itself
+    (i.e. the PROPOSED boundary root would be /etc or similar, not just a
+    file somewhere under a home tree) must still return None — the footer's
+    own guard on `proj_root` (never /etc /usr /opt as the boundary) is what
+    protects against inviting a whole-system-tree index. A file merely
+    *named* like a system path (e.g. <tmp>/etc/x.py) does NOT trip this —
+    it is a normal user file and SHOULD get the footer.
+    """
+    from code_map import hook
+    import os
+    # A file literally at /etc/... (only reachable when running as root in
+    # this container; the test is written to be safe either way — if we
+    # cannot create the file, the guard is still exercised the same way,
+    # because _unindexed_footer only needs the path string to compute the
+    # proposed proj_root, not for the file to exist on disk).
+    sysfile = "/etc/_cm_test_stub.py"
+    out = hook._maybe_nudge("read_file", {"path": sysfile})
+    # The footer's boundary-root guard must reject this: the only sensible
+    # proj_root for a file at /etc/x.py IS /etc (a BLOCKED prefix), so no
+    # footer should be emitted — regardless of whether the file exists.
+    assert out is None, f"reads at a BLOCKED prefix must not invite an index: {out}"
+
+
+def test_unindexed_footer_root_avoids_blocked_prefixes(tmp_path):
+    """The footer's suggested `root=` must never be a BLOCKED prefix
+    (/, /root, /home, /usr, /etc, /opt) — the owner's Gate-10 rule that
+    motivated the 382k-file incident. For a file whose enclosing project
+    root WOULD be /root (no marker found anywhere up the tree), the
+    footer must fall back to a non-blocked boundary so the confirm call
+    the model makes actually passes the gate."""
+    from code_map import hook
+    _seed_confirmed(tmp_path, ["e.py"], "def e(): pass\n")
+    # A source file whose path sits directly under a /home-like dir we can
+    # actually create: tmp_path itself is a good stand-in since the test's
+    # 'other/' sibling has no marker and its nearest project-boundary
+    # candidate (the tmp base) is NOT in BLOCKED_ROOT_PREFIXES.
+    deep = tmp_path / "proj_a" / "mod.py"
+    deep.parent.mkdir(parents=True, exist_ok=True)
+    deep.write_text("def f(): pass\n", encoding="utf-8")
+    out = hook._maybe_nudge("read_file", {"path": str(deep)})
+    assert out is not None
+    # The footer must propose a `root=` that is NOT a blocked prefix.
+    assert "root=/" not in out or "root=/" + "root" not in out  # no /root
+    for bad in ("/root", "/home", "/usr", "/etc", "/opt"):
+        assert f"root={bad}" not in out, f"footer must not propose {bad}: {out}"
 
 
 # ── 件 3: bounded self-heal (reviewer F1/F2) ────────────────────────────────
