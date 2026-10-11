@@ -61,28 +61,43 @@ def _path_segments(target: str):
     return [s for s in target.replace("\\", "/").split("/") if s]
 
 
-def target_match(question: str, target: str) -> bool:
+def target_match(question: str, target: str,
+                 allow_partial: bool = True) -> bool:
     """Does `question` reference `target`?
 
-    Primary: the full abspath appears verbatim (original, strict rule).
+    Primary: the full abspath appears verbatim (original, strict rule) —
+    always accepted, `allow_partial` irrelevant.
     Fallback (RISK #6): a TRAILING run of >= 2 consecutive path segments of
     `target` appears contiguously in the question — the realistic case where
     the model says 'plugins/code_map' instead of the full abspath. A single
     bare segment is NOT enough (collision-prone: any project named
-    'code_map' would match)."""
+    'code_map' would match).
+
+    `allow_partial` (default True): whether the trailing-sub-path fallback is
+    consulted at all. The hook passes False when it is the NEW-PATH fallback
+    arm (a question that mentioned no confirmed target at all): in that
+    arm a bare 'x/y' mention must NOT be enough to create evidence for some
+    arbitrary path the user never discussed — only a verbatim full-target
+    mention counts there (a path the user spelled out completely in the
+    question IS a deliberate target reference; a 2-segment relative
+    mention of an unknown path is not). The confirmed-target arm keeps
+    True, since a trailing-sub-path mention of an ALREADY-confirmed target
+    is safe (that target already passed a prior user confirm)."""
     q = (question or "")
     t = (target or "").replace("\\", "/")
     if not q or not t:
         return False
     if t in q:
         return True
+    if not allow_partial:
+        return False
     segs = _path_segments(t)
     if len(segs) < _MIN_PARTIAL_MATCH_SEGMENTS:
         return False
     # A TRAILING run (suffix) of >= _MIN_PARTIAL_MATCH_SEGMENTS consecutive
-    # segments of the target appearing contiguously in the question is enough.
-    # Checked longest-suffix-first; the "last N segments" phrasing is the
-    # realistic model case ('plugins/code_map' for a deep target).
+    # segments of the target appearing contiguously in the question is
+    # enough. Checked longest-suffix-first; the "last N segments" phrasing
+    # is the realistic model case ('plugins/code_map' for a deep target).
     for nseg in range(len(segs), _MIN_PARTIAL_MATCH_SEGMENTS - 1, -1):
         if "/".join(segs[-nseg:]) in q:
             return True
@@ -104,7 +119,31 @@ def _is_affirmative(text: str) -> bool:
     return any(tok in _AFFIRMATIVE for tok in tokens)
 
 
+_ABS_PATH_RE = None
+
+def _extract_path_mentions(question: str) -> List[str]:
+    """Every ABSOLUTE-path mention (starts with '/' in the question text,
+    >= 2 '/'-separated segments) found in a free-form question string,
+    longest-first. Absolute mentions are explicit, deliberate path
+    references — the realistic case for the hook's new-path evidence
+    fallback. A relative fragment ('x/y') is deliberately NOT returned:
+    a bare fragment of a never-seen target must not mint evidence (the
+    collision risk that made the first, too-loose fix wrong). Pure text,
+    no filesystem access, no side effects."""
+    global _ABS_PATH_RE
+    if _ABS_PATH_RE is None:
+        import re as _re
+        _ABS_PATH_RE = _re.compile(
+            r"/(?:[A-Za-z0-9._-]+/){1,}[A-Za-z0-9._-]+")
+    found = set(_ABS_PATH_RE.findall(question or ""))
+    return sorted(found, key=len, reverse=True)
+
+
 def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, Any]]:
+    # NOTE: `root`/`path` are unused (kept for call-site signature
+    # compatibility); the gate target is the joined+abspath-normalized
+    # `target`, which is the ONLY join key consulted against the log.
+    del root, path
     """Latest transcript evidence that the user affirmatively confirmed
     THIS exact target via the host clarify tool. Returns the evidence
     record (with ts + user response) or None (no/affirmative-missing).

@@ -17,6 +17,7 @@ a boundary prefix, path the relative sub-path. Test dirs live under
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -408,6 +409,102 @@ def test_hook_records_evidence_via_partial_path_mention(monkeypatch):
     assert not _evidence_log().exists(), "single-segment mention must not record"
 
     _cleanup(home, proj)
+
+
+def test_hook_new_path_fallback_unlocks_unconfirmed_target(monkeypatch):
+    """RISK #6 follow-up (found in the 2026-10-11 knowledge-base-search
+    live test): a clarify question about a path that is NOT yet a
+    confirmed target must still be able to mint evidence for it, or the
+    gate dead-locks (to confirm a new path you need evidence; to get
+    evidence you need to have asked about that path; the question, by
+    definition, comes before the confirm).
+
+    Boundary: an ABSOLUTE, fully-spelled path mention in the question
+    unlocks the join for an unconfirmed target. A RELATIVE fragment
+    ('plugins/x') must NOT — that is the collision risk that made the
+    first, too-loose fix wrong."""
+    from code_map import hook, rootreg
+    from code_map.query import _evidence_log
+    home = _mk_home("q3newpath")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # seed ONE confirmed target that shares NO trailing-segment overlap
+    # with new_dir (a sibling, not an ancestor/parent) so that a relative
+    # fragment of new_dir cannot match it via the confirmed-targets arm
+    known = _mk_proj("q3newpath_known")
+    (known / "a.py").write_text("def fk(): pass\n")
+    rootreg.write_confirmed_root(str(known))
+
+    # fresh, empty evidence log before we start asking — the log file may
+    # already exist with stale records from a sibling test (the confirm
+    # target's own data_dir), so _cleanup the log file itself up front
+    _evidence_log().unlink(missing_ok=True)
+
+    new_dir = _mk_proj("q3newpath_new")
+    (new_dir / "a.py").write_text("def fn(): pass\n")
+    assert not rootreg.is_confirmed_root(str(new_dir))
+    abs_new = os.path.abspath(str(new_dir))
+    # new_dir lives under the SAME flat parent as known; the relative
+    # fragment form is <parent_basename>/<new_dir_basename> — it does NOT
+    # share a trailing-segment run with `known` (a different leaf under
+    # the same parent), so the confirmed-targets arm cannot match it.
+    frag = f"{new_dir.parent.name}/{new_dir.name}"
+
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index 一下 {frag} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": "确认"}), status="ok")
+    # The confirmed-targets arm found nothing (frag shares no trailing
+    # segments with `known`); the new-path arm must NOT fire for a
+    # relative fragment of a never-seen path.
+    assert not _evidence_log().exists(), \
+        "relative fragment must not mint evidence for a new path"
+
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index {abs_new} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": "确认"}), status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    assert any(r["target"] == abs_new and r["affirmative"] for r in recs)
+
+    # gate contract: root is the boundary prefix, path the relative
+    # sub-path — new_dir lives directly under /tmp so (root='/tmp',
+    # path=new_dir.name) is the correct pair shape.
+    res = json.loads(code_map_check_root(
+        {"root": str(new_dir.parent), "path": new_dir.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    assert rootreg.is_confirmed_root(abs_new)
+
+    _cleanup(home, known, new_dir)
+
+
+def test_hook_new_path_fallback_never_crosses_unrelated_paths(monkeypatch):
+    """The new-path fallback must NOT let an absolute mention of path A
+    mint evidence for an unrelated path B (different tree)."""
+    from code_map import hook, rootreg
+    from code_map.query import _evidence_log
+    home = _mk_home("q3newpath2")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    a = _mk_proj("q3n2_a")
+    (a / "a.py").write_text("def fa(): pass\n")
+    rootreg.write_confirmed_root(str(a))
+
+    b = _mk_proj("q3n2_b")
+    (b / "a.py").write_text("def fb(): pass\n")
+    abs_b = os.path.abspath(str(b))
+    assert abs_b != os.path.abspath(str(a))
+
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index {abs_b} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": "确认"}), status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    targets = {r["target"] for r in recs}
+    assert abs_b in targets, f"new-path absolute mention must record, got {targets}"
+    a_target = os.path.abspath(str(a))
+    a_recs = [r for r in recs if r["target"] == a_target]
+    assert not a_recs, f"unrelated confirmed target gained spurious evidence: {a_recs}"
+
+    _cleanup(home, a, b)
 
 
 if __name__ == "__main__":

@@ -112,11 +112,43 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
         # deep target) — that is enough for the join; a bare single segment
         # is not. Longest-matching target still wins.
         best: Optional[str] = None
-        from .query import target_match
-        for target in rootreg.confirmed_targets():
+        from .query import target_match, _extract_path_mentions
+        confirmed = rootreg.confirmed_targets()
+        for target in confirmed:
             if target and target_match(q, target):
                 if best is None or len(target) > len(best):
                     best = target
+        if best is not None:
+            from .query import record_clarify_evidence
+            record_clarify_evidence(best, reply)
+            return
+        # New-path fallback (RISK #6 follow-up, found in the 2026-10-11
+        # knowledge-base-search live test): the model is asking to index a
+        # path that is NOT confirmed yet — Q3's core case, which by
+        # definition cannot be in confirmed_targets(). Extract the
+        # path-shaped mentions from the question; a mention that spells out
+        # the target VERBATIM (full, '/'-segregated) in the question is
+        # still an explicit reference to THAT path, so we record evidence
+        # for it — but ONLY that mention, longest-first, and ONLY when it
+        # is a real absolute-looking path (>= 2 segments, starts with '/'
+        # in the question text) — a bare relative 'x/y' fragment with no
+        # leading '/' in the question text is too collision-prone to mint
+        # evidence for a never-seen path. This deliberately does NOT reuse
+        # the trailing-sub-path fallback (target_match(allow_partial=False)):
+        # it is safe for an ALREADY-confirmed target (user already
+        # consented to that exact path) but must not be the trigger for
+        # minting evidence for a brand-new path the user has never been
+        # asked about — that would let a casual 'plugins/foo' mention in
+        # any unrelated question auto-approve an index of /…/plugins/foo.
+        from .query import _extract_path_mentions
+        for cand in _extract_path_mentions(q):
+            # cand is already an absolute, >=2-segment path mention from the
+            # question (the extractor returns only those, longest-first).
+            # A verbatim match back into the question confirms this exact
+            # string is what was asked about.
+            if cand in q:
+                best = os.path.abspath(cand)
+                break
         if best is None:
             return
         from .query import record_clarify_evidence
