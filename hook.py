@@ -265,6 +265,32 @@ def _unindexed_read_ledger() -> "Path":
     return data_dir() / "_unindexed_read_ledger"
 
 
+def _ledger_rmw(mutate) -> None:
+    """Read-mutate-write the ledger inside the advisory cross-process write
+    lock: the current lines go through `mutate(current) -> new_lines` and
+    the result is written back, all under one flock critical section, so
+    two host/profile processes (post_tool_call runs on a bounded worker
+    thread; the data dir is hardlinked cross-profile) cannot both read the
+    same file, append their own row, and overwrite each other — a last-
+    writer-wins lost update that would silently drop pending rows
+    (reviewer round 1 measured ~99.9% row loss in an 8000-iteration
+    4-thread race; a dropped row = the project is asked one fewer time,
+    never data loss).
+
+    write_lock(nowait=True) is ADVISORY, same posture as the single-file
+    reindex at 件 1: when the lock is held we still run the body, so a
+    contested RMW degrades to the pre-lock fail-soft behaviour instead of
+    ever blocking a host worker (the 30s bounded-hook budget applies).
+    `mutate` returning None means "unchanged" (no write, no unlink).
+    """
+    from .lockfile import write_lock
+    with write_lock(nowait=True, what="ledger RMW"):
+        new_lines = mutate(_ledger_read())
+        if new_lines is None:
+            return
+        _ledger_write(new_lines)
+
+
 def _ledger_read() -> list:
     """Return the ledger's non-empty lines, fail-soft to []."""
     p = _unindexed_read_ledger()
@@ -294,14 +320,27 @@ def _ledger_write(lines: list) -> None:
 
 
 def _project_boundary(target: str) -> Optional[str]:
-    """The footer's honest project boundary for `target` (a file path):
+    """The honest project boundary for `target` (a file path):
     detect_root's marker result when it actually encloses the file, else
-    the file's immediate parent dir — the SAME rule the retired footer used,
-    kept in one place so the ledger key and the question text always name
-    the same boundary. Returns None when no meaningful boundary exists."""
+    the file's immediate parent dir — kept in one place so the ledger key
+    and the question text always name the same boundary. Returns None
+    when no meaningful boundary exists.
+
+    Special case (reviewer round 1): detect_root climbs to $HOME as its
+    last-resort cap, so a marker-less project UNDER $HOME would otherwise
+    get $HOME itself as the "project" — and the ledger/clarify question
+    would then offer to index the whole home tree (the 382k-file
+    incident's shape, and exactly what gate ⑩ refuses as a confirm root).
+    $HOME is never a project boundary: downgrade to the file's parent dir.
+    """
     from .rootdetect import detect_root
     proj_root = detect_root(target)
     if proj_root is None or not (target == proj_root or target.startswith(proj_root + os.sep)):
+        proj_root = os.path.dirname(target)
+    home = os.path.expanduser("~")
+    if proj_root == home:
+        # /root/x/y.py with no marker anywhere -> the project is /root/x,
+        # NOT /root (the home tree is not indexable).
         proj_root = os.path.dirname(target)
     if proj_root in ("", os.sep):
         return None
@@ -345,10 +384,14 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         if not session_id:
             return  # no session to scope the row to -> skip, never leak
         line = f"{proj}\t{session_id}"
-        lines = _ledger_read()
-        if line not in lines:
-            lines.append(line)
-            _ledger_write(lines)
+
+        def _append(current):
+            if line in current:
+                return None  # unchanged, no write
+            current.append(line)
+            return current
+
+        _ledger_rmw(_append)
     except Exception as exc:
         _log.debug("code_map unindexed-read ledger log fail-soft: %s", exc)
 
@@ -385,53 +428,118 @@ def _clear_project_rows(session_id: str, project_dirs) -> None:
     """Remove this session's ledger rows for `project_dirs` (exact, per-dir
     settle used by '要'/'不再问')."""
     drop = {os.path.abspath(d) for d in project_dirs}
-    kept = []
-    for line in _ledger_read():
-        parts = line.split("\t")
-        if len(parts) == 2 and parts[1] == session_id and parts[0] in drop:
-            continue
-        kept.append(line)
-    _ledger_write(kept)
+
+    def _drop(current):
+        kept = []
+        for line in current:
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[1] == session_id and parts[0] in drop:
+                continue
+            kept.append(line)
+        return current if kept == current else kept
+
+    _ledger_rmw(_drop)
 
 
-def _clarify_named_project(args: Any) -> Optional[str]:
-    """Which project dir does this clarify call ask about? Extracted from
-    the question text's path mentions (absolute, >= 2 segments, longest
-    first) — the same extractor the Q3 evidence gate uses, so '要 index
-    /root/.hermes/plugins/emo 吗？' names that dir precisely. The 3 fixed
-    options (要/不要/不再问) carry no path; the path always comes from the
-    question the model wrote (the system-prompt policy instructs the model
-    to put the full target path in the clarify question, and
-    on_pre_llm_call's notice text hands it over verbatim)."""
+# Settle-side session scope: _settle_clarify_answer binds the session before
+# calling _clarify_named_projects, so boundary-upward mapping only matches
+# against THIS session's pending rows (never another session's).
+_current_settle_session: Dict[str, str] = {}
+
+
+def _clarify_named_projects(args: Any) -> list:
+    """Every (project boundary) this clarify call asks about. Extracted from
+    EACH question text's path mentions (absolute, >= 2 segments) — the same
+    extractor the Q3 evidence gate uses. The 3 fixed options (要/不要/不再问)
+    carry no path; the path always comes from the question(s) the model
+    wrote (the system-prompt policy instructs the model to put the full
+    target path in the clarify question, and on_pre_llm_call's notice text
+    hands it over verbatim).
+
+    Returns ALL distinct mentions across every question, not just the
+    first (reviewer round 1: a model bundling two projects into one or two
+    questions must not leave the other's row behind). De-duplicated on the
+    abspath form; a file path mention under a pending boundary is mapped
+    UP to that boundary row so '要 index .../core.py' settles the
+    project's row, not a no-op (the ledger key is the directory, per the
+    owner's 2026-10-13 ruling).
+    """
     from .query import _extract_path_mentions
-    q, _reply = _extract_clarify_qr(args, None)
-    if not q:
-        return None
-    mentions = _extract_path_mentions(q)
-    if not mentions:
-        return None
-    # Longest mention = the most specific target the question names.
-    best = max(mentions, key=len)
-    return os.path.abspath(best)
+    out: list = []
+    qs: list = []
+    if isinstance(args, dict):
+        raw = args.get("questions")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    qs.append(str(item.get("question") or ""))
+                elif isinstance(item, str):
+                    qs.append(item)
+        if not qs:
+            qs = [str(args.get("question") or "")]
+    elif isinstance(args, str):
+        qs = [args]
+    for q in qs:
+        for m in _extract_path_mentions(q):
+            m_abs = os.path.abspath(m)
+            # Map a file mention up to the pending boundary that contains
+            # it (the ledger's key is the directory). A mention that
+            # contains no pending row is still returned verbatim —
+            # clearing an absent row is a no-op, and a new path the user
+            # consented to by typing may not be in the ledger yet.
+            target = m_abs
+            for proj in _pending_projects(_current_settle_session.get("session", "")):
+                if target == proj or target.startswith(proj + os.sep):
+                    target = proj
+                    break
+            if target not in out:
+                out.append(target)
+    return out
 
 
-def _clarify_reply_text(result: Any) -> str:
-    """The user's reply from a host clarify result payload (the first
-    question's user_response, whether single- or multi-question shape)."""
+def _clarify_reply_texts(result: Any) -> list:
+    """Every question's user_response from a host clarify result payload,
+    in question order. A bundled multi-question clarify (other topics
+    first, the code_map question second) must not have its code_map
+    answer missed just because responses[0] belongs to the other topic
+    (reviewer round 1: reading only responses[0] left the pending row
+    stuck)."""
     if not result:
-        return ""
+        return []
+    parsed = result
     if isinstance(result, str):
-        return result
-    if isinstance(result, dict):
-        responses = result.get("responses")
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            parsed = result
+    if isinstance(parsed, dict):
+        responses = parsed.get("responses")
         if isinstance(responses, list) and responses:
-            first = responses[0]
-            if isinstance(first, dict):
-                return str(first.get("user_response") or "")
-            return str(first)
+            out = []
+            for r in responses:
+                if isinstance(r, dict):
+                    out.append(str(r.get("user_response") or ""))
+                else:
+                    out.append(str(r))
+            return out
+        # Legacy dict shape: {"q0": "..." or {"user_response": "..."}}.
+        if isinstance(responses, dict) and responses:
+            out = []
+            for val in responses.values():
+                if isinstance(val, dict):
+                    out.append(str(val.get("user_response") or ""))
+                else:
+                    out.append(str(val))
+            return out
         # Legacy single-question shape.
-        return str(result.get("user_response") or "")
-    return ""
+        if parsed.get("user_response"):
+            return [str(parsed.get("user_response"))]
+        return []
+    if isinstance(parsed, list) and parsed:
+        return [str(parsed[0])]
+    if isinstance(parsed, str):
+        return [parsed]
+    return []
 
 
 def _settle_clarify_answer(args: Any, result: Any, status: Any,
@@ -447,6 +555,13 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
                    gets asked again on its next read.
       - '不再问' -> clear the named project's row; that project is silently
                    dropped permanently (row removed = never asked again).
+    A bundled multi-question clarify is settled per-question: each
+    question's reply is matched against ITS path mentions (reviewer round
+    1: reading only responses[0] left the code_map question's answer
+    missed when another topic came first). A reply that is '要'-shaped
+    ('要', '要了', '要建吧' — any 要-prefix) settles; '不再问'-shaped
+    replies clear; '不要'-shaped or free-text answers settle nothing (the
+    next read asks again — the owner's '不要' semantics).
     Only SUCCESSFUL clarify calls settle (a cancelled/errored call is not
     an answer — the next turn asks again, same as the evidence gate).
     Fail-soft: a parse hiccup leaves the ledger untouched.
@@ -455,22 +570,29 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
         return
     if not session_id:
         return
-    reply = _clarify_reply_text(result).strip()
+    _current_settle_session["session"] = session_id
     try:
-        if reply.startswith("不再问"):
-            proj = _clarify_named_project(args)
-            if proj:
-                _clear_project_rows(session_id, [proj])
-            return
-        # '不要' (and every non-'要' answer) settles nothing: the pending
-        # rows stay, the same project is asked again on its next read.
-        if not (reply == "要" or (reply.startswith("要") and len(reply) <= 2)):
-            return
-        proj = _clarify_named_project(args)
-        if proj:
-            _clear_project_rows(session_id, [proj])
+        replies = [r.strip() for r in _clarify_reply_texts(result)]
+        for reply in replies:
+            if reply.startswith("不再问"):
+                projs = _clarify_named_projects(args)
+                if projs:
+                    _clear_project_rows(session_id, projs)
+                continue
+            # '要'-shaped answer (any 要-prefix: '要', '要了', '要建立'):
+            # settle the named project(s). '不要' does NOT start with
+            # '要' (it starts with '不'), so no collision.
+            if reply.startswith("要"):
+                projs = _clarify_named_projects(args)
+                if projs:
+                    _clear_project_rows(session_id, projs)
+                continue
+            # '不要' / free text / anything else: settle nothing — the
+            # owner's "不要 = 下次还问" semantics.
     except Exception as exc:
         _log.debug("code_map clarify-answer settle fail-soft: %s", exc)
+    finally:
+        _current_settle_session["session"] = ""
 
 
 def on_pre_llm_call(session_id: str = "", user_message: str = "",
@@ -494,13 +616,16 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
         projects = _pending_projects(session_id)
         if not projects:
             return None
-        lines = [f"[code_map] 上一轮你读了未索引项目的源码，请调 clarify 问用户"
-                 f"是否为它建代码地图（三个选项：要 / 不要 / 不再问）："]
+        lines = [f"[code_map] 上一轮你读了未索引项目的源码，请对每个项目"
+                 f"各发一条 clarify 问用户是否为其建代码地图"
+                 f"（一条问题只问一个项目；三个选项：要 / 不要 / 不再问）："]
         for proj in projects:
             lines.append(f"  - {proj}")
-        lines.append("（语义：要 -> 调 code_map_check_root(root=<boundary>, "
-                     "path=<rel>, yes=True) 建索引；不要 -> 暂不建，"
-                     "下次读到该项目仍会再问；不再问 -> 永不再就该项目询问。）")
+        lines.append("（语义：要 -> 按 code_map 策略取合法的 "
+                     "(boundary root, relative path) 对调 "
+                     "code_map_check_root(..., yes=True) 建索引；"
+                     "不要 -> 暂不建，下次读到该项目仍会再问；"
+                     "不再问 -> 永不再就该项目询问。）")
         return {"context": "\n".join(lines)}
     except Exception as exc:
         _log.debug("code_map pre_llm_call notice fail-soft: %s", exc)
