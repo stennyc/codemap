@@ -28,7 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import fcntl
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 from .config import (HOOK_DEBOUNCE_S, READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
@@ -265,30 +267,62 @@ def _unindexed_read_ledger() -> "Path":
     return data_dir() / "_unindexed_read_ledger"
 
 
-def _ledger_rmw(mutate) -> None:
-    """Read-mutate-write the ledger inside the advisory cross-process write
-    lock: the current lines go through `mutate(current) -> new_lines` and
-    the result is written back, all under one flock critical section, so
-    two host/profile processes (post_tool_call runs on a bounded worker
-    thread; the data dir is hardlinked cross-profile) cannot both read the
-    same file, append their own row, and overwrite each other — a last-
-    writer-wins lost update that would silently drop pending rows
-    (reviewer round 1 measured ~99.9% row loss in an 8000-iteration
-    4-thread race; a dropped row = the project is asked one fewer time,
-    never data loss).
+@contextmanager
+def _ledger_write_lock(nowait: bool = True):
+    """Ledger's advisory cross-process write lock, on ITS OWN lock file
+    (data/_ledger_proc.lock — deliberately NOT the db's _proc.lock): the
+    single-file reindex holds the db lock for the duration of its sqlite
+    write; serializing ledger RMWs on that same lock would push read-side
+    workers into a 20-30s contention window — the exact 12-min-lag
+    incident shape the single-file reindex replaced. A lost update here
+    degrades to 'asked one fewer time' (fail-soft), so nowait + fail-open
+    is the right posture: never block a host worker.
 
-    write_lock(nowait=True) is ADVISORY, same posture as the single-file
-    reindex at 件 1: when the lock is held we still run the body, so a
-    contested RMW degrades to the pre-lock fail-soft behaviour instead of
-    ever blocking a host worker (the 30s bounded-hook budget applies).
-    `mutate` returning None means "unchanged" (no write, no unlink).
+    Same fcntl.flock mechanism as the db lock, so cross-process
+    mutual exclusion works the way owner's hardlink invariant demands
+    (one physical lock file shared by all host/profile processes — the
+    ledger lock file lives in the same hardlinked data dir).
     """
-    from .lockfile import write_lock
-    with write_lock(nowait=True, what="ledger RMW"):
-        new_lines = mutate(_ledger_read())
-        if new_lines is None:
-            return
-        _ledger_write(new_lines)
+    import fcntl
+    import time
+    from .config import data_dir
+    path = data_dir() / "_ledger_proc.lock"
+    try:
+        path.touch(exist_ok=True)
+        fd = open(path, "w")
+    except OSError:
+        yield  # lock file unobtainable -> run unlocked (fail-open)
+        return
+    acquired = False
+    try:
+        if nowait:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                pass  # held -> advisory: run the body anyway
+        else:
+            deadline = time.monotonic() + 25.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break  # deadline -> proceed without it
+                    time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            fd.close()
+        except OSError:
+            pass
 
 
 def _ledger_read() -> list:
@@ -300,6 +334,34 @@ def _ledger_read() -> list:
         return [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
     except OSError:
         return []
+
+
+def _ledger_rmw(mutate) -> None:
+    """Read-mutate-write the ledger under its own advisory cross-process
+    flock (`_ledger_write_lock`, on data/_ledger_proc.lock — a SEPARATE
+    lock file from the db's _proc.lock, so a 20-30s single-file-reindex
+    critical section never stalls the read-side ledger RMW): the current
+    lines go through `mutate(current) -> new_lines` and the result is
+    written back, all inside one critical section, so two host/profile
+    processes (post_tool_call runs on a bounded worker thread; the data
+    dir is hardlinked cross-profile) cannot both read the same file,
+    append their own row, and overwrite each other — a last-writer-wins
+    lost update that would silently drop pending rows (reviewer round 1
+    measured ~99.9% row loss in an 8000-iteration 4-thread race; a
+    dropped row = the project is asked one fewer time, never data loss).
+
+    The lock is nowait + fail-open (advisory, same posture as 件 1's
+    single-file reindex lock): when the flock is held we still run the
+    body, so a contested RMW degrades to the pre-lock fail-soft behaviour
+    instead of ever blocking a host worker (the 30s bounded-hook budget
+    applies). `mutate` returning None means "unchanged" (no write, no
+    unlink).
+    """
+    with _ledger_write_lock(nowait=True):
+        new_lines = mutate(_ledger_read())
+        if new_lines is None:
+            return
+        _ledger_write(new_lines)
 
 
 def _ledger_write(lines: list) -> None:
