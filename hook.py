@@ -170,9 +170,17 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
         # this arm is skipped when the reply is negative — see
         # test_hook_user_negative_reply_mints_no_evidence_even_with_path).
         if _is_affirmative(reply):
-            q_mentions = set(_extract_path_mentions(q))
+            # RISK #2 fix (reviewer deleg_1993fe7a, 2026-10-12): dedupe
+            # on the NORMALIZED (abspath) form, not raw text — the
+            # question may spell the same path in a non-canonical form
+            # ('/a/../a/x', trailing spaces, double slashes) that the
+            # reply spells canonically; record_clarify_evidence itself
+            # stores os.path.abspath(target), so the comparison has to
+            # happen at the same normalization level or a redundant,
+            # duplicate evidence line gets appended for the same target.
+            q_mentions_norm = {os.path.abspath(c) for c in _extract_path_mentions(q)}
             for cand in _extract_path_mentions(reply):
-                if cand not in q_mentions:
+                if os.path.abspath(cand) not in q_mentions_norm:
                     record_clarify_evidence(os.path.abspath(cand), reply)
     except Exception as exc:
         _log.debug("code_map clarify evidence record fail-soft: %s", exc)

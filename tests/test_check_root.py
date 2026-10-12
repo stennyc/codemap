@@ -633,5 +633,75 @@ def test_hook_user_negative_reply_mints_no_evidence_even_with_path(monkeypatch):
     _cleanup(home, base, other)
 
 
+def test_hook_user_other_path_dedup_ignores_trailing_space_variant(monkeypatch):
+    """RISK #2 修复（reviewer deleg_1993fe7a，2026-10-12）：'Other' 纠正
+    arm 的去重差集此前按原文比较（cand not in q_mentions），但
+    record_clarify_evidence 内部落 target 用的是 os.path.abspath 归一化
+    形式——同一路径的不同原文写法（比如带尾随空格）会漏判重复，
+    产生冗余证据行。修法：差集判断也用 abspath 归一化后的形式比对，
+    跟落 target 的形式对齐。"""
+    from code_map import hook
+    from code_map.query import _evidence_log
+    import os
+    home = _mk_home("q3dedup")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3dedup_proj")
+    (proj / "a.py").write_text("def fd(): pass\n")
+    abs_proj = os.path.abspath(str(proj))
+
+    _evidence_log().unlink(missing_ok=True)
+    # question 提了该路径（干净写法），reply 的 'Other' 里 typed 同一路径
+    # 但带尾随空格（非规范写法）——abspath 归一化后两者相同。
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index 一下 {abs_proj} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response":
+                                            f"确认，{abs_proj} "}),
+                         status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    same_target_recs = [r for r in recs if r["target"] == abs_proj]
+    # question 路径记一条；reply 里带尾随空格的写法 abspath 归一化后
+    # 等于同一路径，必须被差集去重掉，不能产生第二条冗余行。
+    assert len(same_target_recs) == 1, \
+        f"trailing-space variant of an already-mentioned path must not mint a 2nd evidence line: {recs}"
+
+    _cleanup(home, proj)
+
+
+def test_hook_user_other_multithread_dedup_is_per_abspath_not_per_rawtext(monkeypatch):
+    """同一 abspath 目标、不同的非规范原文写法（.. 折叠、双斜杠、尾随
+    空格混合）都应归并到同一条证据（reviewer RISK #2/#4 合流：
+    '同路径不同写法' 的去重必须基于 abspath 归一化，不是原文逐字比较）。
+    这条直接验证跨 3 种非规范写法 + 1 种干净写法的去重强度。"""
+    from code_map import hook
+    from code_map.query import _evidence_log
+    import os
+    home = _mk_home("q3dedup2")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("q3dedup2_proj")
+    (proj / "a.py").write_text("def fd2(): pass\n")
+    abs_proj = os.path.abspath(str(proj))
+
+    _evidence_log().unlink(missing_ok=True)
+    # 用 .. 折叠形式提问（abspath 归一化后 = abs_proj），干净形式回答。
+    raw_q = f"{abs_proj}/../{proj.name}"  # 非规范：带 .. 的写法
+    hook._post_tool_call("clarify",
+                         {"question": f"要 index 一下 {raw_q} 吗？",
+                          "choices": ["确认", "取消"]},
+                         result=json.dumps({"response": f"确认，就是 {abs_proj}"}),
+                         status="ok")
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()]
+    same_target_recs = [r for r in recs if r["target"] == abs_proj]
+    # question 里的 .. 形式：_extract_path_mentions 只抓 '/' 分隔的干净
+    # 绝对路径 mention，`{abs_proj}/../{name}` 里 `..` 段不匹配
+    # [A-Za-z0-9._-]+ 吗？匹配（. 在字符类里），所以这个原文能被抓到，
+    # 且 abspath 归一化后等于 abs_proj —— 记一条。reply 里的干净写法
+    # 与 question 的 .. 写法归一化后相同，必须被差集去重掉。
+    assert len(same_target_recs) == 1, \
+        f"distinct raw-text spellings of the same abspath must dedupe to ONE evidence line: {recs}"
+
+    _cleanup(home, proj)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

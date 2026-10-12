@@ -171,6 +171,19 @@ def _extract_path_mentions(question: str) -> List[str]:
             r"/(?:[A-Za-z0-9._-]+/){1,}[A-Za-z0-9._-]+")
     found = set(_ABS_PATH_RE.findall(question or ""))
     return sorted(found, key=len, reverse=True)
+    # Cross-platform note (reviewer RISK #4, 2026-10-12): this extractor
+    # is POSIX-path-shaped and returns whatever raw text is in the
+    # question, unnormalized — callers that compare these mentions
+    # against each other (or against a stored target) must do so on the
+    # os.path.abspath() form, not the raw string, or distinct raw spellings
+    # of the same target (../ folds, double slashes, trailing spaces) will
+    # not dedupe. On Windows an 'absolute' path would start with a drive
+    # letter, not '/', so this extractor would simply find no mentions
+    # there — a real Windows deployment would need a drive-letter-aware
+    # variant; not a concern for this host (Linux) today, documented so
+    # nobody silently 'fixes' it by swapping in a regex that also matches
+    # relative fragments.
+
 
 
 def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, Any]]:
