@@ -195,12 +195,17 @@ def test_non_source_read_gets_plain_nudge_not_attach(tmp_path):
     assert "symbol(s) in this file" not in out, "non-source must NOT attach symbols"
 
 
-def test_read_outside_confirmed_target_returns_unindexed_footer(tmp_path):
-    """Owner design (2026-10-12, mirrors filemem's draft-decision footer):
-    a read_file that lands on a SOURCE file whose enclosing project has
-    NEITHER a confirmed code_map target NOR a db record must return a
-    one-line footer (not None) that tells the model to ask the user via
-    the host `clarify` tool, then confirm via `code_map_check_root`.
+def test_read_outside_confirmed_target_no_footer(tmp_path):
+    """Owner design (2026-10-13, turn-boundary clarify): a read_file that
+    lands on a SOURCE file outside any confirmed target returns None from
+    the transform_tool_result face (the per-read mid-turn footer that
+    "抢跑" was RETIRED — it was bypassed by a model switch to
+    terminal/execute_code and fired before the user ever got to respond).
+    The clarify-trigger role moved to the pre_llm_call face: this same
+    read, via post_tool_call, logs the file's enclosing DIRECTORY into the
+    session ledger, and the NEXT turn's pre_llm_call notice is where the
+    "ask the user 要/不要/不再问" question is delivered. See
+    tests/test_turn_boundary_clarify.py for that face.
 
     Note: `_seed_confirmed` registers a confirmed target for this test
     (proves the other read-side paths still work), but the 'other/e.py'
@@ -215,11 +220,8 @@ def test_read_outside_confirmed_target_returns_unindexed_footer(tmp_path):
     # Sanity: 'other' is NOT under any confirmed target.
     assert hook._find_confirmed_root(str(outside), set(rootreg.confirmed_targets())) is None
     out = hook._maybe_nudge("read_file", {"path": str(outside)})
-    # (behavior change, owner-signed 2026-10-12): was `assert out is None`
-    assert out is not None, "un-indexed source-file read must return a footer"
-    assert "[code_map]" in out, f"footer must carry the code_map marker: {out[:80]!r}"
-    assert "clarify" in out, f"footer must name the host clarify tool: {out[:80]!r}"
-    assert "code_map_check_root" in out, f"footer must name the confirm tool: {out[:80]!r}"
+    # (behavior change, owner-signed 2026-10-13): was `assert out is not None`
+    assert out is None, "out-of-scope read must NOT carry a per-read footer anymore"
 
 
 def test_read_non_source_outside_confirmed_target_still_none(tmp_path):
@@ -234,53 +236,33 @@ def test_read_non_source_outside_confirmed_target_still_none(tmp_path):
     assert hook._maybe_nudge("read_file", {"path": str(md)}) is None
 
 
-def test_read_system_dir_file_outside_confirmed_target_still_footer(tmp_path):
-    """Owner's 2026-10-12 "回归白名单" ruling: the footer layer does NO
-    path heuristics of its own — index permission is decided SOLELY by
-    the Q3 clarify-evidence gate inside code_map_check_root. So a source
-    file that literally sits at a BLOCKED root prefix (/etc/...) now
-    DOES get the footer (previously this returned None via a footer
-    self-guard that the owner ruled over-complex): the footer proposes
-    /etc as the concrete boundary for the user to confirm or reject
-    via clarify; whether that proposal is actually permitted to build
-    is the Q3 gate's call, not the footer's."""
+def test_read_system_dir_file_outside_confirmed_target_no_footer(tmp_path):
+    """Owner design (2026-10-13, turn-boundary clarify): a source file that
+    literally sits at a BLOCKED root prefix (/etc/...) returns None from
+    the read face (the per-read footer is gone). The /etc read's ledger
+    write happens via post_tool_call, and the next turn's pre_llm_call
+    notice names /etc as the proposed boundary — but the BUILD decision
+    for /etc (whether the Q3 gate permits it) is still the gate's call,
+    never the read face's. See test_turn_boundary_clarify.py."""
     from code_map import hook
-    # A file literally at /etc/... (the test only needs the path string —
-    # _unindexed_footer computes its proposed boundary from the path, it
-    # does not require the file to exist on disk).
     sysfile = "/etc/some_module.py"
     out = hook._maybe_nudge("read_file", {"path": sysfile})
-    assert out is not None, "blocked-prefix source files must also get the footer now"
-    assert "[code_map]" in out
-    # The proposed boundary must be the file's own parent dir (/etc), not
-    # detect_root's last-resort $HOME fallback (which does not actually
-    # contain a /etc file).
-    assert "root='/etc'" in out, f"footer must propose the file's own parent dir: {out}"
-    assert "path='some_module.py'" in out, f"path must be relative to /etc: {out}"
+    assert out is None, "out-of-scope read (incl. /etc) must not carry a footer"
 
 
 def test_footer_boundary_is_honest_smallest_containing_dir(tmp_path):
-    """For a source file under a dir with no project marker, the footer's
-    proposed `root=` must be the smallest honest boundary that ACTUALLY
-    contains the file — its immediate parent dir — not detect_root's
-    last-resort $HOME fallback (which may not contain the file at all).
-    This is the property that makes a confirm call the user approves on
-    the basis of the footer actually index the right thing."""
-    import os
+    """Owner design (2026-10-13, turn-boundary clarify): the honest-smallest
+    boundary logic moved OUT of the read face into the ledger's
+    `_project_boundary` helper (post_tool_call side) — the SAME rule the
+    retired footer used: detect_root's marker result only when it actually
+    encloses the file, else the file's immediate parent dir. Test the
+    helper directly: an out-of-home /usr path with no marker must land on
+    the file's own parent dir, NOT detect_root's last-resort $HOME."""
     from code_map import hook
-    # A file literally under /usr/local (a BLOCKED prefix's SUBTREE —
-    # reviewer N1's case: the old footer self-guard would have proposed
-    # this anyway; the new design has no such guard, and the boundary
-    # must still be honest, i.e. the file's own parent dir).
     target = "/usr/local/lib/hermes_plugin/stub.py"
-    out = hook._maybe_nudge("read_file", {"path": target})
-    # /usr/local/lib/hermes_plugin does not exist on disk, but
-    # _unindexed_footer only needs the path string (same as the /etc
-    # test above) — no marker will be found, so detect_root's
-    # last-resort fallback is $HOME, which does NOT contain a /usr path;
-    # the footer must fall back to the file's own parent dir.
-    assert out is not None, "out-of-home source files must also get the footer"
-    assert "root='/usr/local/lib/hermes_plugin'" in out, f"boundary must be the file's own parent dir: {out}"
+    boundary = hook._project_boundary(target)
+    assert boundary == "/usr/local/lib/hermes_plugin", (
+        f"boundary must be the file's own parent dir, got: {boundary}")
 
 
 # ── 件 3: bounded self-heal (reviewer F1/F2) ────────────────────────────────

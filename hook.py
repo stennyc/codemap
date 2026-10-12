@@ -245,6 +245,279 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any,
         _log.debug("code_map clarify evidence record fail-soft: %s", exc)
 
 
+# ── turn-boundary un-indexed-project clarify (owner 2026-10-13 design) ────
+# The per-read footer's clarify-trigger role moved to a TURN-BOUNDARY face:
+#   write:  post_tool_call (read tool) -> _log_unindexed_read  (records the
+#           read's enclosing DIRECTORY, not the file)
+#   read:   pre_llm_call (host hook)  -> on_pre_llm_call        (delivers the
+#           three-option clarify instruction, once, at the turn start)
+#   settle: post_tool_call (clarify)  -> _settle_clarify_answer (要 / 不要 /
+#           不再问 each clear the ledger in a distinct way)
+# Ledger file: data_dir()/_unindexed_read_ledger — one line per pending
+# project:  <project_dir>\t<session_id>
+# Session-scoped: a session's rows are read only by that session's
+# pre_llm_call face, so rows never leak across sessions (owner's P2
+# simplification: the 3-choice closes cross-session persistence — "不再问"
+# = row deleted = never asked again, no extra state needed).
+
+def _unindexed_read_ledger() -> "Path":
+    from .config import data_dir
+    return data_dir() / "_unindexed_read_ledger"
+
+
+def _ledger_read() -> list:
+    """Return the ledger's non-empty lines, fail-soft to []."""
+    p = _unindexed_read_ledger()
+    if not p.exists():
+        return []
+    try:
+        return [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except OSError:
+        return []
+
+
+def _ledger_write(lines: list) -> None:
+    """Rewrite the ledger with `lines` (already canonical order), fail-soft.
+
+    An empty `lines` deletes the file (no 0-byte ledger residue left
+    behind, mirroring rootreg's own fail-soft style).
+    """
+    p = _unindexed_read_ledger()
+    try:
+        if lines:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
+        elif p.exists():
+            p.unlink()
+    except OSError:
+        pass
+
+
+def _project_boundary(target: str) -> Optional[str]:
+    """The footer's honest project boundary for `target` (a file path):
+    detect_root's marker result when it actually encloses the file, else
+    the file's immediate parent dir — the SAME rule the retired footer used,
+    kept in one place so the ledger key and the question text always name
+    the same boundary. Returns None when no meaningful boundary exists."""
+    from .rootdetect import detect_root
+    proj_root = detect_root(target)
+    if proj_root is None or not (target == proj_root or target.startswith(proj_root + os.sep)):
+        proj_root = os.path.dirname(target)
+    if proj_root in ("", os.sep):
+        return None
+    return proj_root
+
+
+def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) -> None:
+    """post_tool_call read side: record the file's ENCLOSEING DIRECTORY for
+    a source-file read that landed outside any confirmed target.
+
+    Judgment key is the DIRECTORY, not the file (owner's 2026-10-13
+    correction): N reads under one project coalesce to ONE ledger line, so
+    the pending set is O(projects touched) not O(files touched).
+
+    Only source files (INDEXED_EXTENSIONS, non-binary) whose boundary has
+    neither a confirmed target nor a db record get logged — the same
+    two checks the retired footer ran, so an already-indexed/confirmed
+    project never produces a pending row.
+    Fail-soft: any hiccup -> no ledger line, never breaks the read.
+    """
+    try:
+        target = (args or {}).get("path") or (args or {}).get("pattern") or ""
+        if not target:
+            return
+        target = os.path.abspath(str(target))
+        from .config import INDEXED_EXTENSIONS
+        ext = os.path.splitext(target)[1].lower()
+        if ext not in INDEXED_EXTENSIONS or _is_binary(target):
+            return
+        confirmed = rootreg.confirmed_targets()
+        if _find_confirmed_root(target, set(confirmed)) is not None:
+            return  # under a confirmed target -> the attach path, not pending
+        proj = _project_boundary(target)
+        if proj is None:
+            return
+        if rootreg.is_confirmed_root(proj):
+            return
+        from .config import root_db_path
+        if root_db_path(proj).exists():
+            return  # was indexed before -> refresh case, not "never indexed"
+        if not session_id:
+            return  # no session to scope the row to -> skip, never leak
+        line = f"{proj}\t{session_id}"
+        lines = _ledger_read()
+        if line not in lines:
+            lines.append(line)
+            _ledger_write(lines)
+    except Exception as exc:
+        _log.debug("code_map unindexed-read ledger log fail-soft: %s", exc)
+
+
+def _pending_projects(session_id: str) -> list:
+    """This session's pending project dirs, re-filtered at read time:
+    rows whose project is NOW confirmed or already has a db record are
+    dropped (the user may have confirmed between the read and this turn —
+    the row auto-falls out, no stale question). Returns a sorted,
+    de-duplicated list of boundary dirs."""
+    out: list = []
+    for line in _ledger_read():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        proj, sid = parts
+        if sid != session_id:
+            continue
+        if proj in out:
+            continue
+        if rootreg.is_confirmed_root(proj):
+            continue
+        try:
+            from .config import root_db_path
+            if root_db_path(proj).exists():
+                continue
+        except Exception:
+            continue
+        out.append(proj)
+    return sorted(out)
+
+
+def _clear_project_rows(session_id: str, project_dirs) -> None:
+    """Remove this session's ledger rows for `project_dirs` (exact, per-dir
+    settle used by '要'/'不再问')."""
+    drop = {os.path.abspath(d) for d in project_dirs}
+    kept = []
+    for line in _ledger_read():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1] == session_id and parts[0] in drop:
+            continue
+        kept.append(line)
+    _ledger_write(kept)
+
+
+def _clear_all_rows(session_id: str) -> None:
+    """Remove ALL of this session's ledger rows ('不要' settle — the user is
+    not indexing right now, do not spam any pending project)."""
+    kept = [l for l in _ledger_read() if l.split("\t")[1] != session_id]
+    _ledger_write(kept)
+
+
+def _clarify_named_project(args: Any) -> Optional[str]:
+    """Which project dir does this clarify call ask about? Extracted from
+    the question text's path mentions (absolute, >= 2 segments, longest
+    first) — the same extractor the Q3 evidence gate uses, so '要 index
+    /root/.hermes/plugins/emo 吗？' names that dir precisely. The 3 fixed
+    options (要/不要/不再问) carry no path; the path always comes from the
+    question the model wrote (the system-prompt policy instructs the model
+    to put the full target path in the clarify question, and
+    on_pre_llm_call's notice text hands it over verbatim)."""
+    from .query import _extract_path_mentions
+    q, _reply = _extract_clarify_qr(args, None)
+    if not q:
+        return None
+    mentions = _extract_path_mentions(q)
+    if not mentions:
+        return None
+    # Longest mention = the most specific target the question names.
+    best = max(mentions, key=len)
+    return os.path.abspath(best)
+
+
+def _clarify_reply_text(result: Any) -> str:
+    """The user's reply from a host clarify result payload (the first
+    question's user_response, whether single- or multi-question shape)."""
+    if not result:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        responses = result.get("responses")
+        if isinstance(responses, list) and responses:
+            first = responses[0]
+            if isinstance(first, dict):
+                return str(first.get("user_response") or "")
+            return str(first)
+        # Legacy single-question shape.
+        return str(result.get("user_response") or "")
+    return ""
+
+
+def _settle_clarify_answer(args: Any, result: Any, status: Any,
+                           session_id: Optional[str]) -> None:
+    """Turn-boundary ledger settle on a host clarify answer (owner's 2026-10-13
+    three-option model: 要 / 不要 / 不再问):
+      - '要'     -> clear ONLY the question's named project row (it becomes
+                   a confirmed target next turn; auto-drop already covers
+                   this, the explicit clear is belt-and-suspenders).
+      - '不要'   -> clear ALL of this session's pending rows (user is not
+                   indexing right now; stop asking).
+      - '不再问' -> clear the named project row; that project is silently
+                   dropped permanently (row removed = never asked again).
+    Only SUCCESSFUL clarify calls settle (a cancelled/errored call is not
+    an answer — the next turn asks again, same as the evidence gate).
+    Fail-soft: a parse hiccup leaves the ledger untouched.
+    """
+    if status is not None and str(status).lower() not in ("ok", "success", "completed"):
+        return
+    if not session_id:
+        return
+    reply = _clarify_reply_text(result).strip()
+    try:
+        if reply.startswith("不再问"):
+            proj = _clarify_named_project(args)
+            if proj:
+                _clear_project_rows(session_id, [proj])
+            return
+        if reply.startswith("不要"):
+            _clear_all_rows(session_id)
+            return
+        if reply == "要" or reply.startswith("要") and len(reply) <= 2:
+            proj = _clarify_named_project(args)
+            if proj:
+                _clear_project_rows(session_id, [proj])
+            return
+        # Unknown reply (free-text 'Other' that is none of the three):
+        # treat as '不要' for the ledger's purpose — the user did not say
+        # '要', so stop asking; an affirmative typed freely does not get
+        # a 要-style clear (a bare '要' is the tap case, free text is out
+        # of scope for the ledger by design).
+        _clear_all_rows(session_id)
+    except Exception as exc:
+        _log.debug("code_map clarify-answer settle fail-soft: %s", exc)
+
+
+def on_pre_llm_call(session_id: str = "", user_message: str = "",
+                    conversation_history: Optional[list] = None, model: str = "",
+                    platform: str = "", **_: Any) -> Optional[Dict[str, str]]:
+    """pre_llm_call hook dispatcher (host-facing): the turn-boundary face
+    that delivers the "你摸了未索引项目 X，请调 clarify 问用户是否建索引"
+    question ONCE per turn, listing this session's still-pending project
+    dirs with the owner's three fixed clarify options (要 / 不要 / 不再问).
+
+    Returns None when nothing is pending (no ledger rows for this session,
+    or every row auto-fell out because the project is now confirmed / has
+    a db record) — a clean turn costs the host nothing (one small file
+    read). The returned `context` rides the host's pre_llm_call injection
+    (appended to the user message, same shape filemem's auto-retrieve
+    returns). Fail-soft: any exception -> None, never breaks the LLM call.
+    """
+    try:
+        if not session_id:
+            return None
+        projects = _pending_projects(session_id)
+        if not projects:
+            return None
+        lines = [f"[code_map] 上一轮你读了未索引项目的源码，请调 clarify 问用户"
+                 f"是否为它建代码地图（三个选项：要 / 不要 / 不再问）："]
+        for proj in projects:
+            lines.append(f"  - {proj}")
+        lines.append("（用户选 要 -> 按策略 code_map_check_root 建索引；选 不再问 -> "
+                     "永不再就该项目询问。）")
+        return {"context": "\n".join(lines)}
+    except Exception as exc:
+        _log.debug("code_map pre_llm_call notice fail-soft: %s", exc)
+        return None
+
+
 def _post_tool_call(tool_name: str = "", args: Any = None,
                     result: Any = None, **_: Any) -> Optional[str]:
     """post_tool_call dispatcher.
@@ -258,13 +531,25 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
     callers that don't pass status).
     """
     try:
+        # Read-side ledger: a read_file/search_files landing OUTSIDE any
+        # confirmed target logs the file's enclosing DIRECTORY (project
+        # boundary) into the session-scoped ledger. The turn-boundary
+        # pre_llm_call face (on_pre_llm_call) is what delivers the
+        # "ask the user whether to build a code map" question — the
+        # per-read transform_tool_result footer is retired for this role.
+        if tool_name in _READ_TOOLS:
+            _log_unindexed_read(tool_name, args, _.get("session_id"))
         # Q3 transcript 兜底：宿主 clarify 工具的一次调用 = "用户被问到且
         # 已应答"的权威 transcript 证据。args 里携带 code_map 目标
         # （策略文本要求模型把目标写进 clarify 的问题里），result 里是
         # 用户的应答文本。两者齐全且调用成功才落 evidence log。
+        # Also: the 3-option clarify (要/不要/不再问) answer clears the
+        # un-indexed-read ledger per the owner's 2026-10-13 ruling.
         if tool_name == "clarify":
             _record_clarify_evidence(args, result, _.get("status"),
                                     session_id=_.get("session_id"))
+            _settle_clarify_answer(args, result, _.get("status"),
+                                   session_id=_.get("session_id"))
             return None
         if tool_name not in _WRITE_TOOLS:
             return None
@@ -400,17 +685,15 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
     confirmed = rootreg.confirmed_targets()
     enclosing = _find_confirmed_root(target, set(confirmed))
     if enclosing is None:
-        # Not under any confirmed target. Two sub-cases:
-        #  (a) a source file in a project that HAS never been indexed
-        #      (no db record + target not confirmed) -> the owner-design
-        #      "un-indexed footer": one line pointing the model at the
-        #      host `clarify` tool + code_map_check_root (mirrors
-        #      filemem's draft-decision footer — the model decides, the
-        #      plugin only nudges; no state, no auto-inject).
-        #  (b) a non-source file, or a file under a BLOCKED root prefix
-        #      (/etc, /usr, ...) where we must NEVER invite an index ->
-        #      None, as before.
-        return _unindexed_footer(target)
+        # Not under any confirmed target. The clarify-trigger role moved
+        # to the turn-boundary pre_llm_call face (owner's 2026-10-13
+        # ruling: the per-read mid-turn footer "抢跑" and is bypassed by a
+        # model switch to terminal/execute_code). This read-side path now
+        # contributes NOTHING to the tool result for an out-of-scope read
+        # — the ledger write (post_tool_call side) is what captures the
+        # "model read an un-indexed project" fact for the turn-boundary
+        # question.
+        return None
 
     # Must be a source file (extension in INDEXED_EXTENSIONS) — NOT .md/.json
     # and not a binary. Non-source paths under a confirmed target still get
@@ -430,80 +713,6 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
             return attached
         return _plain_nudge(root)  # map query failed -> plain nudge
     return _plain_nudge(enclosing)  # non-source path under a confirmed target
-
-
-def _unindexed_footer(target: str) -> Optional[str]:
-    """Owner-design (2026-10-12, mirrors filemem's draft-decision footer):
-    when a read_file / search_files target is a SOURCE file that is NOT
-    under any confirmed code_map target AND whose enclosing project has
-    never been indexed (no db record), return a one-line footer that
-    points the model at the host `clarify` tool + `code_map_check_root`
-    so the user gets asked, once, whether to build a code map for that
-    project. The model decides; the plugin only nudges — no state, no
-    auto-inject, exactly like filemem's `_pending_drafts` footer.
-
-    The footer layer deliberately does NO path heuristics of its own
-    (owner's 2026-10-12 ruling: "回归白名单，只有用户通过 clarify 的才
-    进行索引" — revert to a pure whitelist design): index permission is
-    determined SOLELY by the Q3 clarify-evidence gate inside
-    code_map_check_root (fail-closed, evidence log = the whitelist).
-    This footer only proposes a boundary (detect_root or the file's
-    parent dir, whichever contains the target) so the user has something
-    concrete to confirm; whether that proposal is actually permitted to
-    build is the Q3 gate's call, not the footer's.
-
-    Returns None (the pre-existing behaviour for this branch) when ANY
-    of these hold — i.e. we do NOT even nudge:
-      - the file is not a source file (extension not in INDEXED_EXTENSIONS
-        or it's a binary);
-      - the enclosing project root (marker-detected, or the file's
-        parent dir as a last resort) is already a confirmed target, or
-        already has a code_map db record — the project WAS indexed before
-        (or is confirmed under this registry); that's a refresh/attach
-        case, not a "never indexed" case, and the footer would mislead.
-
-    The footer's `root=`/`path=` split: use `rootdetect.detect_root`
-    (marker-based project root) as the boundary root when it actually
-    contains the target; otherwise fall back to the target's immediate
-    parent dir. `path=` is the target's path relative to that chosen
-    root. The footer does not second-guess that choice against
-    BLOCKED_ROOT_PREFIXES — that guard, if any, belongs to the confirm
-    gate, not to a read-side nudge.
-    """
-    from .config import INDEXED_EXTENSIONS, root_db_path
-    ext = os.path.splitext(target)[1].lower()
-    if ext not in INDEXED_EXTENSIONS or _is_binary(target):
-        return None
-
-    from .rootdetect import detect_root
-    proj_root = detect_root(target)
-    # detect_root's last-resort fallback is always $HOME (never None),
-    # so it may return a boundary that does NOT actually contain the
-    # target (e.g. reading a file under /etc -> it climbs past / and
-    # falls back to $HOME as the "cap"). Use it only when it truly
-    # encloses the file; otherwise the file's own parent dir is the
-    # honest, smallest boundary that "contains the project".
-    if proj_root is None or not (target == proj_root or target.startswith(proj_root + os.sep)):
-        proj_root = os.path.dirname(target)
-    if proj_root in ("", os.sep):
-        return None  # target is at the filesystem root itself -> no meaningful boundary
-
-    # "还没 confirm 过": the chosen project root (or its containing
-    # sub-tree) is not a confirmed target.
-    if rootreg.is_confirmed_root(proj_root):
-        return None  # already confirmed -> the confirmed-target path handles it
-    # "数据库没有记录": no db record for this project root.
-    if root_db_path(proj_root).exists():
-        return None  # was indexed before (just not under this registry)
-
-    rel = os.path.relpath(target, proj_root)
-    return (
-        f"[code_map] {os.path.basename(proj_root)} has no code map yet "
-        f"(not confirmed, no db record). Ask the user via the host "
-        f"`clarify` tool whether to build one; if they confirm, call "
-        f"code_map_check_root(root={proj_root!r}, path={rel!r}, yes=True) "
-        f"(dry-run first if unsure how many files it would index)."
-    )
 
 
 def _plain_nudge(target_or_root: str) -> Optional[str]:

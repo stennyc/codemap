@@ -282,6 +282,15 @@ def _register_hooks(ctx: Any) -> None:
     # - post_tool_call: write/patch side. On a SUCCESSFUL write under a
     #   confirmed target, synchronously reindex that single file + mark the
     #   target dirty (件 1). Observer hook — returns None, mutates the db.
+    #   ALSO: read-side ledger write for un-indexed projects (turn-boundary
+    #   clarify, owner 2026-10-13) + clarify-answer settle (要/不要/不再问).
+    # - pre_llm_call: the turn-boundary face (owner 2026-10-13) — at the start
+    #   of each LLM turn, injects a notice listing this session's still-pending
+    #   un-indexed project dirs, instructing the model to call the host
+    #   `clarify` tool with three fixed options (要 / 不要 / 不再问). Returns
+    #   None when nothing is pending. Mirrors filemem's auto-retrieve return
+    #   shape ({'context': '...'}).
     ctx.register_hook("transform_tool_result", hook.on_result)
     ctx.register_hook("post_tool_call", hook._post_tool_call)
+    ctx.register_hook("pre_llm_call", hook.on_pre_llm_call)
 
