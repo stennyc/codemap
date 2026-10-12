@@ -30,6 +30,7 @@ import logging
 import os
 import fcntl
 import time
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
@@ -267,6 +268,16 @@ def _unindexed_read_ledger() -> "Path":
     return data_dir() / "_unindexed_read_ledger"
 
 
+# Re-entrancy guard: one lock so two concurrent _ledger_rmw calls in the
+# SAME process (host's bounded post_tool_call worker threads, or pre_llm_call
+# + post_tool_call racing) cannot stack up. flock handles cross-process
+# (hardlink-shared data dir); this lock handles the same-process, cross-thread
+# case, which fcntl.flock on a per-thread fd does NOT serialize against
+# (each thread opens its own fd and gets its own lock handle).
+# Guarded: see _ledger_write_lock below.
+_ledger_thread_lock = threading.Lock()
+
+
 @contextmanager
 def _ledger_write_lock(nowait: bool = True):
     """Ledger's advisory cross-process write lock, on ITS OWN lock file
@@ -355,13 +366,22 @@ def _ledger_rmw(mutate) -> None:
     body, so a contested RMW degrades to the pre-lock fail-soft behaviour
     instead of ever blocking a host worker (the 30s bounded-hook budget
     applies). `mutate` returning None means "unchanged" (no write, no
-    unlink).
+    unlink.
+
+    TWO-LEVEL locking (reviewer round 2, R2-1): the flock above is
+    CROSS-PROCESS only — each host/profile process opens its own fd on
+    the shared lock file, so two bounded worker threads inside the SAME
+    host process do NOT serialize against each other (flock on distinct
+    fds = distinct lock handles, both acquire). A process-local
+    threading.Lock closes that hole; the two locks nest (thread first,
+    then flock) so a cross-process + cross-thread race is still safe.
     """
-    with _ledger_write_lock(nowait=True):
-        new_lines = mutate(_ledger_read())
-        if new_lines is None:
-            return
-        _ledger_write(new_lines)
+    with _ledger_thread_lock:
+        with _ledger_write_lock(nowait=True):
+            new_lines = mutate(_ledger_read())
+            if new_lines is None:
+                return
+            _ledger_write(new_lines)
 
 
 def _ledger_write(lines: list) -> None:
@@ -404,7 +424,11 @@ def _project_boundary(target: str) -> Optional[str]:
         # /root/x/y.py with no marker anywhere -> the project is /root/x,
         # NOT /root (the home tree is not indexable).
         proj_root = os.path.dirname(target)
-    if proj_root in ("", os.sep):
+    # R2-4 residual: a file DIRECTLY under $HOME ($HOME/y.py) downgrades to
+    # $HOME itself, which is not a meaningful project boundary — no
+    # sensible project sits at the home root. Return None (never log a
+    # $HOME row).
+    if proj_root == home or proj_root in ("", os.sep):
         return None
     return proj_root
 
@@ -424,10 +448,21 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
     Fail-soft: any hiccup -> no ledger line, never breaks the read.
     """
     try:
-        target = (args or {}).get("path") or (args or {}).get("pattern") or ""
+        target = str((args or {}).get("path") or (args or {}).get("pattern") or "")
         if not target:
             return
-        target = os.path.abspath(str(target))
+        # The search_files `pattern` is a regex/glob, not a path: a bare
+        # relative pattern ('*.py') abspaths to the CWD and splitext would
+        # log the CWD itself as a "project" (reviewer round 1). Only an
+        # ABSOLUTE pattern names a real directory; a relative pattern is
+        # too CWD-dependent to settle — read_file is the reliable trigger
+        # (the attach path's search_files note at 件 2 says the same thing:
+        # a pattern carries no specific file to settle against). This check
+        # MUST run on the raw (pre-abspath) value: a relative input's
+        # abspath is itself the noise we're trying to reject.
+        if tool_name == "search_files" and not os.path.isabs(target):
+            return
+        target = os.path.abspath(target)
         from .config import INDEXED_EXTENSIONS
         ext = os.path.splitext(target)[1].lower()
         if ext not in INDEXED_EXTENSIONS or _is_binary(target):
@@ -498,18 +533,23 @@ def _clear_project_rows(session_id: str, project_dirs) -> None:
             if len(parts) == 2 and parts[1] == session_id and parts[0] in drop:
                 continue
             kept.append(line)
-        return current if kept == current else kept
+        # None = unchanged (skip the write, matching _ledger_rmw's
+        # documented contract); a fresh list only when a row was dropped.
+        return None if kept == current else kept
 
     _ledger_rmw(_drop)
 
 
-# Settle-side session scope: _settle_clarify_answer binds the session before
-# calling _clarify_named_projects, so boundary-upward mapping only matches
-# against THIS session's pending rows (never another session's).
-_current_settle_session: Dict[str, str] = {}
+# Settle-side session scope is passed EXPLICITLY as a parameter through
+# _settle_clarify_answer -> _clarify_named_projects (reviewer round 2, R2-2:
+# the old module-level dict was shared across concurrent worker threads,
+# so thread B's session could bleed into thread A's boundary-upward
+# mapping and clear the wrong session's rows). threading.local would also
+# work; an explicit parameter is simpler and makes the dependency visible
+# in the signature.
 
 
-def _clarify_named_projects(args: Any) -> list:
+def _clarify_named_projects(args: Any, session_id: str = "") -> list:
     """Every (project boundary) this clarify call asks about. Extracted from
     EACH question text's path mentions (absolute, >= 2 segments) — the same
     extractor the Q3 evidence gate uses. The 3 fixed options (要/不要/不再问)
@@ -550,7 +590,7 @@ def _clarify_named_projects(args: Any) -> list:
             # clearing an absent row is a no-op, and a new path the user
             # consented to by typing may not be in the ledger yet.
             target = m_abs
-            for proj in _pending_projects(_current_settle_session.get("session", "")):
+            for proj in _pending_projects(session_id):
                 if target == proj or target.startswith(proj + os.sep):
                     target = proj
                     break
@@ -632,12 +672,11 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
         return
     if not session_id:
         return
-    _current_settle_session["session"] = session_id
     try:
         replies = [r.strip() for r in _clarify_reply_texts(result)]
         for reply in replies:
             if reply.startswith("不再问"):
-                projs = _clarify_named_projects(args)
+                projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
                 continue
@@ -645,7 +684,7 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
             # settle the named project(s). '不要' does NOT start with
             # '要' (it starts with '不'), so no collision.
             if reply.startswith("要"):
-                projs = _clarify_named_projects(args)
+                projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
                 continue
@@ -653,8 +692,6 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
             # owner's "不要 = 下次还问" semantics.
     except Exception as exc:
         _log.debug("code_map clarify-answer settle fail-soft: %s", exc)
-    finally:
-        _current_settle_session["session"] = ""
 
 
 def on_pre_llm_call(session_id: str = "", user_message: str = "",
@@ -680,12 +717,14 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
             return None
         lines = [f"[code_map] 上一轮你读了未索引项目的源码，请对每个项目"
                  f"各发一条 clarify 问用户是否为其建代码地图"
-                 f"（一条问题只问一个项目；三个选项：要 / 不要 / 不再问）："]
+                 f"（推荐一条问题只问一个项目；若合并成一条，代码会按"
+                 f"问题里的路径提及逐个清账。三个选项：要 / 不要 / 不再问）："]
         for proj in projects:
             lines.append(f"  - {proj}")
         lines.append("（语义：要 -> 按 code_map 策略取合法的 "
                      "(boundary root, relative path) 对调 "
-                     "code_map_check_root(..., yes=True) 建索引；"
+                     "code_map_check_root(root=<boundary 的父目录>, "
+                     "path=<项目目录名>, yes=True) 建索引；"
                      "不要 -> 暂不建，下次读到该项目仍会再问；"
                      "不再问 -> 永不再就该项目询问。）")
         return {"context": "\n".join(lines)}

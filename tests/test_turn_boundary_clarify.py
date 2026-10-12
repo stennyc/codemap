@@ -378,3 +378,124 @@ def test_boundary_never_expands_to_home(tmp_path, monkeypatch):
     assert boundary == str(proj / "sub"), (
         f"boundary must be the file's parent dir, not $HOME: {boundary}")
     assert str(fake_home) != boundary
+
+
+# ── reviewer round 2 follow-ups (2026-10-13) ─────────────────────────────
+
+def test_same_process_threads_no_row_loss(tmp_path):
+    """R2-1: two bounded worker THREADS in the same host process used to
+    lose ~99% of rows (flock on per-thread fds does NOT serialize
+    cross-thread). The threading.Lock in _ledger_rmw closes that hole:
+    N threads x M appends must yield exactly the distinct rows."""
+    import threading
+    from code_map import hook
+    from code_map.config import data_dir
+    proj = _make_unconfirmed_project(tmp_path)
+    errors = []
+
+    def worker(i):
+        row = f"p{i}\ts{i}"
+
+        def append(cur, r=row):
+            if r in cur:
+                return None
+            cur.append(r)
+            return cur
+
+        for _ in range(200):
+            try:
+                hook._ledger_rmw(append)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"RMW must not raise: {errors[:3]}"
+    p = data_dir() / "_unindexed_read_ledger"
+    lines = p.read_text().splitlines() if p.exists() else []
+    uniq = set(l.split("\t")[0] for l in lines)
+    assert len(uniq) == 4, f"4 distinct threads -> 4 rows, got {uniq!r}"
+    assert len(lines) == 4, f"each thread's row coalesces to one: {lines!r}"
+
+
+def test_affirmative_yes_word_clears_q3_gate(tmp_path):
+    """Owner's '要' is a fixed clarify choice — _is_affirmative must treat
+    the bare word '要' (and its free-text 要-prefix variants) as
+    affirmative, otherwise the '要' flow dead-ends at the Q3 evidence
+    gate (record_clarify_evidence would mint an affirmative:false line)."""
+    from code_map.query import _is_affirmative
+    for reply in ("要", "要了", "要建立", "要建吧", "要建索引"):
+        assert _is_affirmative(reply), f"{reply!r} must be affirmative"
+    for reply in ("不要", "不再问", "不用", "否"):
+        assert not _is_affirmative(reply), f"{reply!r} must NOT be affirmative"
+
+
+def test_check_root_under_boundary_evidence_passes_gate(tmp_path):
+    """R2 reviewer #1: evidence minted for the boundary dir /x/projA must
+    authorize a check_root target that lies UNDER that dir (e.g.
+    /x/projA/core.py via root=/x/projA, path=core.py) — the Q3 gate's
+    descent relaxation. Without it, the user taps 要 and the build is
+    still blocked_by_policy."""
+    from code_map import hook, rootreg
+    from code_map.query import record_clarify_evidence, _clarify_evidence
+    proj = _make_unconfirmed_project(tmp_path, name="projA")
+    proj_str = str(proj)
+    # Simulate: read -> ledger row -> clarify '要' -> evidence minted for
+    # the BOUNDARY dir (what _record_clarify_evidence's new-path fallback
+    # actually stores, per the clarify question text).
+    record_clarify_evidence(proj_str, "要", session_id="s1")
+    # The gate called with target = a file UNDER the boundary must pass.
+    sub_target = os.path.join(proj_str, "core.py")
+    ev = _clarify_evidence(sub_target, "", "", session_id="s1")
+    assert ev is not None, "descent relaxation: a check_root target under " \
+                           "the evidence's boundary dir must be accepted"
+    # The reverse (wider than the boundary) must NOT be authorized.
+    wider = os.path.dirname(proj_str)
+    ev2 = _clarify_evidence(wider, "", "", session_id="s1")
+    assert ev2 is None, "a target WIDER than the boundary must stay blocked"
+
+
+def test_check_root_exactly_boundary_passes_gate(tmp_path):
+    """The natural split root=<parent>, path=<boundary name> produces a
+    check_root target EQUAL to the evidence target — must pass."""
+    from code_map import hook
+    from code_map.query import record_clarify_evidence, _clarify_evidence
+    proj = _make_unconfirmed_project(tmp_path, name="projA")
+    record_clarify_evidence(str(proj), "要", session_id="s1")
+    ev = _clarify_evidence(str(proj), "", "", session_id="s1")
+    assert ev is not None
+
+
+def test_home_root_level_file_no_boundary(tmp_path, monkeypatch):
+    """R2-4 residual: a source file DIRECTLY under $HOME ($HOME/y.py,
+    no markers anywhere) must NOT get $HOME itself as its boundary —
+    _project_boundary returns None, so no ledger row is ever minted for
+    a bare home-root file."""
+    from code_map import hook
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    f = fake_home / "y.py"
+    f.write_text("def y(): pass\n", encoding="utf-8")
+    assert hook._project_boundary(str(f)) is None, (
+        "a file at $HOME root is not a project boundary")
+
+
+def test_search_files_relative_pattern_does_not_log(tmp_path):
+    """Reviewer round 1: a bare relative search_files pattern ('*.py')
+    abspaths to the CWD — logging the CWD as a 'project' is noise. Only
+    absolute patterns (or read_file) are trustworthy triggers."""
+    from code_map import hook
+    proj = _make_unconfirmed_project(tmp_path)
+    # Read one file to establish a real row.
+    hook._post_tool_call("read_file", {"path": str(proj / "core.py")}, None,
+                         status="ok", session_id="s1")
+    before = _pending_rows()
+    # A relative search_files pattern must NOT add a CWD row.
+    hook._post_tool_call("search_files", {"pattern": "core.py"}, None,
+                         status="ok", session_id="s1")
+    assert _pending_rows() == before, "relative pattern must not mint a row"

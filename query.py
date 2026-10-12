@@ -139,6 +139,12 @@ _AFFIRMATIVE = frozenset({
     # Chinese
     "确认", "确认保存", "同意", "批准", "可以", "好", "好的", "行", "动手",
     "就按这个来",
+    # 三选项固定应答词（owner 2026-10-13 设计：clarify 卡片选项"要"）：
+    # 整词匹配靠 RISK #5 的 token-boundary 规则（"要" 只在独立成词时命中，
+    # "不需要"/"要不要都行" 里的 "要" 是 CJK 连词的一部分，不会误判）；
+    # 自由文本变体（"要了"/"要建立"）额外列全，"不要" 永远由负面短电路
+    # 拦在 false（见 RISK #1 注释）。
+    "要", "要了", "要建", "要建立", "要建吧", "要建索引",
     # English (incl. the colloquial forms RISK #5 flagged as missed)
     "yes", "y", "ok", "okay", "approve", "approved", "go",
     "sure", "yep", "yeah", "sounds good", "sounds fine", "great", "go for it",
@@ -184,6 +190,37 @@ _NEGATIVE_CJK_SUBSTR = ("取消", "拒绝", "不要", "不用", "不建", "不�
 # sub-path (>= 2 consecutive path segments) instead of the full abspath;
 # both the hook (record side) and the gate (lookup side) use this rule.
 _MIN_PARTIAL_MATCH_SEGMENTS = 2
+
+
+def _target_in_descent_chain(target: str, evidence_targets: set) -> bool:
+    """Owner's 2026-10-13 turn-boundary clarify loop (reviewer round 2,
+    Q3-gate closure): the pending row the pre_llm_call notice names is the
+    project BOUNDARY dir (detect_root's result or the file's parent dir),
+    and the clarify question text that the model generates from it names
+    THAT dir. `record_clarify_evidence` therefore mints its evidence line
+    with target = the boundary dir. But the subsequent code_map_check_root
+    call joins (root, path) per gate ⑩ — and the model can pick ANY legal
+    split of the same boundary (root=<boundary parent>, path=<boundary
+    name> is the natural one, but root=<boundary>, path=<rel subpath> is
+    equally legal). Without this relaxation, an evidence line minted for
+    the boundary dir would not match a check_root target that lies
+    DESCENDANT to it (or any other legal split of the same dir), and the
+    user's "要" tap would dead-end at the Q3 gate.
+
+    The rule: `target` is accepted if it EQUALS an evidence target, or if
+    it sits ANYWHERE under one (descendant of the boundary the user was
+    asked about). An evidence target for /a/b/c authorizes a build of
+    /a/b/c/d (deeper into the same confirmed scope the user approved) but
+    NOT /a/b (wider — that would index more than the user was asked
+    about, and is rejected). Pure function, no filesystem access."""
+    t = os.path.abspath(target)
+    for e in evidence_targets:
+        e = os.path.abspath(e)
+        if t == e:
+            return True
+        if t.startswith(e + os.sep):
+            return True
+    return False
 
 
 def _evidence_log() -> Path:
@@ -343,11 +380,11 @@ def _clarify_evidence(target: str, root: str, path: str,
     #         a live session — that would strand legitimate C-mid
     #         back-compat lines written before the key file existed.
     sign_key = _load_evidence_key()
-    best: Optional[Dict[str, Any]] = None
     log = _evidence_log()
     if not log.exists():
         return None
     try:
+        rows = []
         for line in log.read_text().splitlines():
             line = line.strip()
             if not line:
@@ -356,7 +393,13 @@ def _clarify_evidence(target: str, root: str, path: str,
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if rec.get("target") != target:
+            # Q3 descent relaxation (owner 2026-10-13): the evidence line's
+            # target may be a boundary dir that CONTAINS the requested
+            # target (the model's check_root call named a sub-path of the
+            # boundary the user actually approved). Accept every
+            # same-session, affirmative, sig-verified row whose target is
+            # an ancestor-or-self of `target`, and take the newest.
+            if not _target_in_descent_chain(target, {rec.get("target") or ""}):
                 continue
             if not rec.get("affirmative"):
                 continue
@@ -402,12 +445,13 @@ def _clarify_evidence(target: str, root: str, path: str,
                 rec_sid = rec.get("session_id")
                 if rec_sid != session_id:
                     continue
-            # Newest first wins (ts is host-local ISO from the hook).
-            if best is None or str(rec.get("ts", "")) >= str(best.get("ts", "")):
-                best = rec
+            rows.append(rec)
+        if not rows:
+            return None
+        # Newest first wins (ts is host-local ISO from the hook).
+        return max(rows, key=lambda r: str(r.get("ts", "")))
     except OSError:
         return None
-    return best
 
 
 def record_clarify_evidence(target: str, user_response: str,
