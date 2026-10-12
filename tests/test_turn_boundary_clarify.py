@@ -213,7 +213,10 @@ def test_clarify_reply_yes_clears_named_project_row(tmp_path):
     assert str(proj_b) in joined, "the OTHER project's row must survive"
 
 
-def test_clarify_reply_no_clears_all_rows(tmp_path):
+def test_clarify_reply_no_keeps_all_rows(tmp_path):
+    """Owner semantics (exact): '不要' = not indexing RIGHT NOW, the question
+    stands — nothing is cleared, the SAME project is asked again on its
+    next read."""
     from code_map import hook
     proj_a = _make_unconfirmed_project(tmp_path, name="projA")
     proj_b = _make_unconfirmed_project(tmp_path, name="projB")
@@ -223,7 +226,9 @@ def test_clarify_reply_no_clears_all_rows(tmp_path):
     hook._post_tool_call("clarify", {"questions": [
         {"question": f"要 index {proj_a} 吗？", "choices": ["要", "不要", "不再问"]}]},
         {"responses": [{"user_response": "不要"}]}, status="ok", session_id="s1")
-    assert _pending_rows() == []
+    joined = "\n".join(_pending_rows())
+    assert str(proj_a) in joined, "不要 -> that project's row stays (asked again)"
+    assert str(proj_b) in joined, "不要 -> no other row is touched either"
 
 
 def test_clarify_reply_neverask_clears_named_project_row(tmp_path):

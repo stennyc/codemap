@@ -394,13 +394,6 @@ def _clear_project_rows(session_id: str, project_dirs) -> None:
     _ledger_write(kept)
 
 
-def _clear_all_rows(session_id: str) -> None:
-    """Remove ALL of this session's ledger rows ('不要' settle — the user is
-    not indexing right now, do not spam any pending project)."""
-    kept = [l for l in _ledger_read() if l.split("\t")[1] != session_id]
-    _ledger_write(kept)
-
-
 def _clarify_named_project(args: Any) -> Optional[str]:
     """Which project dir does this clarify call ask about? Extracted from
     the question text's path mentions (absolute, >= 2 segments, longest
@@ -444,13 +437,15 @@ def _clarify_reply_text(result: Any) -> str:
 def _settle_clarify_answer(args: Any, result: Any, status: Any,
                            session_id: Optional[str]) -> None:
     """Turn-boundary ledger settle on a host clarify answer (owner's 2026-10-13
-    three-option model: 要 / 不要 / 不再问):
-      - '要'     -> clear ONLY the question's named project row (it becomes
-                   a confirmed target next turn; auto-drop already covers
-                   this, the explicit clear is belt-and-suspenders).
-      - '不要'   -> clear ALL of this session's pending rows (user is not
-                   indexing right now; stop asking).
-      - '不再问' -> clear the named project row; that project is silently
+    three-option model, exact semantics: 要 / 不要 / 不再问):
+      - '要'     -> the project is being indexed now; clear ONLY that
+                   project's row (it becomes a confirmed target next turn;
+                   the explicit clear is belt-and-suspenders over the
+                   auto-drop).
+      - '不要'   -> the user is not indexing RIGHT NOW, but the question
+                   stands: clear nothing, the row stays, the SAME project
+                   gets asked again on its next read.
+      - '不再问' -> clear the named project's row; that project is silently
                    dropped permanently (row removed = never asked again).
     Only SUCCESSFUL clarify calls settle (a cancelled/errored call is not
     an answer — the next turn asks again, same as the evidence gate).
@@ -467,20 +462,13 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
             if proj:
                 _clear_project_rows(session_id, [proj])
             return
-        if reply.startswith("不要"):
-            _clear_all_rows(session_id)
+        # '不要' (and every non-'要' answer) settles nothing: the pending
+        # rows stay, the same project is asked again on its next read.
+        if not (reply == "要" or (reply.startswith("要") and len(reply) <= 2)):
             return
-        if reply == "要" or reply.startswith("要") and len(reply) <= 2:
-            proj = _clarify_named_project(args)
-            if proj:
-                _clear_project_rows(session_id, [proj])
-            return
-        # Unknown reply (free-text 'Other' that is none of the three):
-        # treat as '不要' for the ledger's purpose — the user did not say
-        # '要', so stop asking; an affirmative typed freely does not get
-        # a 要-style clear (a bare '要' is the tap case, free text is out
-        # of scope for the ledger by design).
-        _clear_all_rows(session_id)
+        proj = _clarify_named_project(args)
+        if proj:
+            _clear_project_rows(session_id, [proj])
     except Exception as exc:
         _log.debug("code_map clarify-answer settle fail-soft: %s", exc)
 
@@ -510,8 +498,9 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
                  f"是否为它建代码地图（三个选项：要 / 不要 / 不再问）："]
         for proj in projects:
             lines.append(f"  - {proj}")
-        lines.append("（用户选 要 -> 按策略 code_map_check_root 建索引；选 不再问 -> "
-                     "永不再就该项目询问。）")
+        lines.append("（语义：要 -> 调 code_map_check_root(root=<boundary>, "
+                     "path=<rel>, yes=True) 建索引；不要 -> 暂不建，"
+                     "下次读到该项目仍会再问；不再问 -> 永不再就该项目询问。）")
         return {"context": "\n".join(lines)}
     except Exception as exc:
         _log.debug("code_map pre_llm_call notice fail-soft: %s", exc)
