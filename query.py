@@ -70,6 +70,13 @@ _NEGATIVE_ASCII = frozenset({
 # hit IS a real negation. Single-char "不" is NOT in this set (too many
 # false-positive substrings: "不行" inside "不太行得通" etc. — keep the
 # token-level CJK guard for that one instead).
+# RISK note (reviewer, 2026-10-12): '否决' as a plain substring can, in
+# principle, misfire on a sentence like '否决不了，还是确认吧' (a genuine
+# affirmation that happens to contain the word). Deliberately accepted,
+# not 'fixed': the failure mode is fail-closed (a real yes gets blocked,
+# the user just has to re-ask), and this phrasing is rare enough that
+# adding carve-out logic for it isn't worth the complexity. Documented
+# so nobody 'fixes' it the wrong way later.
 _NEGATIVE_CJK_SUBSTR = ("取消", "拒绝", "不要", "不用", "不建", "不索引", "否决")
 
 # RISK #6 fallback: a clarify question may mention the target by a TRAILING
@@ -163,26 +170,34 @@ def _extract_path_mentions(question: str) -> List[str]:
     fallback. A relative fragment ('x/y') is deliberately NOT returned:
     a bare fragment of a never-seen target must not mint evidence (the
     collision risk that made the first, too-loose fix wrong). Pure text,
-    no filesystem access, no side effects."""
+    no filesystem access, no side effects.
+
+    Cross-platform note (reviewer RISK #4, 2026-10-12): this extractor
+    is POSIX-path-shaped and returns whatever raw text is in the
+    question, UNNORMALIZED — callers that compare these mentions
+    against each other (or against a stored target) must do so on the
+    os.path.abspath() form, not the raw string, or distinct raw
+    spellings of the same target (../ folds, double slashes, trailing
+    spaces) will not dedupe. On Windows an 'absolute' path would start
+    with a drive letter, not '/', so this extractor would simply find
+    no mentions there — a real Windows deployment would need a
+    drive-letter-aware variant; not a concern for this host (Linux)
+    today, documented so nobody silently 'fixes' it by swapping in a
+    regex that also matches relative fragments."""
     global _ABS_PATH_RE
     if _ABS_PATH_RE is None:
         import re as _re
+        # NOTE: the character class deliberately EXCLUDES whitespace —
+        # that's what makes the "trailing-space variant" dedup case
+        # (reviewer RISK #2, 2026-10-12) work: a reply that types
+        # "/a/b/c " (trailing space) extracts as "/a/b/c", whose
+        # os.path.abspath() matches the question's clean "/a/b/c".
+        # If anyone ever adds \s to this class, that dedup silently
+        # breaks (raw-text comparison would see two distinct strings).
         _ABS_PATH_RE = _re.compile(
             r"/(?:[A-Za-z0-9._-]+/){1,}[A-Za-z0-9._-]+")
     found = set(_ABS_PATH_RE.findall(question or ""))
     return sorted(found, key=len, reverse=True)
-    # Cross-platform note (reviewer RISK #4, 2026-10-12): this extractor
-    # is POSIX-path-shaped and returns whatever raw text is in the
-    # question, unnormalized — callers that compare these mentions
-    # against each other (or against a stored target) must do so on the
-    # os.path.abspath() form, not the raw string, or distinct raw spellings
-    # of the same target (../ folds, double slashes, trailing spaces) will
-    # not dedupe. On Windows an 'absolute' path would start with a drive
-    # letter, not '/', so this extractor would simply find no mentions
-    # there — a real Windows deployment would need a drive-letter-aware
-    # variant; not a concern for this host (Linux) today, documented so
-    # nobody silently 'fixes' it by swapping in a regex that also matches
-    # relative fragments.
 
 
 
