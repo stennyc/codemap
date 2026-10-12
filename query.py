@@ -8,9 +8,12 @@ resolve within the confirmed root. No CWD fallback anywhere.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +34,104 @@ from . import rootreg
 #      否则 fail-closed 拒绝（blocked_by_policy），指引"先 clarify 再
 #      yes=true"。382k-file 事故的同类风险面由此闭环。
 _EVIDENCE_FILE = "_clarify_evidence.jsonl"
+_SIGNING_KEY_FILE = "_evidence_signing_key"
+
+# ── C-mid: per-line HMAC signature over the clarify-evidence log ─────────
+# Owner policy (2026-10-12): the session-stamped evidence log is still a
+# plain file a same-host writer (including the model via execute_code /
+# terminal, all root here) can forge. C-lite rejects cross-session and
+# un-stamped lines, but a forged line STAMPED with the current
+# HERMES_SESSION_ID would still pass C-lite. C-mid closes that: every
+# evidence line carries an HMAC-SHA256 signature over its canonical JSON,
+# keyed by a random secret generated once and held ONLY under data/
+# (co-located with the log). A hand-written line cannot produce a valid
+# signature, so the gate rejects it; legitimate hook-minted lines verify.
+#
+# Back-compat (fail-open for data this process itself wrote): lines minted
+# BEFORE C-mid has no "sig" field and are accepted (old confirmations must
+# not be stranded). A forged line added AFTER C-mid carries no valid sig ->
+# rejected. A pre-C-mid line with a GARBAGE sig is also rejected (an
+# attacker touching the log loses the back-compat pass).
+
+def _evidence_key_path() -> Path:
+    return data_dir() / _SIGNING_KEY_FILE
+
+
+def _load_evidence_key() -> Optional[bytes]:
+    """Return the signing key, or None when no key exists yet.
+
+    The key is generated lazily (see _mint_evidence_line); this reader is
+    used by the gate, where a missing key simply means "no verifiable
+    lines expected" -> fall back to C-lite behavior, never crash."""
+    p = _evidence_key_path()
+    try:
+        if p.exists():
+            return p.read_bytes()
+    except OSError:
+        return None
+    return None
+
+
+def _sign_evidence_line(rec: Dict[str, Any], key: Optional[bytes]) -> Dict[str, Any]:
+    """Compute the sig for an evidence record (sig field added by the caller).
+
+    The canonical payload is the record WITHOUT the sig field, key-sorted
+    JSON (UTF-8, no ascii escaping) — byte-stable for a given record. The
+    key stays out of the payload; it only signs it."""
+    payload = {k: v for k, v in rec.items() if k != "sig"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+    if key is None:
+        return {"sig": None}
+    return {"sig": hmac.new(key, canonical, hashlib.sha256).hexdigest()}
+
+
+def _verify_evidence_line(rec: Dict[str, Any], key: bytes) -> bool:
+    """True iff rec["sig"] matches the HMAC over the canonical payload.
+
+    Recreate the expected signature and use constant-time compare. A
+    missing/None sig is a False (no back-compat: pre-C-mid lines are
+    handled by the caller via the "sig" key-absent branch, not here)."""
+    if "sig" not in rec or rec.get("sig") in (None, ""):
+        return False
+    payload = {k: v for k, v in rec.items() if k != "sig"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+    expected = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, str(rec["sig"]))
+
+
+def _mint_evidence_line(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure an evidence record carries a valid C-mid signature before it
+    is written. Loads (or generates on first use) the key under data/,
+    computes the sig, and returns the record WITH "sig" attached. The key
+    file is created 0600 so a co-host reader can't trivially copy it.
+    Fail-soft: on any key/fs hiccup the record is returned UNSIGNED
+    (sig=None); the gate then degrades per the documented skip-arm rule.
+
+    M1: concurrent first-time mints can each generate a distinct key; the
+    one that wins the key-file write is authoritative, the other's sigs
+    become orphaned. In practice the evidence log is single-writer under
+    host dispatch, so this is a robustness note, not a security issue."""
+    key = _load_evidence_key()
+    if key is None:
+        try:
+            import os as _os
+            key = _os.urandom(32)
+            p = _evidence_key_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(key)
+            try:
+                _os.chmod(p, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            key = None
+    signed = _sign_evidence_line(rec, key)
+    rec = dict(rec)
+    rec["sig"] = signed["sig"]
+    return rec
 
 # 宿主单选卡应答的肯定词面（clarify choices 约定：确认保存/确认/yes/...）。
 # 保守匹配：只有明确肯定词才放行，含糊/否定/其他一律视为无证据（fail-closed）。
@@ -201,16 +302,47 @@ def _extract_path_mentions(question: str) -> List[str]:
 
 
 
-def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, Any]]:
+def _clarify_evidence(target: str, root: str, path: str,
+                     session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     # NOTE: `root`/`path` are unused (kept for call-site signature
     # compatibility); the gate target is the joined+abspath-normalized
     # `target`, which is the ONLY join key consulted against the log.
     del root, path
     """Latest transcript evidence that the user affirmatively confirmed
-    THIS exact target via the host clarify tool. Returns the evidence
-    record (with ts + user response) or None (no/affirmative-missing).
-    Fail-soft: a missing/corrupt log -> None (fail-closed at the gate)."""
+    THIS exact target via the host clarify tool, in THIS session.
+    Returns the evidence record (with ts + user response + session_id)
+    or None (no/affirmative-missing/cross-session-mismatch).
+    Fail-soft: a missing/corrupt log -> None (fail-closed at the gate).
+
+    C-lite (session anchor): the evidence line must carry a ``session_id``
+    matching the caller's current session. Lines minted in a different
+    session (or hand-written without a session_id) are NOT accepted —
+    this is what blocks cross-session / forged-evidence bypasses.
+    ``session_id=None`` on the caller side (legacy / unit tests that don't
+    stamp the env) degrades to the pre-C-lite behavior (no session check)
+    to keep existing tests green; a production call always passes the
+    live ``HERMES_SESSION_ID`` so the check is active."""
     target = os.path.abspath(target)
+    if session_id is None:
+        session_id = os.environ.get("HERMES_SESSION_ID")
+    # C-mid: load the signing key once. Acceptance policy:
+    #   - record has NO "sig" key at all -> pre-C-mid back-compat line,
+    #     falls through to the C-lite session check below only.
+    #   - record carries a "sig" key:
+    #       * sig value is a non-empty hex string -> must verify against
+    #         the loaded key; key absent or verify fails -> reject
+    #         (fail-closed: we never accept a line we cannot
+    #         authenticate).
+    #       * sig value is null / empty (e.g. hand-written `sig: null`)
+    #         -> "skip arm": treated as an unsigned line and falls
+    #         through to the C-lite session check. Rationale: this is
+    #         the documented session-less degrade path the owner chose
+    #         (C-mid fail-soft); under a live HERMES_SESSION_ID the
+    #         C-lite check still rejects it, so the skip arm is safe in
+    #         production. Do NOT "fix" this to reject null-sig under
+    #         a live session — that would strand legitimate C-mid
+    #         back-compat lines written before the key file existed.
+    sign_key = _load_evidence_key()
     best: Optional[Dict[str, Any]] = None
     log = _evidence_log()
     if not log.exists():
@@ -228,6 +360,48 @@ def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, A
                 continue
             if not rec.get("affirmative"):
                 continue
+            # C-mid signature check. A line that CARRIES a "sig" field is a
+            # C-mid-minted line and MUST verify — the sig is the forgery
+            # detector, so a bad/missing-verification sig is always a reject.
+            # Only lines with NO "sig" key at all take the pre-C-mid
+            # back-compat path (fall through to the C-lite session check).
+            # C-mid signature check. The "sig" key is present in three forms:
+            #   (a) no "sig" key            -> pre-C-mid back-compat: fall
+            #                                  through to C-lite check.
+            #   (b) sig = null / empty      -> "skip arm": the key file was
+            #                                  absent at mint time so no
+            #                                  sig could be computed (the
+            #                                  _mint_evidence_line fail-soft
+            #                                  path). Treated as unsigned:
+            #                                  fall through to C-lite. Under
+            #                                  a live session this is still
+            #                                  rejected by the session check;
+            #                                  in the sessionless degrade path
+            #                                  it is accepted (documented
+            #                                  fail-soft, not a security hole).
+            #   (c) sig = hex string        -> C-mid-minted under a live key:
+            #                                  MUST verify. Key absent OR
+            #                                  verify fails -> reject
+            #                                  (fail-closed: we never accept
+            #                                  a line we can't authenticate).
+            sig_val = rec.get("sig")
+            if sig_val is not None and sig_val != "":
+                if sign_key is None or not _verify_evidence_line(rec, sign_key):
+                    continue
+            # C-lite session anchor: when the caller is running under a live
+            # HERMES_SESSION_ID, ONLY same-session stamped lines are accepted.
+            # - stamped + matching session  -> accept
+            # - stamped + different session -> reject (cross-session theft)
+            # - un-stamped (pre-C-lite / hand-written) -> reject, since a live
+            #   session means the host SHOULD have stamped this line; an
+            #   un-stamped line under a live session is exactly the forged or
+            #   legacy row we are trying to block.
+            # When session_id is None (unit tests / session-less runner) the
+            # check is skipped, preserving the pre-C-lite behavior.
+            if session_id:
+                rec_sid = rec.get("session_id")
+                if rec_sid != session_id:
+                    continue
             # Newest first wins (ts is host-local ISO from the hook).
             if best is None or str(rec.get("ts", "")) >= str(best.get("ts", "")):
                 best = rec
@@ -237,18 +411,36 @@ def _clarify_evidence(target: str, root: str, path: str) -> Optional[Dict[str, A
 
 
 def record_clarify_evidence(target: str, user_response: str,
-                            ts: Optional[str] = None) -> None:
+                            ts: Optional[str] = None,
+                            session_id: Optional[str] = None) -> None:
     """Append one clarify-evidence record (called by the post_tool_call
     hook for host clarify calls). Appends ONLY — the gate reads newest.
-    Fail-soft: a log write hiccup must never break a tool call."""
+    Fail-soft: a log write hiccup must never break a tool call.
+
+    C-lite: ``session_id`` is the host-kwargs session id (or the current
+    ``HERMES_SESSION_ID`` env when the caller omitted it). The gate reads
+    the SAME env on its side to reject evidence minted in a different
+    session — a hand-written line without a matching session_id fails the
+    session-check."""
     if not target:
         return
+    if session_id is None:
+        # M4: read the env var directly (no `or None` fold): an empty-string
+        # session id (a host bug) is preserved as "" so the session check can
+        # see the distinction between "un-stamped" (None) and "stamped-empty"
+        # (""). The gate treats both the same (empty != live session), but
+        # keeping the raw value avoids silently collapsing the two cases.
+        session_id = os.environ.get("HERMES_SESSION_ID")
     rec = {
         "ts": ts or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "target": os.path.abspath(target),
         "user_response": (user_response or "")[:400],
         "affirmative": _is_affirmative(user_response or ""),
+        "session_id": session_id,
     }
+    # C-mid: sign the line before it hits the log so the gate can later
+    # distinguish host-minted evidence from a hand-written forgery.
+    rec = _mint_evidence_line(rec)
     try:
         log = _evidence_log()
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -466,11 +658,11 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             "status": "blocked_by_policy",
             "root": target,
             "note": ("yes=true requires a prior user confirmation for this "
-                     "exact target. Call code_map_check_root (dry-run) and "
-                     "ask the user via the host `clarify` tool first; the "
-                     "user's affirmative reply is the transcript evidence "
-                     "this gate accepts. (Owner policy 2026-10-11: 模型推 "
-                     "clarify, transcript 兜底.)"),
+                     "exact target, in this session. Call code_map_check_root "
+                     "(dry-run) and ask the user via the host `clarify` tool "
+                     "first; the user's affirmative reply is the transcript "
+                     "evidence this gate accepts (session-stamped since C-lite). "
+                     "(Owner policy 2026-10-11: 模型推 clarify, transcript 兜底.)"),
             "next": "code_map_check_root(root, path) + clarify, then yes=true",
         }, ensure_ascii=False)
 

@@ -61,17 +61,93 @@ _WRITE_TOOLS = ("write_file", "patch")
 
 # ── write/patch side: synchronous single-file reindex (件 1) ────────────────
 
-def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
+def _extract_clarify_qr(args: Any, result: Any) -> tuple[Optional[str], str]:
+    """C-0: pull (question_text, reply_text) out of a host clarify call.
+
+    The host clarify tool's real schema is ``questions=[{qid, question,
+    choices?, multi_select?}]`` (a plural array; each entry is one question,
+    UI appends an 'Other' free-text row, answers come back keyed by qid).
+    This mirrors the legacy single-shot shape ``{"question", "choices"}``
+    (unit tests / earlier host builds) and returns the FIRST question's text
+    + the reply for it. If a call carries multiple questions we only mine
+    evidence for the first — a multi-question clarify that bundles a code_map
+    target with other topics is out of scope for the gate's 1:1 join key.
+
+    Reply extraction (shape-agnostic, keep the old tolerant parsing):
+      - result is the post_tool_call payload. Depending on the host renderer
+        it may be a JSON string, a dict, or a raw string. We walk the common
+        shapes and pull out the first non-empty user response text.
+    """
+    q: Optional[str] = None
+    if isinstance(args, dict):
+        qs = args.get("questions")
+        if isinstance(qs, list) and qs:
+            first = qs[0]
+            if isinstance(first, dict):
+                q = str(first.get("question") or "").strip() or None
+            elif isinstance(first, str):
+                q = first.strip() or None
+        if not q:
+            q = str(args.get("question") or "").strip() or None
+    reply = ""
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            parsed = result
+    else:
+        parsed = result
+    if isinstance(parsed, dict):
+        # Host clarify_tool._result returns:
+        #   {"responses": [{"question", "choices_offered", "status", "user_response"}, ...],
+        #    "outcome": "..."}
+        # — a LIST of response dicts keyed by qid, each carrying user_response.
+        # Also accept legacy shapes: {"responses": {"q0": "..."}} (dict),
+        # {"answers": [...]}, {"response": "..."}.
+        for k in ("responses", "answers", "response"):
+            v = parsed.get(k)
+            if isinstance(v, list) and v:
+                # Primary host shape: list of response dicts.
+                if isinstance(v[0], dict):
+                    reply = str(v[0].get("user_response") or "")
+                else:
+                    reply = str(v[0])
+                break
+            elif isinstance(v, dict) and v:
+                # Legacy dict shape: {"q0": "..."} or {"q0": {...}}
+                val = next(iter(v.values()))
+                if isinstance(val, dict):
+                    reply = str(val.get("user_response") or "")
+                else:
+                    reply = str(val)
+                break
+            elif isinstance(v, str) and v:
+                reply = v
+                break
+    elif isinstance(parsed, list) and parsed:
+        reply = str(parsed[0])
+    elif isinstance(parsed, str):
+        reply = parsed
+    return q, (reply or "").strip()
+
+
+def _record_clarify_evidence(args: Any, result: Any, status: Any,
+                             session_id: Optional[str] = None) -> None:
     """Record a host clarify call as transcript evidence for the code_map
     target it asked about (Q3, owner policy: 模型推 clarify, transcript 兜底).
 
-    Shape (verified against the host clarify tool):
-      args: {"question": "...", "choices": [...]}  — the question is
-            REQUIRED to mention the code_map target (the policy text
-            instructs the model to phrase it as: "要 index <target> 吗？"
-            so the target path is in the question).
-      result: the user's reply (a choice label or free text), possibly
-            JSON-encoded depending on the host renderer.
+    C-0 + C-lite:
+      - C-0: question text now extracted via _extract_clarify_qr so the
+        host's real plural ``questions`` schema (not the legacy single
+        ``question`` dict) is honored. The legacy shape still works.
+      - C-lite: ``session_id`` (host-kwargs ``session_id``, passed through
+        by _post_tool_call) is stamped into the evidence line so the gate
+        can reject evidence minted in a DIFFERENT session than the one
+        calling code_map_check_root(yes=true). The caller (gate) is the
+        authoritative session boundary; a hand-written evidence line with
+        a stale/missing session_id fails the gate check.
+      result: the user's reply (a choice label, free text, or a JSON-encoded
+            structure from the host renderer; see _extract_clarify_qr).
 
     Only successful clarify calls are recorded (a cancelled/errored one is
     NOT evidence the user consented). The target is extracted from the
@@ -83,26 +159,9 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
     if status is not None and str(status).lower() not in ("ok", "success", "completed"):
         return
     try:
-        q = (args or {}).get("question") if isinstance(args, dict) else None
+        q, reply = _extract_clarify_qr(args, result)
         if not q:
             return
-        # The user's reply: result is the tool's result payload (str or
-        # JSON str). Extract the reply TEXT (not its JSON encoding) so the
-        # affirmative match sees "确认", not the quoted '"确认"'.
-        reply = ""
-        if isinstance(result, str):
-            try:
-                parsed = json.loads(result)
-            except ValueError:
-                parsed = result
-            if isinstance(parsed, dict):
-                reply = str(parsed.get("response", ""))
-            elif isinstance(parsed, list) and parsed:
-                reply = str(parsed[0])
-            else:
-                reply = str(parsed)
-        elif isinstance(result, dict):
-            reply = str(result.get("response", ""))
         if not reply:
             return
         # Join key: which confirmed target does the question ask about?
@@ -120,7 +179,7 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
                     best = target
         if best is not None:
             from .query import record_clarify_evidence
-            record_clarify_evidence(best, reply)
+            record_clarify_evidence(best, reply, session_id=session_id)
             return
         # New-path fallback (RISK #6 follow-up, found in the 2026-10-11
         # knowledge-base-search live test): the model is asking to index a
@@ -159,7 +218,7 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
         # silently dropping the evidence.
         from .query import _is_affirmative, record_clarify_evidence
         if best is not None:
-            record_clarify_evidence(best, reply)
+            record_clarify_evidence(best, reply, session_id=session_id)
         # 'Other' free-text correction channel (owner's 2026-10-12 ruling):
         # the host clarify UI auto-appends an 'Other' free-text row; if the
         # user's reply TYPES an absolute path that the QUESTION itself did
@@ -181,7 +240,7 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any) -> None:
             q_mentions_norm = {os.path.abspath(c) for c in _extract_path_mentions(q)}
             for cand in _extract_path_mentions(reply):
                 if os.path.abspath(cand) not in q_mentions_norm:
-                    record_clarify_evidence(os.path.abspath(cand), reply)
+                    record_clarify_evidence(os.path.abspath(cand), reply, session_id=session_id)
     except Exception as exc:
         _log.debug("code_map clarify evidence record fail-soft: %s", exc)
 
@@ -204,7 +263,8 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
         # （策略文本要求模型把目标写进 clarify 的问题里），result 里是
         # 用户的应答文本。两者齐全且调用成功才落 evidence log。
         if tool_name == "clarify":
-            _record_clarify_evidence(args, result, _.get("status"))
+            _record_clarify_evidence(args, result, _.get("status"),
+                                    session_id=_.get("session_id"))
             return None
         if tool_name not in _WRITE_TOOLS:
             return None

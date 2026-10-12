@@ -703,5 +703,280 @@ def test_hook_user_other_multithread_dedup_is_per_abspath_not_per_rawtext(monkey
     _cleanup(home, proj)
 
 
+def test_clarify_c_lite_same_session_evidence_passes(monkeypatch):
+    """C-lite: evidence stamped with the SAME session id as the caller's
+    live HERMES_SESSION_ID must pass the gate."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
+    _cleanup(_mk_home("clitesame"), _mk_proj("clitesame"))
+    home = _mk_home("clitesame")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-clitesame")
+    proj = _mk_proj("clitesame")
+    (proj / "a.py").write_text("def csl(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Evidence stamped with the SAME session id the caller runs under.
+    record_clarify_evidence(str(proj), "确认", session_id="sess-clitesame")
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_lite_cross_session_evidence_blocked(monkeypatch):
+    """C-lite: evidence stamped with a DIFFERENT session id must be
+    rejected — cross-session theft is the bypass we are closing."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
+    _cleanup(_mk_home("clitex"), _mk_proj("clitex"))
+    home = _mk_home("clitex")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-clitex")
+    proj = _mk_proj("clitex")
+    (proj / "a.py").write_text("def csl(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Evidence minted in another session.
+    record_clarify_evidence(str(proj), "确认", session_id="sess-other")
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+    assert "this session" in res["note"], res["note"]
+    _cleanup(home, proj)
+
+
+def test_clarify_c_lite_unstamped_line_rejected_under_live_session(monkeypatch):
+    """C-lite: an un-stamped (pre-C-lite or hand-written) evidence line must
+    be REJECTED when the caller runs under a live HERMES_SESSION_ID — that is
+    exactly the forged/legacy row the session anchor blocks."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence, _evidence_log
+    _cleanup(_mk_home("clilegacy"), _mk_proj("clilegacy"))
+    home = _mk_home("clilegacy")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-clilegacy")
+    proj = _mk_proj("clilegacy")
+    (proj / "a.py").write_text("def csl(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Hand-written line: explicit session_id=None so it lands UN-STAMPED
+    # (the record fn only falls back to the env when session_id is None AND we
+    # are NOT under a live session; here we pass a sentinel that records as
+    # missing). Simulate the pre-C-lite / forged shape directly on the log.
+    _evidence_log().unlink(missing_ok=True)
+    rec = {
+        "ts": "2026-10-12T00:00:00",
+        "target": os.path.abspath(str(proj)),
+        "user_response": "确认",
+        "affirmative": True,
+    }  # no session_id key -> un-stamped
+    _evidence_log().parent.mkdir(parents=True, exist_ok=True)
+    with open(_evidence_log(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_lite_sessionless_degrades_to_legacy(monkeypatch):
+    """C-lite: when the caller has NO live session id (unit test / sessionless
+    runner), the session anchor degrades to the pre-C-lite behavior — an
+    un-stamped line is accepted, keeping old confirmations valid."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
+    _cleanup(_mk_home("clinone"), _mk_proj("clinone"))
+    home = _mk_home("clinone")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    proj = _mk_proj("clinone")
+    (proj / "a.py").write_text("def csl(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # No live session -> record fn stamps session_id=None -> un-stamped line.
+    record_clarify_evidence(str(proj), "确认")
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_mid_valid_signature_passes(monkeypatch):
+    """C-mid: an evidence line minted by record_clarify_evidence carries a
+    valid HMAC sig and must pass the gate when the session matches."""
+    from code_map import rootreg
+    from code_map.query import record_clarify_evidence
+    _cleanup(_mk_home("cmidv"), _mk_proj("cmidv"))
+    home = _mk_home("cmidv")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidv")
+    proj = _mk_proj("cmidv")
+    (proj / "a.py").write_text("def cmv(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    record_clarify_evidence(str(proj), "确认", session_id="sess-cmidv")
+    # Verify the line actually carries a non-None sig.
+    from code_map.query import _evidence_log
+    recs = [json.loads(l) for l in _evidence_log().read_text().splitlines()
+            if l.strip()]
+    assert recs and all(r.get("sig") for r in recs), \
+        f"hook-minted lines must carry a C-mid sig: {recs}"
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "build_started", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_mid_forged_signature_rejected(monkeypatch):
+    """C-mid: a line that CARRIES a sig field but it does NOT verify (a
+    hand-written forgery that stamps session_id correctly but forges the sig)
+    must be REJECTED — the sig is the forgery detector."""
+    from code_map import rootreg
+    from code_map.query import _evidence_log
+    _cleanup(_mk_home("cmidf"), _mk_proj("cmidf"))
+    home = _mk_home("cmidf")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidf")
+    proj = _mk_proj("cmidf")
+    (proj / "a.py").write_text("def cmf(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Forge: correct target + correct session_id, but a bogus signature.
+    _evidence_log().unlink(missing_ok=True)
+    _evidence_log().parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": "2026-10-12T00:00:00",
+        "target": os.path.abspath(str(proj)),
+        "user_response": "确认",
+        "affirmative": True,
+        "session_id": "sess-cmidf",
+        "sig": "0" * 64,  # wrong-length / wrong-content sig -> must fail verify
+    }
+    with open(_evidence_log(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_mid_forged_sig_with_live_key_exercises_verify(monkeypatch):
+    """F2: the forged-sig reject above passes trivially when the key file is
+    absent (reject happens at the key-absent branch, not the verify path).
+    This test pre-mints a REAL key (via record_clarify_evidence) so that
+    _verify_evidence_line actually runs on the forged sig and the reject is
+    attributed to a sig MISMATCH, not to a missing key."""
+    from code_map import rootreg
+    from code_map.query import _evidence_log, record_clarify_evidence, _load_evidence_key
+    _cleanup(_mk_home("cmidv2"), _mk_proj("cmidv2"))
+    home = _mk_home("cmidv2")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidv2")
+    proj = _mk_proj("cmidv2")
+    (proj / "a.py").write_text("def cmv2(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Step 1: mint a real line -> this forces key generation (first mint).
+    record_clarify_evidence(str(proj), "确认", session_id="sess-cmidv2")
+    key = _load_evidence_key()
+    assert key is not None, "key must exist after first mint"
+
+    # Step 2: overwrite the log with a forged sig line ONLY (drop the real one),
+    # keeping the same target + session, but with a bogus sig.
+    _evidence_log().unlink(missing_ok=True)
+    _evidence_log().parent.mkdir(parents=True, exist_ok=True)
+    forged = {
+        "ts": "2026-10-12T00:00:00",
+        "target": os.path.abspath(str(proj)),
+        "user_response": "确认",
+        "affirmative": True,
+        "session_id": "sess-cmidv2",
+        "sig": "1" * 64,  # 64 chars but wrong content -> verify fails
+    }
+    with open(_evidence_log(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(forged, ensure_ascii=False) + "\n")
+
+    # Now the key EXISTS, so the gate reaches _verify_evidence_line (the sig
+    # mismatch branch) and must reject.
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    assert res["status"] == "blocked_by_policy", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_mid_null_sig_skip_arm_sessionless(monkeypatch):
+    """C-mid skip-arm (F1): a line with sig=null (the _mint_evidence_line
+    fail-soft unsigned shape) in a sessionless caller degrades to the
+    C-lite back-compat path and is accepted."""
+    from code_map import rootreg
+    from code_map.query import _evidence_log
+    _cleanup(_mk_home("cmidns"), _mk_proj("cmidns"))
+    home = _mk_home("cmidns")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    proj = _mk_proj("cmidns")
+    (proj / "a.py").write_text("def cmns(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    # Write a line with sig=null explicitly (the fail-soft unsigned shape).
+    _evidence_log().unlink(missing_ok=True)
+    _evidence_log().parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": "2026-10-12T00:00:00",
+        "target": os.path.abspath(str(proj)),
+        "user_response": "确认",
+        "affirmative": True,
+        "session_id": None,
+        "sig": None,
+    }
+    with open(_evidence_log(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    # Sessionless + sig=null -> skip arm accepts (C-lite degrade).
+    assert res["status"] == "build_started", res
+    _cleanup(home, proj)
+
+
+def test_clarify_c_mid_null_sig_rejected_under_live_session(monkeypatch):
+    """C-mid skip-arm + C-lite interaction (F1): the same sig=null line is
+    REJECTED under a live HERMES_SESSION_ID, because the C-lite session check
+    (rec session_id != live session) rejects it — proving the skip arm is
+    safe in production even though it does not itself reject null sigs."""
+    from code_map import rootreg
+    from code_map.query import _evidence_log
+    _cleanup(_mk_home("cmidns2"), _mk_proj("cmidns2"))
+    home = _mk_home("cmidns2")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-live")
+    proj = _mk_proj("cmidns2")
+    (proj / "a.py").write_text("def cmns2(): pass\n")
+    rootreg.write_confirmed_root(str(proj))
+
+    _evidence_log().unlink(missing_ok=True)
+    _evidence_log().parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": "2026-10-12T00:00:00",
+        "target": os.path.abspath(str(proj)),
+        "user_response": "确认",
+        "affirmative": True,
+        "session_id": None,   # un-stamped
+        "sig": None,         # skip-arm unsigned
+    }
+    with open(_evidence_log(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    res = json.loads(code_map_check_root(
+        {"root": "/tmp", "path": proj.name, "yes": True}))
+    # Live session + un-stamped line -> C-lite rejects (session mismatch).
+    assert res["status"] == "blocked_by_policy", res
+    _cleanup(home, proj)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
