@@ -34,9 +34,10 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-from .config import (HOOK_DEBOUNCE_S, READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
-                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
-                     READ_SYMBOL_MAX_BYTES, data_dir)
+from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
+                    READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
+                    READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
+                    READ_SYMBOL_MAX_BYTES, data_dir)
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
@@ -1029,6 +1030,132 @@ def _count_indexed_files(root: str) -> int:
         return 0
 
 
+def _cross_folder_signal(root: str, file_path: str,
+                         import_rows: list) -> Optional[str]:
+    """Cross-folder dependency existence+count signal (owner 2026-10-13).
+
+    For the read target's in-project import edges, count how many land in a
+    DIFFERENT top-level sub-directory of the CONFIRMED root than the file
+    itself. This is the "does this file even have cross-folder contacts?"
+    question the owner wants the model to see WITHOUT being handed the
+    target paths — the count is the signal; `code_map_query` is the follow-up
+    for the details. Root-external targets (stdlib / third-party / anything
+    that resolves above the confirmed root) are never counted: the confirmed
+    root IS the project boundary (owner: "confirm 记录的不就是项目根吗").
+
+    `import_rows` are (name, kind, line, sig, ...) tuples from
+    `query_symbols(..., kind="import")`. Resolution is conservative and
+    per-file only: the import edge's target module is located among this
+    ROOT's indexed files (path = module dotted/relative under root); a
+    target that is not indexable inside the root cannot be classified, so it
+    is silently dropped (fail-soft, matches the gate ⑨ posture). Returns a
+    one-line string when count > 0, else None (no noise line).
+
+    Cost: one sqlite COUNT + a few LIKE lookups on the root's `files`
+    table — cheap on the read hot path, bounded by the host hook budget.
+    """
+    try:
+        from .config import root_db_path
+        db = root_db_path(root)
+        if not db.exists():
+            return None
+        import sqlite3
+        conn = sqlite3.connect(str(db), timeout=2.0)
+        try:
+            root_abs = os.path.abspath(root)
+            file_abs = os.path.abspath(file_path)
+
+            # All in-root module basenames, to classify import edges.
+            indexed = [r[0] for r in conn.execute(
+                "SELECT path FROM files").fetchall()]
+            mod_to_files = {}
+            def _real_module(name: str, sig: str) -> Optional[str]:
+                """Recover the REAL imported symbol from an import edge.
+
+                For `from ..sub_b import util as tool`, the parser records
+                the ALIAS `tool` as the import name, but the module file is
+                `util.py` — which is what the basename map keys on. The `sig`
+                field carries the full line ('from ..sub_b import util as
+                tool'), so we recover the original symbol without a schema
+                change. For non-aliased edges the recorded `name` already IS
+                the imported symbol, so it is returned as-is. Return None
+                when the edge can't be classified as an in-root module.
+                """
+                if not sig:
+                    return name
+                s = sig.strip()
+                if s.startswith("from "):
+                    # `from <mod> import <sym> [as <alias>]`
+                    # The imported symbol is the FIRST name AFTER 'import'.
+                    parts = s.split()
+                    try:
+                        imp_idx = parts.index("import")
+                    except ValueError:
+                        return name
+                    if len(parts) > imp_idx + 1:
+                        sym = parts[imp_idx + 1]
+                        # strip surrounding parens (e.g. `import (a, b)`)
+                        sym = sym.lstrip("(")
+                        return sym or name
+                    return name
+                # `import <mod>` — name IS the module/symbol
+                return name
+
+            # Python-only signal (reviewer round-1, finding ④): the basename
+            # module map keys on the `.py` extension; a non-Python file's
+            # import edges (TS/Go/Rust etc.) therefore never resolve and are
+            # silently skipped (fail-soft). This is deliberate — the signal
+            # is a cheap existence hint, not a full cross-language resolver.
+            for p in indexed:
+                b = os.path.basename(p)
+                if b.endswith(".py"):
+                    b = b[:-3]
+                # Store the TOP-LEVEL sub-dir of the confirmed root (e.g. 'a'
+                # for 'a/b/x.py'), not the full relative dir. The owner's
+                # cross-folder definition is relative to the confirmed root:
+                # 'a/b/x.py' vs 'a/c/x.py' are NOT cross-folder (both under
+                # top-level 'a'), while 'a/b/x.py' vs 'sub_b/x.py' ARE.
+                rel_dir = os.path.dirname(os.path.relpath(os.path.abspath(p), root_abs))
+                top_dir = rel_dir.split(os.sep, 1)[0] if rel_dir else ""
+                mod_to_files.setdefault(b, []).append(top_dir)
+
+            count = 0
+            seen = set()
+            for r in import_rows:
+                name = r[2]
+                sig = r[5] if len(r) > 5 else ""
+                # Reveal the real module name (alias -> original) so an
+                # `as`-renamed edge still matches the basename map.
+                real = _real_module(name, sig)
+                if not real or real in seen:
+                    continue
+                seen.add(real)
+                dirs = mod_to_files.get(real)
+                if not dirs:
+                    continue  # not indexable inside this root -> stdlib/3rd
+                # Cross-folder iff SOME directory of `real` differs from the
+                # file's own top-level sub-dir (handles same-basename-in-
+                # multiple-subdirs = inherently cross-folder).
+                own_top = os.path.dirname(os.path.relpath(
+                    os.path.abspath(file_path), root_abs)).split(os.sep, 1)[0] \
+                    if os.path.dirname(os.path.relpath(os.path.abspath(file_path), root_abs)) else ""
+                if any(d != own_top for d in dirs):
+                    count += 1
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log.debug("code_map cross-folder signal fail-soft: %s", exc)
+        return None
+    if count <= 0:
+        return None
+    line = (f"  cross-folder: {count} import target(s) in other sub-dir(s) "
+            f"of this confirmed root (count over the {len(import_rows)} "
+            f"import edge(s) attached above; more imports may exist beyond "
+            f"top-N -> code_map_query for the full list)")
+    line = line[:CROSS_FOLDER_LINE_MAX_BYTES]
+    return line
+
+
 def _attach_symbols(root: str, file_path: str) -> Optional[str]:
     """Query the map for this file's own symbols + import edges; return the
     attachment text, or None when the query path is unavailable.
@@ -1086,6 +1213,12 @@ def _attach_symbols(root: str, file_path: str) -> Optional[str]:
         out = raw[:budget].decode("utf-8", errors="ignore") + marker.decode("utf-8")
     else:
         out = raw.decode("utf-8", errors="ignore")
+    # Cross-folder existence signal (owner 2026-10-13): appended AFTER the
+    # byte cap, OUTSIDE READ_SYMBOL_MAX_BYTES — it must never squeeze the
+    # symbol lines. Emitted only when N > 0 (no noise line when 0).
+    cross = _cross_folder_signal(root, file_path, import_rows)
+    if cross:
+        out = out + "\n" + cross
     return out
 
 

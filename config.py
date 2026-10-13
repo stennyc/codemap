@@ -77,6 +77,21 @@ WAL_BUSY_TIMEOUT_MS = 5000
 # Tier-1 save-hook debounce: agent writes N files in a burst -> one parse job.
 HOOK_DEBOUNCE_S = 0.25
 
+# Cross-folder dependency signal (owner 2026-10-13): appended AFTER the
+# byte-capped symbol/import block of the read-side attach, as a one-line
+# existence+count signal. `N` = how many of this file's in-project
+# (root-internal) import edges land in a different top-level sub-directory
+# of the CONFIRMED root than the file itself. Root-external targets
+# (stdlib / third-party / anything above the confirmed root) are NEVER
+# counted — the confirmed root is the project boundary. Budget: the signal
+# line is appended OUTSIDE READ_SYMBOL_MAX_BYTES so it must never squeeze
+# the symbol lines (owner: "预算不是重点，重点是不要影响分符号行"). Only
+# emitted when N > 0; a 0 stays silent (no noise line). Sized so the FULL
+# cue ("...more imports may exist beyond top-N -> code_map_query for the
+# full list") survives for any realistic count (worst case count=3-digit
+# number keeps the line at 204 bytes, under the 208 cap) — the follow-up
+# keyword `code_map_query` must never be the truncated tail.
+CROSS_FOLDER_LINE_MAX_BYTES = 208
 # Read-side auto map-attach (code_map auto-indexing, owner 2026-10-11):
 # when read_file/search_files lands on a source file UNDER a confirmed target,
 # the result is auto-augmented with that file's own symbol outline (top
