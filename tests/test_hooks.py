@@ -184,15 +184,29 @@ def test_attach_byte_cap_is_exact_not_char_based(tmp_path):
         f"CJK attach overflowed cap: {len(b)} bytes > {READ_SYMBOL_MAX_BYTES + 40}"
 
 
-def test_non_source_read_gets_plain_nudge_not_attach(tmp_path):
+def test_binary_read_under_confirmed_target_no_footer(tmp_path):
+    """A source extension (.py) whose content is binary must also get NO
+    footer: binary sniff short-circuits the attach path before any
+    symbol query (binary .py is unparseable; sniffing avoids wasted db
+    work)."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["bin.py"], "def bin(): pass\n")
+    bin_p = Path(target) / "bin.py"
+    bin_p.write_bytes(b"\x00\x01\x02\x03\x04" * 10)  # NUL bytes in first 512
+    out = hook._maybe_nudge("read_file", {"path": str(bin_p)})
+    assert out is None, "binary read under a confirmed target must return None"
+
+
+def test_non_source_read_under_confirmed_target_no_footer(tmp_path):
+    """Owner ruling 2026-10-15 (option A): a .md read under a confirmed
+    target gets NO footer at all (was: plain directory nudge, which
+    hijacked the read result)."""
     from code_map import hook, rootreg
     target = _seed_confirmed(tmp_path, ["d.py"], "def d(): pass\n")
     md = Path(target) / "notes.md"
     md.write_text("# doc\n", encoding="utf-8")
     out = hook._maybe_nudge("read_file", {"path": str(md)})
-    # .md is not in INDEXED_EXTENSIONS -> plain directory nudge, no symbol block.
-    assert out is not None and out.startswith("[code_map]")
-    assert "symbol(s) in this file" not in out, "non-source must NOT attach symbols"
+    assert out is None, "non-source read under a confirmed target must return None"
 
 
 def test_read_outside_confirmed_target_no_footer(tmp_path):

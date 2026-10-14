@@ -912,23 +912,27 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
         return None
 
     # Must be a source file (extension in INDEXED_EXTENSIONS) — NOT .md/.json
-    # and not a binary. Non-source paths under a confirmed target still get
-    # the plain directory nudge (useful "you're in an indexed dir" signal).
+    # and not a binary. Non-source paths under a confirmed target get NO
+    # footer at all (owner ruling 2026-10-15): the legacy plain directory
+    # nudge hijacked the read result and is retired.
     from .config import INDEXED_EXTENSIONS
     ext = os.path.splitext(target)[1].lower()
-    if ext in INDEXED_EXTENSIONS and not _is_binary(target):
-        root = enclosing
-        # 件 3: if dirty, heal before attaching (sync full rebuild, ms-scale
-        # at ~100-file scale; for larger targets this is the one case where
-        # the read path does a full walk — still bounded, and it is the
-        # price of "never serve a stale map").
-        if rootreg.is_dirty(root):
-            _heal_dirty(root)
-        attached = _attach_symbols(root, target)
-        if attached:
-            return attached
-        return _plain_nudge(root)  # map query failed -> plain nudge
-    return _plain_nudge(enclosing)  # non-source path under a confirmed target
+    if ext not in INDEXED_EXTENSIONS or _is_binary(target):
+        # Owner ruling 2026-10-15 (option A): non-source reads (.md/.json/
+        # binary) under a confirmed target get NO footer at all — the plain
+        # directory nudge hijacked the read result and is no longer wanted.
+        return None
+    root = enclosing
+    # 件 3: if dirty, heal before attaching (sync full rebuild, ms-scale
+    # at ~100-file scale; for larger targets this is the one case where
+    # the read path does a full walk — still bounded, and it is the
+    # price of "never serve a stale map").
+    if rootreg.is_dirty(root):
+        _heal_dirty(root)
+    attached = _attach_symbols(root, target)
+    if attached:
+        return attached
+    return _plain_nudge(root)  # source file, map query failed -> plain nudge
 
 
 def _plain_nudge(target_or_root: str) -> Optional[str]:
