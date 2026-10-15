@@ -15,7 +15,12 @@ never block the tool result from reaching the LLM):
                     symbol outline (top READ_SELF_SYMBOLS) + its cross-file
                     import edges (top READ_IMPORT_EDGES) to the tool result
                     text, so the model gets project-aware context without a
-                    separate code_map_query round-trip. If the target is
+                    separate code_map_query round-trip. P0 PRESERVATION
+                    (owner ruling 2026-10-15): the host's transform REPLACES
+                    the result with the first string a hook returns, so the
+                    attach block is always prepended to a verbatim copy of
+                    the original result body (_with_body) — the model never
+                    loses the file content to the attach. If the target is
                     dirty, a synchronous full rebuild runs first (件 3
                     self-heal), then the attach. Triggers ONLY for
                     INDEXED_EXTENSIONS source files (not .md/.json/binary).
@@ -877,9 +882,17 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
     If the read target is a source file (INDEXED_EXTENSIONS) under a
     confirmed target, query the map for that file's own symbols (top 30) +
     its import edges (top 8) and return an attachment string that the host
-    prepends to the tool result. If the target is dirty, run a synchronous
-    full rebuild first (件 3 self-heal), then clear the dirty stamp.
+    PREPENDS to the tool result. P0 PRESERVATION (owner ruling 2026-10-15):
+    the host's transform_tool_result REPLACES the result with the first
+    string a hook returns, so the returned text must carry the ORIGINAL
+    result body verbatim — appending it after the attach block. Returning
+    the attach block alone would silently strip the file content from the
+    model's view (the exact bug behind 'read_file 被 code_map 劫持').
+    When `result` is None/empty (unit-test callers) the attach block is
+    returned on its own (backward-compatible).
 
+    If the target is dirty, run a synchronous full rebuild first (件 3
+    self-heal), then clear the dirty stamp.
     Falls back to the plain nudge text when the query path is unavailable
     (corrupt db / missing venv) — the read result is never broken.
     """
@@ -931,8 +944,40 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
         _heal_dirty(root)
     attached = _attach_symbols(root, target)
     if attached:
-        return attached
-    return _plain_nudge(root)  # source file, map query failed -> plain nudge
+        return _with_body(attached, result)
+    return _with_body(_plain_nudge(root), result)  # source file, map query failed -> plain nudge
+
+
+def _with_body(attach_block: Optional[str], result: Any) -> Optional[str]:
+    """P0 preservation (owner ruling 2026-10-15): the host REPLACES the
+    tool result with the first string a transform_tool_result hook returns.
+    So whatever text we return must END with the original result body,
+    verbatim — returning the attach block alone would strip the file
+    content from the model's view.
+
+    - `attach_block` None (nothing to attach): return the body itself, or
+      None when there is no body (legacy / out-of-scope reads).
+    - `result` str: the host's real tool result (JSON string) — append as-is.
+    - `result` dict: legacy / unit-test callers — serialize, then append.
+    - `result` None / empty: attach block on its own (backward-compatible;
+      all pre-P0 tests exercise this shape).
+    """
+    if not attach_block:
+        if isinstance(result, str) and result:
+            return result
+        return None
+    if isinstance(result, str):
+        body = result
+    elif isinstance(result, dict):
+        try:
+            body = json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            body = ""
+    else:
+        body = ""
+    if not body:
+        return attach_block
+    return attach_block + "\n" + body
 
 
 def _plain_nudge(target_or_root: str) -> Optional[str]:
@@ -1241,6 +1286,11 @@ def on_result(
       (the legacy transform_tool_result registration stays until the host
       fully adopts post_tool_call).
     - read_file/search_files -> _maybe_nudge (件 2 auto-attach + 件 3 heal).
+      P0: `result` (the host's original tool result string) is forwarded so
+      _maybe_nudge can PREPEND the attach block to a verbatim copy of it —
+      the host replaces the result with the first string we return, so
+      dropping `result` here would strip the file content from the model's
+      view (owner ruling 2026-10-15).
 
     Fail-soft: any exception -> None (gate 9).
     """
@@ -1259,11 +1309,23 @@ def _confirmed_roots() -> set:
 
 
 def _find_confirmed_root(file_path: str, confirmed: set) -> Optional[str]:
-    """Return the confirmed target that `file_path` falls under (nearest)."""
-    abspath = os.path.abspath(file_path)
+    """Return the confirmed target that `file_path` falls under (nearest).
+
+    Normalizes BOTH the candidate file path and each confirmed target via
+    `os.path.realpath` (resolving symlinks to their physical target). This is
+    critical for the profile/symlink deployment model: a profile-local dir
+    like /root/.hermes/profiles/<p>/plugins/code_map is a SYMLINK to the
+    shared physical /root/.hermes/plugins/code_map; abspath alone keeps the
+    symlink prefix, so the string-prefix match against the shared target in
+    the registry never fires, the read is treated as "outside any confirmed
+    target" and the un-indexed-read ledger gets a spurious row for it.
+    realpath collapses both sides to the same physical dir and fixes the
+    match. (The registry still stores logical confirmed-target strings; only
+    the read-side matching normalizes.)"""
+    abspath = os.path.realpath(file_path)
     best = None
     for root in confirmed:
-        root_abs = os.path.abspath(root)
+        root_abs = os.path.realpath(root)
         if abspath.startswith(root_abs + os.sep) or abspath == root_abs:
             if best is None or len(root_abs) > len(best):
                 best = root_abs

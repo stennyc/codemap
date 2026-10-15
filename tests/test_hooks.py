@@ -156,11 +156,20 @@ def test_attach_returns_symbol_outline_for_source_file(tmp_path):
     p = Path(target) / "mod.py"
     out = hook._maybe_nudge("read_file", {"path": str(p)})
     assert out is not None, "source-file read under a confirmed target must attach"
-    assert out.startswith("[code_map]"), f"attach must be the code_map block: {out[:60]!r}"
-    assert "func_0" in out and "import" in out
+    # CRITICAL (P0): the host REPLACES the result with the first string the
+    # transform hook returns, so the returned text MUST still carry the
+    # original file content — otherwise the model loses the file entirely.
+    # The attach block is prepended, the original result body is preserved.
+    orig = json.dumps({"content": "1|import os", "total_lines": 2}, ensure_ascii=False)
+    full = hook._maybe_nudge("read_file", {"path": str(p)}, result=orig)
+    assert full is not None
+    assert orig in full, "original read_file result must be preserved inside the returned text"
+    assert full.startswith("[code_map]"), f"attach block comes first: {full[:60]!r}"
+    assert "func_0" in full and "import" in full
     from code_map.config import READ_SYMBOL_MAX_BYTES
-    assert len(out.encode("utf-8")) <= READ_SYMBOL_MAX_BYTES + 40, \
-        f"attach must be byte-capped, got {len(out.encode('utf-8'))} bytes"
+    attach_only = full[: full.index(orig)]
+    assert len(attach_only.encode("utf-8")) <= READ_SYMBOL_MAX_BYTES + 40, \
+        f"attach block must be byte-capped, got {len(attach_only.encode('utf-8'))} bytes"
 
 
 def test_attach_byte_cap_is_exact_not_char_based(tmp_path):
@@ -182,6 +191,20 @@ def test_attach_byte_cap_is_exact_not_char_based(tmp_path):
     out.encode("utf-8").decode("utf-8")
     assert len(b) <= READ_SYMBOL_MAX_BYTES + 40, \
         f"CJK attach overflowed cap: {len(b)} bytes > {READ_SYMBOL_MAX_BYTES + 40}"
+
+
+def test_attach_without_result_body_does_not_lose_the_map(tmp_path):
+    """Unit-test / legacy callers pass no `result`: the attach block is
+    still returned on its own (no crash, no phantom empty-body marker)."""
+    from code_map import hook
+    target = _seed_confirmed(tmp_path, ["x.py"], "def x():\n    pass\n")
+    p = Path(target) / "x.py"
+    out = hook._maybe_nudge("read_file", {"path": str(p)}, result=None)
+    assert out is not None
+    assert out.startswith("[code_map]")
+    assert "x.py" in out
+    # No phantom empty-body marker appended.
+    assert not out.endswith("\n\n")
 
 
 def test_binary_read_under_confirmed_target_no_footer(tmp_path):
@@ -430,3 +453,58 @@ def test_search_files_pattern_no_false_attach(tmp_path):
     p = Path(target) / "i.py"
     out = hook._maybe_nudge("search_files", {"path": str(p)})
     assert out is not None and out.startswith("[code_map]")
+
+
+# ── symlink-profile regression (owner 2026-10-15, code_map audit) ───────────
+# The profile/symlink deployment model: a profile-local dir
+# (<home>/profiles/<p>/plugins/code_map) is a SYMLINK to the shared physical
+# dir (<home>/plugins/code_map). A read through the profile symlink used to
+# be matched with abspath (which keeps the symlink prefix) against a registry
+# that stores the shared physical path, so it never matched, was treated as
+# "outside any confirmed target", and got a spurious un-indexed-read ledger
+# row (which then drove a pre_llm_call "要 index 吗" prompt even though the
+# shared target was already confirmed). _find_confirmed_root now normalizes
+# both sides via realpath, so the profile-symlink read resolves to the shared
+# physical dir and matches.
+
+def test_symlink_profile_read_matches_shared_confirmed_root(tmp_path):
+    """A read through a profile-local SYMLINK to a confirmed shared target
+    must be recognized as in-scope (attach fires) AND must NOT log a
+    spurious un-indexed-read ledger row."""
+    import os as _os
+    from code_map import hook, rootreg
+    # Shared physical target (confirmed + built + not dirty).
+    target = _seed_confirmed(tmp_path, ["mod.py"], "def f():\n    return 1\n")
+    # Build a sibling profile-style symlink pointing at the shared target.
+    symlink_parent = Path(target).parent / "profile_view"
+    symlink_parent.mkdir(parents=True, exist_ok=True)
+    symlink = symlink_parent / "code_map"
+    symlink.symlink_to(Path(target), target_is_directory=True)
+
+    # The read path the model actually uses: the SYMLINK view of mod.py.
+    read_path = str(symlink / "mod.py")
+    # Sanity: os.path.abspath keeps the symlink prefix (the old bug trigger).
+    assert _os.path.abspath(read_path) != _os.path.realpath(read_path)
+
+    # (1) The matched confirmed root resolves to the shared physical target.
+    confirmed = set(rootreg.confirmed_targets())
+    matched = hook._find_confirmed_root(read_path, confirmed)
+    assert matched is not None, "symlink-profile read must match the shared target"
+    assert _os.path.realpath(matched) == _os.path.realpath(target)
+
+    # (2) _maybe_nudge attaches (in-scope), does not treat it as out-of-scope.
+    out = hook._maybe_nudge("read_file", {"path": read_path})
+    assert out is not None and out.startswith("[code_map]"), \
+        f"symlink-profile read must auto-attach, got: {out!r}"
+
+    # (3) No spurious ledger row for the profile-symlink dir (the read is
+    # recognized as under a confirmed target, not "un-indexed").
+    from code_map.config import data_dir
+    ledger = data_dir() / "_unindexed_read_ledger"
+    lines = []
+    if ledger.exists():
+        lines = [l for l in ledger.read_text().splitlines() if l.strip()]
+    # A row keyed on the profile-symlink dir would be the bug's signature.
+    symlink_view = _os.path.realpath(symlink_parent)  # physical, for a fair key
+    bad = [l for l in lines if l.startswith(f"{symlink_view}\t")]
+    assert not bad, f"symlink-profile read must NOT log an un-indexed row: {bad!r}"
