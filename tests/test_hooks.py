@@ -508,3 +508,136 @@ def test_symlink_profile_read_matches_shared_confirmed_root(tmp_path):
     symlink_view = _os.path.realpath(symlink_parent)  # physical, for a fair key
     bad = [l for l in lines if l.startswith(f"{symlink_view}\t")]
     assert not bad, f"symlink-profile read must NOT log an un-indexed row: {bad!r}"
+
+
+# ── terminal 档 2 不对称版 (owner 2026-10-15) ─────────────────────────────────
+# Write-side: terminal command with a write signal + workdir under a confirmed
+# target  ->  mark_dirty(target).  No per-file reindex (command text can't be
+# trusted to name which files changed).
+# Read-side: single-file `cat <source.py>` under a confirmed target  ->
+# one-line pointer appended to terminal stdout.  Multi-file / pipe / grep
+#  ->  no nudge (opaque stdout; we only point, never stuff symbols in).
+
+def test_terminal_write_signal_marks_dirty(tmp_path):
+    """A SUCCESSFUL terminal command that carries a write signal and whose
+    workdir is inside a confirmed target must mark that target dirty."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["f.py"], "def f(): pass\n")
+    rootreg.clear_dirty(target)
+    assert not rootreg.is_dirty(target)
+    hook._post_tool_call(
+        tool_name="terminal",
+        args={"command": "echo x >> /var/tmp/x/f.py", "workdir": target},
+        result="", status="ok",
+    )
+    assert rootreg.is_dirty(target), "write-signal terminal under target must mark dirty"
+
+
+def test_terminal_no_write_signal_no_dirty(tmp_path):
+    """A terminal command WITHOUT a write signal (ls, git status, grep)
+    must NOT mark the target dirty — only write-shaped commands do."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["f.py"], "def f(): pass\n")
+    rootreg.clear_dirty(target)
+    for cmd in ("ls", "git status", "grep -n f f.py", "python -m pytest"):
+        hook._post_tool_call(
+            tool_name="terminal",
+            args={"command": cmd, "workdir": target},
+            result="", status="ok",
+        )
+    assert not rootreg.is_dirty(target), f"non-write terminal must not dirty: got dirty"
+
+
+def test_terminal_quoted_read_commands_no_false_dirty(tmp_path):
+    """REGRESSION (reviewer 2026-10-15 HIGH): read-only terminal commands that
+    MERELY MENTION a write token inside a QUOTED ARGUMENT must NOT mark the
+    target dirty. The sniff is quote-aware: `grep -rn "rm " .` and
+    `grep "a > b" f.py` are read-only even though they contain `rm` / `>`.
+    A real write outside quotes MUST still fire (the write-side signal is
+    not suppressed by the quote fix)."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["f.py"], "def f(): pass\n")
+    rootreg.clear_dirty(target)
+    # Read-only commands where the write-ish token sits inside quotes.
+    for cmd in ('grep -rn "rm " .', 'grep "a > b" f.py', 'echo "rm -rf x"'):
+        hook._post_tool_call(
+            tool_name="terminal",
+            args={"command": cmd, "workdir": target},
+            result="", status="ok",
+        )
+        assert not rootreg.is_dirty(target), \
+            f"quoted read-only command must not dirty: {cmd!r}"
+    # A REAL redirect outside quotes must still mark dirty.
+    hook._post_tool_call(
+        tool_name="terminal",
+        args={"command": "echo x > f.py", "workdir": target},
+        result="", status="ok",
+    )
+    assert rootreg.is_dirty(target), "real out-of-quote redirect must dirty"
+
+
+def test_terminal_write_outside_target_no_dirty(tmp_path):
+    """A write-signal command whose workdir is OUTSIDE every confirmed target
+    must not touch the registry (fail-soft no-op)."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["f.py"], "def f(): pass\n")
+    rootreg.clear_dirty(target)
+    hook._post_tool_call(
+        tool_name="terminal",
+        args={"command": "echo x > /tmp/outside.py", "workdir": "/tmp"},
+        result="", status="ok",
+    )
+    assert not rootreg.is_dirty(target), "out-of-target write must not dirty the target"
+
+
+def test_terminal_failed_write_no_dirty(tmp_path):
+    """件 1 discipline: a FAILED terminal command (status=error) has not
+    mutated anything we know about -> no mark_dirty (db keeps prior state)."""
+    from code_map import hook, rootreg
+    target = _seed_confirmed(tmp_path, ["f.py"], "def f(): pass\n")
+    rootreg.clear_dirty(target)
+    hook._post_tool_call(
+        tool_name="terminal",
+        args={"command": "echo x >> /var/tmp/x/f.py", "workdir": target},
+        result="", status="error",
+    )
+    assert not rootreg.is_dirty(target), "failed terminal write must not dirty"
+
+
+def test_terminal_read_cat_appends_pointer(tmp_path):
+    """A single-file `cat <source.py>` of a confirmed-target source file
+    appends a one-line code_map_query pointer to the terminal stdout
+    (the host's _with_body prepends the pointer AFTER the original body)."""
+    from code_map import hook
+    target = _seed_confirmed(tmp_path, ["mod.py"], "def mod(): pass\n")
+    import os
+    mod = os.path.join(target, "mod.py")
+    # _maybe_nudge is the read-side dispatcher; on_result routes to it.
+    result = hook.on_result(
+        tool_name="terminal",
+        args={"command": f"cat {mod}", "workdir": target},
+        result="stdout-content",
+    )
+    assert result is not None, "cat of confirmed-target source must produce a pointer"
+    assert "code_map_query" in result, f"pointer must name code_map_query: {result!r}"
+    # P0 preservation: the original terminal stdout must still be present.
+    assert "stdout-content" in result, "terminal stdout must survive (P0 preservation)"
+
+
+def test_terminal_read_pipe_no_nudge(tmp_path):
+    """A piped / multi-file / grep-style terminal read must NOT get a
+    pointer (we refuse to point at opaque multi-source stdout)."""
+    from code_map import hook
+    target = _seed_confirmed(tmp_path, ["a.py", "b.py"], "def a(): pass\ndef b(): pass\n")
+    import os
+    a, b = os.path.join(target, "a.py"), os.path.join(target, "b.py")
+    for cmd in (
+        f"cat {a} | wc -l",
+        f"cat {a} {b}",
+        f"grep -n def {a}",
+    ):
+        out = hook.on_result(tool_name="terminal",
+                             args={"command": cmd, "workdir": target},
+                             result="x")
+        assert out is None, f"opaque terminal read must not nudge: {cmd!r} -> {out!r}"
+

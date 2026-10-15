@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import fcntl
+import re
 import time
 import threading
 from contextlib import contextmanager
@@ -66,6 +67,7 @@ _debounce_lock = threading.Lock()
 # Read-side tools that benefit from the auto-attach / nudge.
 _READ_TOOLS = ("read_file", "search_files")
 _WRITE_TOOLS = ("write_file", "patch")
+_TERMINAL_TOOL = "terminal"
 
 
 # ── write/patch side: synchronous single-file reindex (件 1) ────────────────
@@ -772,6 +774,16 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
             _settle_clarify_answer(args, result, _.get("status"),
                                    session_id=_.get("session_id"))
             return None
+        # ── terminal write-signal (owner 2026-10-15 档 2) ──
+        # If a terminal command under a confirmed target carries a write/
+        # delete signal, mark the enclosing target dirty so the read-side
+        # heal (件 3) or an explicit code_map_refresh rebuilds it. No
+        # per-file reindex is attempted — the command text cannot be
+        # trusted to name which file(s) changed (shell variables, pipes,
+        # scripts all defeat that). Fail-soft: any hiccup -> no-op.
+        if tool_name == _TERMINAL_TOOL:
+            _maybe_mark_terminal_dirty(args, _.get("status"))
+            return None
         if tool_name not in _WRITE_TOOLS:
             return None
         # Success gate (件 1): only reindex a write that actually SUCCEEDED.
@@ -891,11 +903,33 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
     When `result` is None/empty (unit-test callers) the attach block is
     returned on its own (backward-compatible).
 
+    terminal read-signal (owner 档 2, 2026-10-15): if the tool is terminal
+    and its command is a single-file `cat`/`less` targeting a confirmed
+    target source file, append a one-line "you read X.py, use code_map_query
+    for its map" nudge to the terminal stdout — deliberately NOT a full
+    symbol attach (terminal stdout is opaque; we only point the model).
+    Multi-file / piped / grep-style terminal reads get no nudge.
+
     If the target is dirty, run a synchronous full rebuild first (件 3
     self-heal), then clear the dirty stamp.
     Falls back to the plain nudge text when the query path is unavailable
     (corrupt db / missing venv) — the read result is never broken.
     """
+    # terminal read-signal nudge (档 2, owner 2026-10-15): before the
+    # read_file/search_files path below, check if this is a terminal tool
+    # call whose command is a single-file cat/less of a confirmed-target
+    # source file. If so, append a one-line nudge to the terminal stdout.
+    if tool_name == _TERMINAL_TOOL:
+        targets = _terminal_read_targets(
+            str((args or {}).get("command") or ""),
+            str((args or {}).get("workdir") or ""),
+        )
+        if targets:
+            rels = [os.path.relpath(t, os.path.dirname(t)) for t in targets]
+            nudge = _terminal_read_nudge(targets[0], rels[0])
+            if nudge:
+                return _with_body(nudge, result)
+        return None  # terminal read not matching the narrow sniff -> no nudge
     if tool_name not in _READ_TOOLS:
         return None
     target = (args or {}).get("path") or (args or {}).get("pattern") or ""
@@ -1000,6 +1034,225 @@ def _is_binary(path: str) -> bool:
         return b"\x00" in head
     except OSError:
         return False  # unreadable -> treat as text (let the query fail-soft)
+
+
+# ── terminal-side sniffs (owner 2026-10-15 档 2 不对称版) ────────────────────
+# The terminal tool is NOT routed through the write-side reindex path
+# (post_tool_call only recognizes write_file/patch) and its stdout is an
+# opaque text block (no structured "which file" field the host can use to
+# attach a map to). Two narrow, deterministic sniffs close the coverage gap:
+#
+#   _terminal_has_write_signal(command):
+#     conservative string sniff for "this command almost certainly wrote
+#     or deleted a file" (redirects, sed -i, tee, rm, git clean -f,
+#     python -c "open(...,'w')", …). No shell-AST parsing: the goal is
+#     "should we mark the enclosing target dirty?", not "which lines".
+#     Missed -> the read-side heal still covers it (correctness);
+#     false-positive -> one extra full rebuild (bounded, safe).
+#
+#   _terminal_read_targets(command, workdir):
+#     extracts ONLY the single-file `cat <file>` / `less <file>` targets
+#     that land inside a confirmed target AND carry an INDEXED_EXTENSIONS
+#     extension. Multi-file cat, pipe/grep output, glob `*.py` — all return
+#     [] (deliberately: we refuse to attach to stdout whose source is not
+#     a known single source file).
+
+# Shell-level write/delete signal keywords.  A command is "write-shaped"
+# if ANY of these tokens appears as a standalone word or as part of a
+# Shell write/delete signal detection.  A bare command NAME (rm, tee,
+# shred, truncate) must only count when it is a real shell command, NOT
+# when it appears inside a quoted argument (`grep -rn "rm " .` is
+# read-only and must not fire).  The reviewer's word-boundary attempt
+# failed because `\b` treats `"` as a non-word char, so `"rm ` still
+# matched.  The fix: mask out quoted regions first, then match command
+# names on the mask — so a name is only "live" if it sits outside quotes
+# AND is preceded by a command-start boundary (^ / whitespace / & | ; ( ).
+#
+# Masking rule: replace every `'...'` and `"..."` region with spaces of
+# the SAME length (the command-name chars survive, the surrounding
+# whitespace does not, so boundaries stay valid but the quoted text
+# cannot form a command).  Single-quotes are handled first (shell: no
+# escaping inside '), then double-quotes (where backslash can escape ").
+def _mask_quoted(cmd: str) -> str:
+    out = []
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if ch == "'":
+            # single-quoted: copy to matching ' (no escaping)
+            j = i + 1
+            while j < n and cmd[j] != "'":
+                j += 1
+            out.append(" " * (min(j, n) - i))
+            i = j + 1 if j < n else j
+        elif ch == '"':
+            # double-quoted: backslash escapes the next char (incl. ")
+            # EVERY character inside the quotes (except the backslash
+            # itself, which we must skip so we don't mask the closing
+            # quote prematurely) is masked to a SPACE. This is what
+            # makes `grep "a > b" f.py` NOT fire: the `>` sits inside
+            # the quotes, so it is a quoted string character, not a
+            # shell redirect, and must not count as a write signal.
+            j = i + 1
+            while j < n:
+                if cmd[j] == "\\" and j + 1 < n:
+                    j += 2          # skip escaped pair
+                    continue
+                if cmd[j] == '"':
+                    break
+                j += 1
+            # Mask i .. j (both endpoints exclusive of the closing ")
+            # to spaces, then resume just after the closing quote.
+            out.append(" " * (j - i))
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+# Bare write command names, matched on the quote-masked command with a
+# command-start boundary.  `rm`, `tee`, `shred`, `truncate`.
+_TERMINAL_BARE_WRITE_CMD_RE = re.compile(
+    r"(?:^|[\s&|;(>])((?:rm|tee|shred|truncate))(?:[\s]|$)")
+# Compound / flag forms: these are specific enough that a read-only
+# command mentioning them verbatim is rare, so plain substring is fine
+# (they also all carry `-` or multiple words that a bare grep would not
+# accidentally reproduce in a quoted string).  Kept as substrings.
+_TERMINAL_WRITE_SUBSTRINGS: tuple = (
+    "sed -i", "git clean", "git rm",
+    "-delete", "-exec rm",
+)
+# Redirects: `>` or `>>` appearing OUTSIDE quotes (a redirect is the
+# actual write op).  Matched on the quote-masked string so `grep "a > b"`
+# does NOT fire (the `>` is inside quotes -> masked to spaces).
+_TERMINAL_REDIRECT_RE = re.compile(r"(?:^|[\s;&|;($])>{1,2}\s")
+# python inline writes:  open(<path>,<mode>) where mode contains w/a/+.
+_TERMINAL_PY_WRITE_RE = re.compile(
+    r"""open\s*\(\s*["\'][^"\']*["\']\s*,\s*["\'][^"']*[wa+][^"']*["\']""")
+
+
+def _terminal_has_write_signal(command: str) -> bool:
+    """Conservative sniff: does `command` carry a write/delete signal?
+
+    Quote-aware (reviewer 2026-10-15 HIGH): bare command names and
+    redirects are only counted when they sit OUTSIDE quoted arguments,
+    so `grep -rn "rm " .` and `echo "3 > 2"` do NOT false-positive.
+    Fail-soft: empty/None -> False.
+    """
+    if not command or not isinstance(command, str):
+        return False
+    masked = _mask_quoted(command)
+    if _TERMINAL_BARE_WRITE_CMD_RE.search(masked):
+        return True
+    if _TERMINAL_REDIRECT_RE.search(masked):
+        return True
+    for tok in _TERMINAL_WRITE_SUBSTRINGS:
+        if tok in masked:
+            return True
+    if _TERMINAL_PY_WRITE_RE.search(command):
+        return True
+    return False
+
+
+def _terminal_read_targets(command: str, workdir: str) -> list:
+    """Extract single-file `cat`/`less` source targets from `command` that
+    fall under a confirmed target and carry an indexable extension.
+
+    Returns [] in every case where the source file cannot be identified
+    with certainty: pipe output, multi-file `cat a.py b.py`, glob
+    `*.py`, `grep`/`rg`/`head`/`tail` (these read but their stdout is
+    not a whole source file), `vim`/`nano` editors, or any command we
+    don't understand.  Only `cat <abs-path-or-rel-to-workdir>` where
+    the path resolves to a single file inside a confirmed target with
+    an INDEXED_EXTENSIONS extension is returned.
+    """
+    if not command or not isinstance(command, str):
+        return []
+    c = command.strip()
+    # Reject multi-file cat (two+ non-flag args after cat) — we refuse to
+    # attach a map to a concatenated multi-file stdout.
+    # Also reject any pipe (`|`) or backtick in the command — the stdout
+    # is no longer a whole source file.
+    if "|" in c or "`" in c:
+        return []
+    # Match `cat <path>` as the first meaningful segment (allow leading
+    # cd/`cd x && ` prefix but not pipelines).
+    m = re.match(r'^(?:cd\s+\S+\s*&&\s*)?(?:cat|less)\s+(\S+)\s*$', c)
+    if not m:
+        return []
+    raw = m.group(1)
+    # Only resolve paths that are absolute or clearly relative to workdir;
+    # reject glob patterns, redirects, and shell variables.
+    if any(ch in raw for ch in "*?{}$`"):
+        return []
+    target = os.path.abspath(raw) if os.path.isabs(raw) else os.path.join(workdir or ".", raw)
+    target = os.path.realpath(target)
+    # Must be a single regular file (not a dir)
+    if not os.path.isfile(target):
+        return []
+    from .config import INDEXED_EXTENSIONS
+    ext = os.path.splitext(target)[1].lower()
+    if ext not in INDEXED_EXTENSIONS or _is_binary(target):
+        return []
+    # Must land under a confirmed target (symlink-normalized via realpath)
+    confirmed = set(rootreg.confirmed_targets())
+    if _find_confirmed_root(target, confirmed) is None:
+        return []
+    return [target]
+
+
+def _terminal_read_nudge(file_path: str, rel_name: str) -> Optional[str]:
+    """档 2 read-side: the one-line "you cat'd a confirmed-target source
+    file; use code_map_query for its symbol map" pointer. Deliberately a
+    POINT, not a full symbol attach — terminal stdout is opaque (it may be
+    build logs, test output, anything) and stuffing 30 symbols into it
+    would pollute the model's read of the command output. Byte-capped
+    like the cross-folder signal so the follow-up keyword `code_map_query`
+    survives truncation. Returns None when nothing confirmed is indexed."""
+    from .config import TERMINAL_READ_NUDGE_MAX_BYTES
+    confirmed = set(rootreg.confirmed_targets())
+    enclosing = _find_confirmed_root(file_path, confirmed)
+    if enclosing is None:
+        return None
+    line = (f"[code_map] you cat'd {rel_name} (under confirmed root "
+            f"{enclosing}); for its symbol map call code_map_query(root="
+            f"{enclosing}, path={rel_name})")
+    return line[:TERMINAL_READ_NUDGE_MAX_BYTES]
+
+
+def _maybe_mark_terminal_dirty(args: Any, status: Any) -> None:
+    """档 2 write-side: if a SUCCESSFUL terminal command with a write signal
+    was run with its `workdir` under a confirmed target, mark that target
+    dirty so the read-side heal / code_map_refresh rebuilds it before the
+    map is trusted again.
+
+    Gated on `status` (ok/success/completed) exactly like the write_file
+    reindex path: a failed command has not mutated anything we know about,
+    so we must NOT mark the target dirty on error/cancel (the db keeps
+    its prior state — the same discipline as 件 1). `workdir` is resolved
+    against the confirmed registry via realpath (the symlink fix), so a
+    terminal run in a profile-symlink view of a confirmed dir still marks
+    the shared physical target.
+
+    Fail-soft: any exception -> no-op (a terminal hiccup never breaks the
+    command result reaching the model).
+    """
+    if status is not None and str(status).lower() not in ("ok", "success", "completed"):
+        return
+    command = str((args or {}).get("command") or "")
+    workdir = str((args or {}).get("workdir") or "")
+    if not _terminal_has_write_signal(command):
+        return
+    if not workdir:
+        return
+    candidate = os.path.realpath(workdir)
+    confirmed = set(rootreg.confirmed_targets())
+    root = _find_confirmed_root(candidate, confirmed)
+    if root is None:
+        return
+    rootreg.mark_dirty(root)
 
 
 def _heal_dirty(root: str) -> None:

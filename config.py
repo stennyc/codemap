@@ -103,6 +103,14 @@ CROSS_FOLDER_LINE_MAX_BYTES = 208
 READ_SELF_SYMBOLS = 30
 READ_IMPORT_EDGES = 8
 READ_SYMBOL_MAX_BYTES = 1500
+# 档 2 terminal read-signal (owner 2026-10-15): a one-line pointer appended
+# to terminal stdout when a single-file cat/less of a confirmed-target
+# source file is detected. Deliberately a POINT (byte-capped), NOT a full
+# symbol attach — terminal stdout is opaque and must never be polluted with
+# 30 symbols. Sized so "code_map_query" survives truncation (same rationale
+# as CROSS_FOLDER_LINE_MAX_BYTES: the follow-up keyword must not be the
+# truncated tail). 256 keeps the full cue under the cap for realistic paths.
+TERMINAL_READ_NUDGE_MAX_BYTES = 256
 # 件3 review fix (reviewer F1/F2, 2026-10-11): the hot-path dirty heal runs a
 # FULL rebuild of the target (state._run_build — walk + parse). The host's
 # transform_tool_result / post_tool_call are in _HOOK_TIMEOUT_BOUNDED_HOOKS
