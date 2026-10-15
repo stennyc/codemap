@@ -90,7 +90,18 @@ _ROOT_POLICY_TEXT = (
     "symbol lookup, call code_map_refresh explicitly. "
     "Every build appends one audit line to "
     "data/confirm_root_log.jsonl (target + boundary + rel path + file "
-    "count + db path), kept for recovery."
+    "count + db path), kept for recovery. "
+    "TOOL CHOICE: when reading or writing SOURCE CODE, prefer the host's "
+    "native code tools — read_file (a confirmed target's source read "
+    "auto-attaches that file's symbol outline + import edges + "
+    "cross-folder signal, so the map comes along for free) and "
+    "write_file/patch (a successful write auto-reindexes the single "
+    "file, keeping the map current). Use the terminal ONLY for what the "
+    "native tools cannot do (builds, tests, git, processes, network); "
+    "do not terminal cat/grep/sed/echo source files when read_file/"
+    "search_files covers the need — that is exactly the gap this "
+    "preference closes. (Owner's B-option, 2026-10-15: prompt-layer "
+    "steering, no tool override.)"
 )
 
 
