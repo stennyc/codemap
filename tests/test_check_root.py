@@ -452,6 +452,40 @@ def test_hook_records_evidence_via_partial_path_mention(monkeypatch):
     _cleanup(home, proj)
 
 
+def test_write_confirmed_root_is_idempotent_no_duplicate_line(monkeypatch):
+    """Owner 2026-10-18 (defect 1): write_confirmed_root must NOT append a
+    second line when the SAME abspath target is already in the registry.
+    Before the fix the append was unconditional (open(reg,'a')), so each
+    host/profile confirm of an already-confirmed target grew the file with
+    a duplicate row (e.g. /usr/local/.../hermes_cli x2). The reader
+    (confirmed_targets) already de-dups, but the write-side must stay clean
+    so the _registry file doesn't accumulate unbounded duplicates."""
+    from code_map import rootreg
+    home = _mk_home("dedup_idem")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    proj = _mk_proj("dedup_idem")
+    # Clean any stale registry from a PRIOR run (these helpers use fixed
+    # /tmp names without a uuid, so a leftover 3-line registry from before
+    # the dedup fix would otherwise poison the count).
+    import shutil
+    shutil.rmtree(home / "plugins" / "code_map", ignore_errors=True)
+    (proj / "a.py").write_text("def fa(): pass\n")
+
+    rootreg.write_confirmed_root(str(proj))
+    rootreg.write_confirmed_root(str(proj))
+    rootreg.write_confirmed_root(str(proj))
+
+    reg = rootreg._registry_file()
+    lines = [l for l in reg.read_text().splitlines() if l.strip()]
+    target_abs = os.path.abspath(str(proj))
+    hits = [l for l in lines if os.path.abspath(l) == target_abs]
+    assert len(hits) == 1, \
+        f"repeated write_confirmed_root of the same target must be one line: {lines!r}"
+    # The reader still returns exactly one entry for this target.
+    assert rootreg.confirmed_targets().count(target_abs) == 1
+    _cleanup(home, proj)
+
+
 def test_hook_new_path_fallback_unlocks_unconfirmed_target(monkeypatch):
     """RISK #6 follow-up (found in the 2026-10-11 knowledge-base-search
     live test): a clarify question about a path that is NOT yet a

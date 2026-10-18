@@ -121,12 +121,19 @@ def test_read_confirmed_project_does_not_log(tmp_path):
     assert _ledger_lines() == []
 
 
-def test_read_non_source_unconfirmed_does_not_log(tmp_path):
+def test_read_non_source_unconfirmed_logs_directory(tmp_path):
+    """Owner 2026-10-18 (defect 2): the clarify offer is DIRECTORY-triggered,
+    not source-file-triggered — reading ANY file (e.g. .md) inside an
+    un-indexed project logs the project row, so the turn-boundary clarify
+    can propose indexing it. (The legacy behaviour was 'non-source reads
+    do NOT log', which is what this test now inverts.)"""
     from code_map import hook
     proj = _make_unconfirmed_project(tmp_path, files={"notes.md": "# hi\n"})
     hook._post_tool_call("read_file", {"path": str(proj / "notes.md")}, None,
                          status="ok", session_id="s1")
-    assert _ledger_lines() == []
+    lines = _ledger_lines()
+    assert len(lines) == 1, f"non-source read under un-indexed project must log its dir: {lines!r}"
+    assert str(proj) in lines[0]
 
 
 def test_write_side_tools_do_not_log(tmp_path):

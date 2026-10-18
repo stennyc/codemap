@@ -111,6 +111,17 @@ READ_SYMBOL_MAX_BYTES = 1500
 # as CROSS_FOLDER_LINE_MAX_BYTES: the follow-up keyword must not be the
 # truncated tail). 256 keeps the full cue under the cap for realistic paths.
 TERMINAL_READ_NUDGE_MAX_BYTES = 256
+# Search-side directory pointer (owner 2026-10-18): a one-line [code_map]
+# POINT appended to a search_files result when its `path` (the search root)
+# is a DIRECTORY under a confirmed target. A directory search root has no
+# per-file symbol table to attach (a glob returns many paths), so — same
+# discipline as the terminal cat nudge — this is a POINTER, not a 30-symbol
+# block. It names the confirmed root and carries the follow-up keyword
+# `code_map_query`, sized so that keyword survives truncation. 360 (raised
+# from 320, P3-2) keeps the full cue — including the "whole-tree glob/grep"
+# frame at the tail — under the cap for the longest realistic (root,
+# target) pair (reviewer measured 347 bytes at 320, which clipped the tail).
+SEARCH_DIR_NUDGE_MAX_BYTES = 360
 # 件3 review fix (reviewer F1/F2, 2026-10-11): the hot-path dirty heal runs a
 # FULL rebuild of the target (state._run_build — walk + parse). The host's
 # transform_tool_result / post_tool_call are in _HOOK_TIMEOUT_BOUNDED_HOOKS

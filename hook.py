@@ -443,16 +443,29 @@ def _project_boundary(target: str) -> Optional[str]:
 
 def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) -> None:
     """post_tool_call read side: record the file's ENCLOSEING DIRECTORY for
-    a source-file read that landed outside any confirmed target.
+    a read that landed outside any confirmed target.
 
     Judgment key is the DIRECTORY, not the file (owner's 2026-10-13
     correction): N reads under one project coalesce to ONE ledger line, so
     the pending set is O(projects touched) not O(files touched).
 
-    Only source files (INDEXED_EXTENSIONS, non-binary) whose boundary has
-    neither a confirmed target nor a db record get logged — the same
-    two checks the retired footer ran, so an already-indexed/confirmed
-    project never produces a pending row.
+    Directory-triggered, NOT source-file-triggered (owner 2026-10-18,
+    defect 2): ANY file read under an un-indexed project's directory logs
+    the project row — the legacy INDEXED_EXTENSIONS filter made projects
+    whose read files were .md/.json/.lock etc. invisible to the
+    turn-boundary clarify offer (the project was never proposed for
+    indexing). A binary read is still skipped (it is not "source" we would
+    ever index, and a NUL-sniff on the first 512 bytes is cheap).
+
+    Two guards keep this honest:
+      - the read must NOT already land under a confirmed target (the attach
+        path, not the pending path);
+      - the project boundary must NOT itself be a real system tree — the
+        hardcoded ("/usr", "/etc", "/opt") guard (plus bare "/") is the
+        gate-⑩ incident shape; those trees are never offered for indexing.
+        /root and /home are deliberately NOT guarded: owner's projects live
+        under /root and ARE the indexable case, and a real project under
+        them resolves to its own marker dir via detect_root, not to /root.
     Fail-soft: any hiccup -> no ledger line, never breaks the read.
     """
     try:
@@ -471,15 +484,29 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         if tool_name == "search_files" and not os.path.isabs(target):
             return
         target = os.path.abspath(target)
-        from .config import INDEXED_EXTENSIONS
-        ext = os.path.splitext(target)[1].lower()
-        if ext not in INDEXED_EXTENSIONS or _is_binary(target):
+        # A binary read is not a project source we would index; skip it.
+        if _is_binary(target):
             return
         confirmed = rootreg.confirmed_targets()
         if _find_confirmed_root(target, set(confirmed)) is not None:
             return  # under a confirmed target -> the attach path, not pending
         proj = _project_boundary(target)
         if proj is None:
+            return
+        # System-tree guard (owner 2026-10-18, defect 2): if the resolved
+        # project boundary IS a real system tree we never index (/usr, /etc,
+        # /opt — the gate-⑩ incident shape) OR the bare filesystem root,
+        # skip the row. /root and /home are deliberately NOT guarded here:
+        # they are user workspaces (owner's projects like /root/.hermes/
+        # plugins/emo live under /root and ARE the indexable case), and a
+        # real project under them resolves to ITS OWN marker dir via
+        # detect_root, not to /root itself.
+        proj_abs = os.path.abspath(proj)
+        for prefix in ("/usr", "/etc", "/opt"):
+            p = os.path.abspath(prefix)
+            if proj_abs == p or proj_abs.startswith(p + os.sep):
+                return
+        if proj_abs == os.sep:
             return
         if rootreg.is_confirmed_root(proj):
             return
@@ -957,6 +984,25 @@ def _maybe_nudge(tool_name: str, args: Any, result: Any = None) -> Optional[str]
         # "model read an un-indexed project" fact for the turn-boundary
         # question.
         return None
+
+    # Search-side directory pointer (owner 2026-10-18): when the tool is
+    # `search_files` and its `path` (the search root) is a DIRECTORY that
+    # lands under a confirmed target, attach a one-line [code_map] POINTER
+    # naming the confirmed root + the `code_map_query` follow-up. A glob
+    # against a directory has no per-file symbol table to attach, so this is
+    # a POINT (byte-capped), not a 30-symbol block. A `path` that is a
+    # concrete FILE keeps falling through to the symbol-attach path below; a
+    # bare `pattern` (no absolute `path`) never reaches here (Gate ① above
+    # already returned None for it, since a relative pattern abspaths into
+    # the CWD and matches no confirmed target — the F6 invariant).
+    if tool_name == "search_files" and os.path.isdir(target):
+        from .config import SEARCH_DIR_NUDGE_MAX_BYTES
+        line = (f"[code_map] your search root {target} is under confirmed "
+                f"target {enclosing}; for symbol lookup in this project "
+                f"prefer code_map_query(root={enclosing}, name=...) over "
+                f"whole-tree glob/grep")
+        line = line[:SEARCH_DIR_NUDGE_MAX_BYTES]
+        return _with_body(line, result)
 
     # Must be a source file (extension in INDEXED_EXTENSIONS) — NOT .md/.json
     # and not a binary. Non-source paths under a confirmed target get NO

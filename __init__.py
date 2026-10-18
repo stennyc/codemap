@@ -101,7 +101,15 @@ _ROOT_POLICY_TEXT = (
     "do not terminal cat/grep/sed/echo source files when read_file/"
     "search_files covers the need — that is exactly the gap this "
     "preference closes. (Owner's B-option, 2026-10-15: prompt-layer "
-    "steering, no tool override.)"
+    "steering, no tool override.) "
+    "SEARCH-SIDE DEFAULT (owner 2026-10-18, option 2): within a confirmed "
+    "target, locate a symbol or a file BY NAME via code_map_query(root="
+    "<confirmed target>, name=... or path=...) FIRST — one indexed "
+    "round-trip instead of a whole-tree glob/grep. Honor the one-line "
+    "[code_map] pointer a directory-anchored search_files (path=<dir> under "
+    "a confirmed target) already carries. Fall back to whole-tree "
+    "search_files/grep ONLY when the target is not confirmed, or the match "
+    "is content/regex (which the index does not rank). Hard default."
 )
 
 

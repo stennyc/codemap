@@ -191,11 +191,46 @@ def is_confirmed_root(root: str) -> bool:
 
 def write_confirmed_root(target: str) -> None:
     """Append a validated target. Callers must have run _join_target
-    (or state.confirm_root, which does) before calling this."""
+    (or state.confirm_root, which does) before calling this.
+
+    Idempotent (owner 2026-10-18, defect 1): if the SAME abspath target is
+    already a line in the registry, this is a no-op — the legacy unconditional
+    append grew the _registry file with duplicate rows on every confirm of an
+    already-confirmed target (e.g. hermes_cli x2 in the live registry). The
+    reader (confirmed_targets) already de-dups, but the file itself must stay
+    clean. Dedup is on the NORMALIZED abspath (the reader normalizes too), so
+    non-canonical spellings of the same target cannot add a second row.
+    Fail-soft on the read (corrupt/absent registry): fall back to a plain
+    append — a dedup hiccup must never block a legitimate first confirm.
+
+    Concurrency (owner 2026-10-18, P2-1): the read-check-append window is
+    wrapped in an ADVISORY cross-process write lock (fcntl flock on the
+    shared data dir's _proc.lock — the same lock the single-file reindex
+    holds, nowait=True so a host worker is never blocked). Without it two
+    host/profile processes could both read 'not present' for a NEW target
+    and both append, re-creating the duplicate-row bug this fix removes.
+    nowait=True is deliberately advisory (not a gate): if another process
+    holds the lock we still run the body — the append is a single-line
+    idempotent WAL write, and the read-side confirmed_targets() dedup is
+    the correctness backstop, so worst case degrades to a cosmetic
+    duplicate, never a broken confirm.
+    """
     abspath = os.path.abspath(target)
     if abspath == os.sep:
         raise ValueError("bare filesystem root '/' can never be confirmed")
     reg = _registry_file()
     reg.parent.mkdir(parents=True, exist_ok=True)
-    with open(reg, "a") as f:
-        f.write(abspath + "\n")
+    from .lockfile import write_lock
+    with write_lock(nowait=True, what="registry-dedup-append"):
+        # Dedup: skip when this abspath is already present (normalized).
+        existing = set()
+        if reg.exists():
+            try:
+                existing = {os.path.abspath(l.strip())
+                            for l in reg.read_text().splitlines() if l.strip()}
+            except OSError:
+                existing = set()
+        if abspath in existing:
+            return
+        with open(reg, "a") as f:
+            f.write(abspath + "\n")

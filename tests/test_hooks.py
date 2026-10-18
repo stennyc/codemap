@@ -455,6 +455,55 @@ def test_search_files_pattern_no_false_attach(tmp_path):
     assert out is not None and out.startswith("[code_map]")
 
 
+def test_search_files_dir_root_under_confirmed_gets_pointer(tmp_path):
+    """The common gap: a `search_files` whose `path` (search root) is a
+    DIRECTORY under a confirmed target (e.g. globbing `*emo*` under
+    /root/.hermes/plugins/emo). Today this returns None, so the model runs a
+    whole-tree glob with zero code_map awareness. New behavior: attach a
+    one-line [code_map] POINTER (byte-capped, the follow-up keyword
+    `code_map_query` must survive the cap) pointing at the confirmed target —
+    the POINT-not-attach discipline (no 30-symbol block on a directory)."""
+    from code_map import hook
+    target = _seed_confirmed(tmp_path, ["i.py"], "def i(): pass\n")
+    out = hook._maybe_nudge("search_files", {"path": target})
+    assert out is not None
+    assert out.startswith("[code_map]")
+    # It must be a pointer to the target, not a symbol attach: name the
+    # confirmed root and carry the follow-up keyword `code_map_query`.
+    assert target in out
+    assert "code_map_query" in out
+    # P3-3: pin the FULL pointer text (nudge copy) — the legacy assertion
+    # only checked prefix/keyword/cap, so a rewrite of the nudge copy would
+    # silently pass.
+    expected = (f"[code_map] your search root {target} is under confirmed "
+                f"target {target}; for symbol lookup in this project "
+                f"prefer code_map_query(root={target}, name=...) over "
+                f"whole-tree glob/grep")
+    assert out.splitlines()[0] == expected
+    # Byte cap respected (the keyword must not be the truncated tail).
+    from code_map.config import SEARCH_DIR_NUDGE_MAX_BYTES
+    assert len(out.encode("utf-8")) <= SEARCH_DIR_NUDGE_MAX_BYTES + 64
+
+
+def test_search_files_dir_root_outside_confirmed_no_pointer(tmp_path):
+    """A directory search-root that is NOT under any confirmed target stays
+    None (no pointer, no crash) — mirrors the read-side out-of-scope rule."""
+    from code_map import hook
+    target = _seed_confirmed(tmp_path, ["i.py"], "def i(): pass\n")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    assert hook._maybe_nudge("search_files", {"path": str(outside)}) is None
+
+
+def test_search_files_bare_pattern_still_none(tmp_path):
+    """F6 invariant: a BARE relative pattern (no absolute `path` arg) abspaths
+    into the CWD and must stay None even when a confirmed target exists —
+    the directory pointer only fires on an absolute search-root path."""
+    from code_map import hook
+    _seed_confirmed(tmp_path, ["i.py"], "def i(): pass\n")
+    assert hook._maybe_nudge("search_files", {"pattern": "i.py"}) is None
+
+
 # ── symlink-profile regression (owner 2026-10-15, code_map audit) ───────────
 # The profile/symlink deployment model: a profile-local dir
 # (<home>/profiles/<p>/plugins/code_map) is a SYMLINK to the shared physical
@@ -508,6 +557,77 @@ def test_symlink_profile_read_matches_shared_confirmed_root(tmp_path):
     symlink_view = _os.path.realpath(symlink_parent)  # physical, for a fair key
     bad = [l for l in lines if l.startswith(f"{symlink_view}\t")]
     assert not bad, f"symlink-profile read must NOT log an un-indexed row: {bad!r}"
+
+
+# ── un-indexed project: directory-triggered, not source-file-triggered ─────
+# Owner 2026-10-18 (defect 2): reading ANY file (not just source) under an
+# un-indexed project's directory must log a ledger row, so the turn-boundary
+# clarify can offer to index that project. The legacy extension filter
+# (INDEXED_EXTENSIONS only) meant a project whose files the model read were
+# .md/.json/etc would NEVER be offered an index.
+#
+# Two guards keep this honest:
+#   (a) a project boundary that lands under a BLOCKED_ROOT_PREFIXES system
+#       dir (/usr, /etc, /opt, /home, or bare /) is NOT logged — reading
+#       /etc/hostname must not offer to index the whole /etc tree.
+#   (b) a read already under a CONFIRMED target is never logged (the
+#       attach path, not the pending path).
+
+def test_unindexed_read_non_source_file_logs_ledger_row(tmp_path):
+    """Reading a NON-source file (.md) inside an un-indexed project dir
+    must log a ledger row for that project dir (the clarify offer is
+    directory-triggered, not source-file-triggered)."""
+    from code_map import hook
+    from code_map.config import data_dir
+    # A brand-new project dir (NOT under any confirmed target, NOT under
+    # $HOME, NOT a blocked system dir): the /var/tmp/cm_proj_* shape.
+    import uuid, shutil
+    proj = Path("/var/tmp") / f"cm_nonsrc_{uuid.uuid4().hex[:8]}"
+    _seed_bases.append(proj)
+    try:
+        (proj / "docs").mkdir(parents=True)
+        md = proj / "docs" / "readme.md"
+        md.write_text("# hi\n", encoding="utf-8")
+        # Session-scoped: _post_tool_call carries the session_id kwarg.
+        hook._post_tool_call(
+            tool_name="read_file",
+            args={"path": str(md)},
+            result="", status="ok",
+            session_id="sess_test_nonsrc",
+        )
+        ledger = data_dir() / "_unindexed_read_ledger"
+        lines = [l for l in (ledger.read_text().splitlines()
+                              if ledger.exists() else []) if l.strip()]
+        # _project_boundary keys on the file's DIRECT PARENT DIR (the
+        # honest boundary when no root marker is found): docs/, not proj.
+        expected = f"{proj / 'docs'}\tsess_test_nonsrc"
+        assert expected in lines, \
+            f"non-source read under un-indexed project must log its dir row: {lines!r}"
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+        _seed_bases.pop()
+
+
+def test_unindexed_read_system_dir_not_logged(tmp_path):
+    """Reading a file whose project boundary is a real system tree (/usr,
+    /etc, /opt — the gate-⑩ incident shape) must NOT log a ledger row.
+    (/root and /home are deliberately NOT guarded: owner's projects under
+    them ARE the indexable case, and a real project resolves to its own
+    marker dir via detect_root, not to /root itself.)"""
+    from code_map import hook
+    from code_map.config import data_dir
+    # /etc/hostname always exists on Linux; its _project_boundary is /etc.
+    hook._post_tool_call(
+        tool_name="read_file",
+        args={"path": "/etc/hostname"},
+        result="", status="ok",
+        session_id="sess_test_sysdir",
+    )
+    ledger = data_dir() / "_unindexed_read_ledger"
+    lines = [l for l in (ledger.read_text().splitlines()
+                          if ledger.exists() else []) if l.strip()]
+    bad = [l for l in lines if l.split("\t")[0] in ("/etc", "/usr", "/opt")]
+    assert not bad, f"system-tree read must NOT log a ledger row: {bad!r}"
 
 
 # ── terminal 档 2 不对称版 (owner 2026-10-15) ─────────────────────────────────
