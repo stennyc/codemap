@@ -530,10 +530,14 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
 
 def _pending_projects(session_id: str) -> list:
     """This session's pending project dirs, re-filtered at read time:
-    rows whose project is NOW confirmed or already has a db record are
-    dropped (the user may have confirmed between the read and this turn —
-    the row auto-falls out, no stale question). Returns a sorted,
-    de-duplicated list of boundary dirs."""
+    rows whose project is NOW a confirmed target, sits UNDER a confirmed
+    target, or already has a db record are dropped (the user may have
+    confirmed or a db may have appeared between the read and this turn —
+    the row auto-falls out, no stale question). Owner 2026-10-19 added the
+    under-a-confirmed-target case: that is the refresh scenario, not the
+    "never indexed" one. Returns a sorted, de-duplicated list of boundary
+    dirs."""
+    confirmed = _confirmed_roots()
     out: list = []
     for line in _ledger_read():
         parts = line.split("\t")
@@ -545,6 +549,8 @@ def _pending_projects(session_id: str) -> list:
         if proj in out:
             continue
         if rootreg.is_confirmed_root(proj):
+            continue
+        if _find_confirmed_root(proj, confirmed) is not None:
             continue
         try:
             from .config import root_db_path
@@ -582,6 +588,40 @@ def _clear_project_rows(session_id: str, project_dirs) -> None:
 # mapping and clear the wrong session's rows). threading.local would also
 # work; an explicit parameter is simpler and makes the dependency visible
 # in the signature.
+
+
+def _purge_obsolete_rows(tool_name: str, args: Any,
+                        session_id: Optional[str]) -> None:
+    """post_tool_call write side (owner 2026-10-19): drop this session's
+    ledger rows for a project that this very read just proved obsolete —
+    i.e. the read's boundary is a confirmed target, sits under a confirmed
+    target, or has a db record (the refresh case, not "never indexed").
+
+    The write-side guards in _log_unindexed_read skip LOGGING such rows,
+    but they cannot ERASE a row that was logged BEFORE the target was
+    confirmed / a db appeared (or by a session whose confirm/refresh
+    happened later). Without this purge, on_pre_llm_call's
+    _needs_index_build_question filter alone would still let a stale row
+    survive across a confirm, and the '不再问' settle path would silently
+    drop a refresh offer the user may want next time.
+    Fail-soft: any hiccup -> no rows touched.
+    """
+    try:
+        if not session_id:
+            return
+        target = str((args or {}).get("path") or (args or {}).get("pattern") or "")
+        if not target:
+            return
+        if tool_name == "search_files" and not os.path.isabs(target):
+            return
+        proj = _project_boundary(target)
+        if proj is None:
+            return
+        if _needs_index_build_question(proj):
+            return  # genuinely pending -> keep the row, do not purge
+        _clear_project_rows(session_id, [proj])
+    except Exception as exc:
+        _log.debug("code_map obsolete-row purge fail-soft: %s", exc)
 
 
 def _clarify_named_projects(args: Any, session_id: str = "") -> list:
@@ -743,11 +783,19 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
     read). The returned `context` rides the host's pre_llm_call injection
     (appended to the user message, same shape filemem's auto-retrieve
     returns). Fail-soft: any exception -> None, never breaks the LLM call.
+
+    Owner 2026-10-19: a pending project that sits UNDER a confirmed target
+    or already has a db record is the "index known but lagging" case —
+    refresh it, don't ask "是否建索引". The write side
+    (_log_unindexed_read) already skips those rows; this face skips them
+    too so a pre-existing row (written before the target was confirmed /
+    the db appeared) cannot resurrect a redundant question.
     """
     try:
         if not session_id:
             return None
-        projects = _pending_projects(session_id)
+        projects = [p for p in _pending_projects(session_id)
+                    if _needs_index_build_question(p)]
         if not projects:
             return None
         lines = [f"[code_map] 上一轮你读了未索引项目的源码，请对每个项目"
@@ -766,6 +814,27 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
     except Exception as exc:
         _log.debug("code_map pre_llm_call notice fail-soft: %s", exc)
         return None
+
+
+def _needs_index_build_question(proj: str) -> bool:
+    """True only when the project genuinely needs the '要 / 不要 / 不再问'
+    build question. False when the project is already a confirmed target,
+    sits under one (refresh case), or has a db record (refresh case).
+    Mirrors the write-side skip guards in _log_unindexed_read so a stale
+    ledger row can't turn a refresh case into a redundant build question
+    (owner 2026-10-19)."""
+    if rootreg.is_confirmed_root(proj):
+        return False
+    confirmed = _confirmed_roots()
+    if _find_confirmed_root(proj, confirmed) is not None:
+        return False
+    try:
+        from .config import root_db_path
+        if root_db_path(proj).exists():
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _post_tool_call(tool_name: str = "", args: Any = None,
@@ -789,6 +858,11 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
         # per-read transform_tool_result footer is retired for this role.
         if tool_name in _READ_TOOLS:
             _log_unindexed_read(tool_name, args, _.get("session_id"))
+            # Owner 2026-10-19: a read that just landed inside the ledger
+            # under a confirmed target / a db-backed project is the REFRESH
+            # case, not a "never indexed" one — drop that session's rows so
+            # the turn-boundary question cannot resurrect next turn.
+            _purge_obsolete_rows(tool_name, args, _.get("session_id"))
         # Q3 transcript 兜底：宿主 clarify 工具的一次调用 = "用户被问到且
         # 已应答"的权威 transcript 证据。args 里携带 code_map 目标
         # （策略文本要求模型把目标写进 clarify 的问题里），result 里是

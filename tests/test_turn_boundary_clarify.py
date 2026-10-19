@@ -121,6 +121,58 @@ def test_read_confirmed_project_does_not_log(tmp_path):
     assert _ledger_lines() == []
 
 
+def test_read_under_a_later_confirmed_project_purges_its_stale_row(tmp_path):
+    """Owner 2026-10-19: a ledger row written BEFORE the project was
+    confirmed (the read-time boundary was a sub-dir that was not itself
+    confirmed) becomes the REFRESH case once an ancestor project is
+    confirmed — the next read under it must purge the stale row so the
+    turn-boundary question cannot resurrect, and on_pre_llm_call must
+    stay silent for the session."""
+    from code_map import hook
+    proj = _make_unconfirmed_project(tmp_path, name="projP")
+    f = proj / "core.py"
+    # 1) read before confirmation -> one ledger row for the project.
+    hook._post_tool_call("read_file", {"path": str(f)}, None,
+                         status="ok", session_id="s1")
+    rows = _pending_rows()
+    assert len(rows) == 1 and str(proj) in rows[0], rows
+    # 2) the project is now confirmed (and indexed) while the stale row lingers.
+    from code_map import rootreg
+    from code_map.state import _run_build
+    from code_map.fingerprint import invalidate_cache
+    rootreg.write_confirmed_root(str(proj))
+    _run_build(str(proj))
+    rootreg.clear_dirty(str(proj))
+    invalidate_cache(str(proj))
+    # 3) the turn-boundary face must not re-ask (filter at read time).
+    out = hook.on_pre_llm_call(session_id="s1", user_message="hi",
+                               conversation_history=[], model="m",
+                               platform="tui")
+    assert out is None, f"stale row under a confirmed target must not ask: {out}"
+    # 4) the next read purges the stale ledger row itself.
+    hook._post_tool_call("read_file", {"path": str(f)}, None,
+                         status="ok", session_id="s1")
+    assert _pending_rows() == [], "the stale row must be purged by the read"
+
+
+def test_on_pre_llm_call_skips_projects_under_a_confirmed_target(tmp_path):
+    """Owner 2026-10-19 (filter face): a manually-seeded ledger row whose
+    project sits UNDER a confirmed target must be skipped by
+    on_pre_llm_call even before any purge read happens — that is the
+    refresh case, never the '是否建索引' case."""
+    from code_map import hook
+    from code_map.config import data_dir
+    target = _seed_confirmed(tmp_path, ["top.py"], "def top(): pass\n")
+    sub = target + "/sub"
+    data_dir().mkdir(parents=True, exist_ok=True)
+    p = data_dir() / "_unindexed_read_ledger"
+    p.write_text(f"{sub}\ts1\n", encoding="utf-8")
+    out = hook.on_pre_llm_call(session_id="s1", user_message="hi",
+                               conversation_history=[], model="m",
+                               platform="tui")
+    assert out is None, f"row under a confirmed target must be skipped: {out}"
+
+
 def test_read_non_source_unconfirmed_logs_directory(tmp_path):
     """Owner 2026-10-18 (defect 2): the clarify offer is DIRECTORY-triggered,
     not source-file-triggered — reading ANY file (e.g. .md) inside an
