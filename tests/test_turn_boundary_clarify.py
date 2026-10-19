@@ -173,6 +173,29 @@ def test_on_pre_llm_call_skips_projects_under_a_confirmed_target(tmp_path):
     assert out is None, f"row under a confirmed target must be skipped: {out}"
 
 
+def test_purge_is_noop_for_genuinely_pending_project(tmp_path):
+    """Owner-awareness (reviewer round 1, P2): the purge must NOT clear a
+    row for a project that is still genuinely pending (unconfirmed, not
+    under a confirmed target, no db record) — the '不要 = keep asking'
+    semantics require the row to survive its own re-read."""
+    from code_map import hook
+    proj = _make_unconfirmed_project(tmp_path, name="projQ")
+    f = proj / "core.py"
+    hook._post_tool_call("read_file", {"path": str(f)}, None,
+                         status="ok", session_id="s1")
+    assert len(_pending_rows()) == 1
+    # Re-reading the SAME pending project must leave the row intact.
+    hook._post_tool_call("read_file", {"path": str(f)}, None,
+                         status="ok", session_id="s1")
+    assert _pending_rows() == [f"{proj}\ts1"], \
+        "purge must be a no-op for a genuinely pending project"
+    # The question must still be offered next turn.
+    out = hook.on_pre_llm_call(session_id="s1", user_message="hi",
+                               conversation_history=[], model="m",
+                               platform="tui")
+    assert out is not None and str(proj) in out["context"]
+
+
 def test_read_non_source_unconfirmed_logs_directory(tmp_path):
     """Owner 2026-10-18 (defect 2): the clarify offer is DIRECTORY-triggered,
     not source-file-triggered — reading ANY file (e.g. .md) inside an
