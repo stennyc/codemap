@@ -1,0 +1,13 @@
+name: code_map
+version: 1.0.0
+description: L1.5 code-symbol index (tree-sitter based, zero external API). Cross-file symbol lookup + single-file outline + authoritative re-scan.
+author: Agnes
+license: MIT
+provides_tools:
+  - code_map_query
+  - code_map_confirm_root
+  - code_map_refresh
+  - code_map_check_root
+provides_hooks:
+  - transform_tool_result
+  - post_tool_call
