@@ -67,7 +67,8 @@ def ensure_dep_paths() -> List[str]:
     """
     import sys
 
-    venv_root = os.environ.get("CODE_MAP_VENV", str(Path.home() / ".hermes" / "plugin-venv"))
+    hermes_home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    venv_root = os.environ.get("CODE_MAP_VENV", os.path.join(hermes_home, "plugin-venv"))
     sites = resolve_dep_sites(venv_root)
     appended: List[str] = []
     for site in sites:
