@@ -3,6 +3,18 @@ version: 1.0.0
 description: L1.5 code-symbol index (tree-sitter based, zero external API). Cross-file symbol lookup + single-file outline + authoritative re-scan.
 author: Agnes
 license: MIT
+python_dependencies:
+  - "tree-sitter>=0.21"
+  - "tree-sitter-python"
+  - "tree-sitter-typescript"
+  - "tree-sitter-javascript"
+  - "tree-sitter-go"
+  - "tree-sitter-rust"
+  - "tree-sitter-java"
+  - "tree-sitter-dart"
+  - "tree-sitter-c"
+  - "tree-sitter-cpp"
+  - "filelock>=3.12"
 provides_tools:
   - code_map_query
   - code_map_confirm_root
