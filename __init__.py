@@ -23,6 +23,7 @@ from ._dep_paths import ensure_dep_paths
 def _ensure_code_map_dep_paths() -> None:
     """Make tree_sitter + the language grammars importable, UNIFORMLY from
     $HERMES_HOME/plugin-venv.
+    /root/.hermes/plugin-venv.
 
     The site-packages dir is resolved by globbing ``lib/python*`` under the
     venv (never a hardcoded minor version), so a venv built under 3.13, 3.14

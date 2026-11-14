@@ -18,6 +18,7 @@ import glob
 import json
 import os
 from pathlib import Path
+import os
 from typing import List
 
 ENV_OVERRIDE = "CODE_MAP_PY_SITE"
@@ -119,6 +120,23 @@ def ensure_dep_paths() -> List[str]:
     # Splice onto sys.path (deduped)
     appended: List[str] = []
     for site in candidates:
+def ensure_dep_paths() -> List[str]:
+    """Splice :func:`resolve_dep_sites` results onto ``sys.path``.
+
+    Intended to run before the package imports parser.py. Always appends the
+    plugin-venv site-packages (deduped against existing ``sys.path`` entries —
+    see the ``site not in sys.path`` guard below); it does NOT probe whether the
+    host interpreter already sees the packages (the old find_spec early-return
+    is gone, per the 10-08 venv 口径). Returns the dirs actually appended
+    (for logging/tests). Rollback-safe: remove the call site to restore
+    host-only behaviour.
+    """
+    import sys
+
+    venv_root = os.environ.get("CODE_MAP_VENV", "/root/.hermes/tools")
+    sites = resolve_dep_sites(venv_root)
+    appended: List[str] = []
+    for site in sites:
         if site not in sys.path:
             sys.path.append(site)
             appended.append(site)
