@@ -30,6 +30,8 @@ CASES = [
     ("dart", fx.DART_SRC, fx.DART_EXPECTED_CALL_NAMES),
     ("c", fx.C_SRC, fx.C_EXPECTED_CALL_NAMES),
     ("cpp", fx.CPP_SRC, fx.CPP_EXPECTED_CALL_NAMES),
+    ("php", fx.PHP_SRC, fx.PHP_EXPECTED_CALL_NAMES),
+    ("kotlin", fx.KOTLIN_SRC, fx.KOTLIN_EXPECTED_CALL_NAMES),
 ]
 
 

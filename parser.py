@@ -1,4 +1,4 @@
-"""tree-sitter symbol extraction for Python, TypeScript, JavaScript, Go, Rust, Java, Dart, C, C++.
+"""tree-sitter symbol extraction for Python, TypeScript, JavaScript, Go, Rust, Java, Dart, C, C++, PHP, Kotlin.
 
 Contract gate ①: streaming, O(single-file) peak memory.
 
@@ -84,6 +84,14 @@ def _lazy_import(lang: str) -> bool:
         elif lang == "cpp":
             import tree_sitter_cpp
             _GRAMMARS[lang] = tree_sitter_cpp
+            _LANG_TYPES[lang] = ("language",)
+        elif lang == "php":
+            import tree_sitter_php
+            _GRAMMARS[lang] = tree_sitter_php
+            _LANG_TYPES[lang] = ("language_php",)
+        elif lang == "kotlin":
+            import tree_sitter_kotlin
+            _GRAMMARS[lang] = tree_sitter_kotlin
             _LANG_TYPES[lang] = ("language",)
         else:
             return False
@@ -190,6 +198,13 @@ def _call_site_row(node, in_class: bool, lang: str) -> Optional[SymbolRow]:
     if fn is None:
         fn = node.child_by_field_name("name")  # java method_invocation
     if fn is None:
+        # PHP: function_call_expression has a `name` CHILD (not a field)
+        # Kotlin: call_expression has an `identifier` child
+        for sub in node.children:
+            if sub.type in ("name", "identifier"):
+                fn = sub
+                break
+    if fn is None:
         return None
 
     # Collect all identifier-type children, then take the LAST one (the called
@@ -201,6 +216,12 @@ def _call_site_row(node, in_class: bool, lang: str) -> Optional[SymbolRow]:
                    "type_identifier"):
         id_children = [fn]
     if not id_children:
+        # Leaf name nodes (e.g. PHP `name` child of `function_call_expression`)
+        # have no identifier-type children — use the node's own text directly.
+        if fn.text:
+            nm = fn.text.decode("utf-8", "replace").strip()
+            if nm:
+                return (nm, "call_site", node.start_point[0] + 1, _sig_for(node))
         return None
     nm = id_children[-1].text.decode("utf-8", "replace")
     if not nm:
@@ -220,8 +241,10 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
         # handled in the `lang == "dart"` branch just below.
         _call_node_types = (
             "call",                # python
-            "call_expression",    # typescript, javascript, go, rust, c, cpp
+            "call_expression",    # typescript, javascript, go, rust, c, cpp, kotlin
             "method_invocation",   # java
+            "function_call_expression",  # php
+            "member_call_expression",    # php
         )
         if ctype in _call_node_types or (lang == "dart" and ctype == "expression_statement"):
             row = _call_site_row(child, in_class, lang)
@@ -395,6 +418,96 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                 # block/statement_list/expression_statement added for L2: Go
                 # call_expression nodes sit inside expression_statement inside a
                 # statement_list inside a function body block
+                rows.extend(_symbol_rows_from_node(child, in_class, lang))
+                continue
+
+        # ---- PHP ----
+        if lang == "php":
+            if ctype == "function_definition":
+                name = _extract_name(child)
+                if name:
+                    rows.append((name, "function", child.start_point[0] + 1, _sig_for(child)))
+                body = child.child_by_field_name("body")
+                if body is None:
+                    for sub in child.children:
+                        if sub.type == "compound_statement":
+                            body = sub
+                            break
+                if body is not None:
+                    rows.extend(_symbol_rows_from_node(body, in_class, lang))
+                continue
+            if ctype == "class_declaration":
+                name = _extract_name(child)
+                if name:
+                    rows.append((name, "class", child.start_point[0] + 1, _sig_for(child)))
+                body = child.child_by_field_name("body")
+                if body is None:
+                    for sub in child.children:
+                        if sub.type in ("declaration_list", "class_body"):
+                            body = sub
+                            break
+                if body is not None:
+                    rows.extend(_symbol_rows_from_node(body, True, lang))
+                continue
+            if ctype == "method_declaration":
+                name = _extract_name(child)
+                if name:
+                    rows.append((name, "method", child.start_point[0] + 1, _sig_for(child)))
+                body = child.child_by_field_name("body")
+                if body is None:
+                    for sub in child.children:
+                        if sub.type == "compound_statement":
+                            body = sub
+                            break
+                if body is not None:
+                    rows.extend(_symbol_rows_from_node(body, True, lang))
+                continue
+            if ctype in ("namespace_use_declaration", "use_declaration", "import_declaration"):
+                line = child.start_point[0] + 1
+                sig = _sig_for(child)
+                for sub in child.children:
+                    if sub.type in ("name", "qualified_name", "scoped_name"):
+                        for iden in sub.children:
+                            if iden.type == "name":
+                                nm = iden.text.decode("utf-8", "replace").strip()
+                                if nm:
+                                    rows.append((nm, "import", line, sig))
+                                    break
+                continue
+            if ctype in ("program", "compound_statement", "declaration_list", "expression_statement"):
+                rows.extend(_symbol_rows_from_node(child, in_class, lang))
+                continue
+
+        # ---- Kotlin ----
+        if lang == "kotlin":
+            if ctype == "function_declaration":
+                name = _extract_name(child)
+                if name:
+                    kind = "method" if in_class else "function"
+                    rows.append((name, kind, child.start_point[0] + 1, _sig_for(child)))
+                body = child.child_by_field_name("body")
+                if body is None:
+                    for sub in child.children:
+                        if sub.type in ("function_body", "block"):
+                            body = sub
+                            break
+                if body is not None:
+                    rows.extend(_symbol_rows_from_node(body, in_class, lang))
+                continue
+            if ctype == "class_declaration":
+                name = _extract_name(child)
+                if name:
+                    rows.append((name, "class", child.start_point[0] + 1, _sig_for(child)))
+                body = child.child_by_field_name("body")
+                if body is None:
+                    for sub in child.children:
+                        if sub.type in ("class_body", "block"):
+                            body = sub
+                            break
+                if body is not None:
+                    rows.extend(_symbol_rows_from_node(body, True, lang))
+                continue
+            if ctype in ("source_file", "block", "class_body", "function_body"):
                 rows.extend(_symbol_rows_from_node(child, in_class, lang))
                 continue
 

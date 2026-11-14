@@ -73,6 +73,14 @@ int main() { g(1); obj.m(); std::puts("hi"); return 0; }
 """
 CPP_EXPECTED_CALL_NAMES = {"g", "m", "puts"}
 
+# php
+PHP_SRC = b'<?php function foo() { bar(); } class Baz { public function qux() { helper(1); } }'
+PHP_EXPECTED_CALL_NAMES = {"bar", "helper"}
+
+# kotlin
+KOTLIN_SRC = b'fun main() { helper(1) }\nclass Foo { fun bar() { helper(2) } }'
+KOTLIN_EXPECTED_CALL_NAMES = {"helper"}
+
 
 # ---- gate ④ timing-window fixtures ------------------------------------------
 # A root containing a single small .py file; used to measure that a

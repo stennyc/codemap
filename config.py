@@ -36,7 +36,7 @@ DEFAULT_PRUNE_BLACKLIST = frozenset({
     ".idea", ".vscode",
 })
 
-# File extensions code_map indexes (expanded from Python-only to 9 languages).
+# File extensions code_map indexes (expanded from Python-only to 11 languages).
 INDEXED_EXTENSIONS = frozenset({
     ".py",      # Python
     ".ts", ".tsx",  # TypeScript
@@ -48,6 +48,8 @@ INDEXED_EXTENSIONS = frozenset({
     ".c", ".h",  # C
     ".cpp", ".cc", ".cxx",  # C++
     ".hpp", ".hxx", ".hh",  # C++ headers
+    ".php",     # PHP
+    ".kt", ".kts",  # Kotlin
 })
 
 # Project-root markers, searched upward. `.git` has the highest priority

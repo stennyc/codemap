@@ -8,4 +8,6 @@ tree-sitter-java
 tree-sitter-dart
 tree-sitter-c
 tree-sitter-cpp
+tree-sitter-php
+tree-sitter-kotlin
 filelock>=3.12

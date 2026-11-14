@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
-# The 9 supported languages, keyed by the grammar module name.
+# The 11 supported languages, keyed by the grammar module name.
 SUPPORTED_LANGUAGES: Dict[str, str] = {
     "python": "tree_sitter_python",
     "typescript": "tree_sitter_typescript",
@@ -19,6 +19,8 @@ SUPPORTED_LANGUAGES: Dict[str, str] = {
     "dart": "tree_sitter_dart",
     "c": "tree_sitter_c",
     "cpp": "tree_sitter_cpp",
+    "php": "tree_sitter_php",
+    "kotlin": "tree_sitter_kotlin",
 }
 
 # Extension → language mapping (kept here as the source of truth;
@@ -34,10 +36,12 @@ EXT_TO_LANG: Dict[str, str] = {
     ".c": "c", ".h": "c",
     ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
     ".hpp": "cpp", ".hxx": "cpp", ".hh": "cpp",
+    ".php": "php",
+    ".kt": "kotlin", ".kts": "kotlin",
 }
 
 # Languages that are *conditionally* included (may not be installed).
-OPTIONAL_LANGS: Set[str] = {"dart", "c", "cpp"}
+OPTIONAL_LANGS: Set[str] = {"dart", "c", "cpp", "php", "kotlin"}
 
 
 def available_languages() -> List[str]:
