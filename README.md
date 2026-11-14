@@ -23,8 +23,23 @@ the tool layer covers what the model *explicitly asks for*.
 
 ## Supported languages
 
-Python, TypeScript, JavaScript, Go, Rust, Java, Dart, C, C++
-(via [tree-sitter](https://tree-sitter.github.io/) grammars)
+| Language | File extensions | Grammar package |
+|---|---|---|
+| Python | `.py` | tree-sitter-python |
+| TypeScript | `.ts`, `.tsx` | tree-sitter-typescript |
+| JavaScript | `.js`, `.jsx` | tree-sitter-javascript |
+| Go | `.go` | tree-sitter-go |
+| Rust | `.rs` | tree-sitter-rust |
+| Java | `.java` | tree-sitter-java |
+| Dart | `.dart` | tree-sitter-dart |
+| C | `.c`, `.h` | tree-sitter-c |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | tree-sitter-cpp |
+| PHP | `.php` | tree-sitter-php |
+| Kotlin | `.kt`, `.kts` | tree-sitter-kotlin |
+
+All via [tree-sitter](https://tree-sitter.github.io/) grammars, fully offline.
+Optional languages (Dart, C, C++, PHP, Kotlin) are skipped gracefully if
+their grammar package is not installed.
 
 ## Architecture
 
@@ -65,7 +80,7 @@ falls back to the host interpreter's own `tree_sitter` + grammar packages
 pip install tree-sitter tree-sitter-python tree-sitter-typescript \
             tree-sitter-javascript tree-sitter-go tree-sitter-rust \
             tree-sitter-java tree-sitter-dart tree-sitter-c \
-            tree-sitter-cpp
+            tree-sitter-cpp tree-sitter-php tree-sitter-kotlin
 ```
 
 ## Running the tests
