@@ -46,6 +46,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "code_map"))  # tests/ 包可导入（从任一 cwd 跑测试）
 
 from tests.test_hooks import _seed_confirmed, _make_store  # noqa: E402
 
