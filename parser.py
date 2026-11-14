@@ -126,18 +126,7 @@ def _sig_for(node) -> str:
 def _detect_language(path: str) -> Optional[str]:
     """Detect language from file extension."""
     ext = Path(path).suffix.lower()
-    EXT_TO_LANG = {
-        ".py": "python",
-        ".ts": "typescript", ".tsx": "typescript",
-        ".js": "javascript", ".jsx": "javascript",
-        ".go": "go",
-        ".rs": "rust",
-        ".java": "java",
-        ".dart": "dart",
-        ".c": "c", ".h": "c",
-        ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
-        ".hpp": "cpp", ".hxx": "cpp", ".hh": "cpp",
-    }
+    from .registry import EXT_TO_LANG
     return EXT_TO_LANG.get(ext)
 
 

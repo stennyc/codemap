@@ -259,14 +259,8 @@ def _parse_safe(path: str) -> list:
 
 def _guess_lang(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
-    lang_map = {
-        ".py": "python", ".ts": "typescript", ".tsx": "typescript",
-        ".js": "javascript", ".jsx": "javascript", ".go": "go",
-        ".rs": "rust", ".java": "java", ".dart": "dart",
-        ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp",
-        ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp", ".hh": "cpp",
-    }
-    return lang_map.get(ext, "unknown")
+    from .registry import EXT_TO_LANG
+    return EXT_TO_LANG.get(ext, "unknown")
 
 
 def _commit_batch(conn, root: str, build_id: str,
