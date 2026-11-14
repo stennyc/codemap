@@ -15,6 +15,7 @@ Resolution rules (venv 口径, user directive 10-08):
 from __future__ import annotations
 
 import glob
+import json
 import os
 from pathlib import Path
 from typing import List
