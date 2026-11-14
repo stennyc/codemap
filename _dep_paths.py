@@ -83,20 +83,13 @@ def _find_hermes_managed_venv(hermes_home: str) -> str | None:
     return None
 
 
-def _find_legacy_plugin_venv(hermes_home: str) -> str | None:
-    """Return the legacy ``<HERMES_HOME>/plugin-venv`` path when it exists."""
-    venv = os.path.join(hermes_home, "plugin-venv")
-    return venv if os.path.isdir(venv) else None
-
-
 def ensure_dep_paths() -> List[str]:
     """Splice resolved site-packages onto ``sys.path``.
 
     Priority order:
       1. ``CODE_MAP_PY_SITE`` environment override (explicit user control)
       2. Hermes-managed venv (from ``facts.json`` — canonical, auto-detected)
-      3. Legacy ``plugin-venv`` (fallback for manual installs)
-      4. Nothing — fail-soft, deps resolved from host interpreter if present
+      3. Nothing — fail-soft, deps resolved from host interpreter if present
 
     Deduplication against ``sys.path`` is applied so repeated calls are no-ops.
     Returns the dirs actually appended (for logging/tests).
@@ -122,12 +115,6 @@ def ensure_dep_paths() -> List[str]:
         managed = _find_hermes_managed_venv(hermes_home)
         if managed:
             candidates.extend(resolve_dep_sites(managed))
-
-    # 3. Legacy plugin-venv
-    if not candidates:
-        legacy = _find_legacy_plugin_venv(hermes_home)
-        if legacy:
-            candidates.extend(resolve_dep_sites(legacy))
 
     # Splice onto sys.path (deduped)
     appended: List[str] = []
