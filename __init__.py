@@ -45,6 +45,34 @@ def _ensure_code_map_dep_paths() -> None:
 
 _ensure_code_map_dep_paths()
 
+
+def _ensure_fcntl_module() -> None:
+    """Make the bare ``import fcntl`` in hook.py/lockfile.py resolvable on Windows.
+
+    The loader (hermes_cli.plugins_loader._load_directory_module) imports this
+    package via file location and never puts the plugins dir on sys.path, so a
+    top-level ``import fcntl`` fails on Windows, where the stdlib has no fcntl.
+    Install the bundled fcntl.py shim (identical to the $HERMES_HOME/plugins
+    shim) into sys.modules; no-op when a real fcntl (Linux/macOS) or an
+    already-imported shim is present.
+    """
+    try:
+        import fcntl  # noqa: F401  (stdlib on Linux/macOS, or shim already on path)
+        return
+    except ModuleNotFoundError:
+        pass
+    import importlib.util as _ilu
+    shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fcntl.py")
+    spec = _ilu.spec_from_file_location("fcntl", shim)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"code_map: cannot load fcntl shim at {shim}")
+    mod = _ilu.module_from_spec(spec)
+    sys.modules["fcntl"] = mod
+    spec.loader.exec_module(mod)
+
+
+_ensure_fcntl_module()
+
 from . import hook  # noqa: E402  (must follow the dep splice)
 from .query import code_map_query, code_map_confirm_root, code_map_refresh, code_map_check_root  # noqa: E402
 
