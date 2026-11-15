@@ -29,4 +29,3 @@ config_schema:
     default: []
     label: "Granted capabilities"
     description: "宿主 capability 门禁：该插件被授权的能力列表（如 [\"tools.override\"]）。启用/能力由 hermes plugins 侧控制，非插件行为档位。"
-schema: legacy_nested
