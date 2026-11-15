@@ -685,6 +685,24 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             "note": "dry-run: nothing indexed. Pass yes=true to build.",
         }, ensure_ascii=False)
 
+    # OPT: if target already in registry, skip transcript check and just refresh.
+    # Already-confirmed targets don't need re-clarification every session —
+    # the registry itself is the persistent authorization record. This
+    # eliminates the "asked and confirmed last session, asked again this
+    # session" loop while keeping the gate fail-closed for NEW targets.
+    from . import rootreg
+    if rootreg.is_confirmed_root(target):
+        from .state import refresh_root
+        res = refresh_root(root, path)
+        if res.get("status") != "build_started":
+            return json.dumps(res, ensure_ascii=False)
+        res["root"] = target
+        res["dry_run"] = False
+        res["note"] = ("refresh: target already confirmed (registry hit), "
+                       "no fresh clarify needed — only re-indexing.")
+        res["files_indexed"] = len(indexable)
+        return json.dumps(res, ensure_ascii=False)
+
     # ── transcript 兜底（Q3, owner 定：模型推 clarify，transcript 兜底）──
     # 宿主 clarify 工具是原生单选卡，_sum_clarify 在 context_compressor 里
     # 保证 clarify 的问答对（user_response）压缩后仍留痕。插件侧没有宿主
