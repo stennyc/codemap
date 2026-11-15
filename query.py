@@ -698,16 +698,35 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
         or any(target.startswith(ct + os.sep) for ct in _confirmed_targets)
     )
     if _is_confirmed_or_descendant:
-        from .state import refresh_root
-        res = refresh_root(root, path)
-        if res.get("status") != "build_started":
+        from .state import invalidate_cache, _start_build_thread
+        # For exact-match confirmed targets use refresh_root (includes
+        # the files_indexed count). For sub-paths (descendants only),
+        # call the internals directly since the sub-path target is not
+        # itself in the registry.
+        if target in _confirmed_targets:
+            from .state import refresh_root
+            res = refresh_root(root, path)
+            if res.get("status") != "build_started":
+                return json.dumps(res, ensure_ascii=False)
+            res["root"] = target
+            res["dry_run"] = False
+            res["note"] = ("refresh: target already confirmed (registry hit), "
+                           "no fresh clarify needed — only re-indexing.")
+            res["files_indexed"] = len(indexable)
             return json.dumps(res, ensure_ascii=False)
-        res["root"] = target
-        res["dry_run"] = False
-        res["note"] = ("refresh: target already confirmed (registry hit), "
-                       "no fresh clarify needed — only re-indexing.")
-        res["files_indexed"] = len(indexable)
-        return json.dumps(res, ensure_ascii=False)
+        else:
+            # Sub-path of a confirmed ancestor: invalidate cache + start
+            # build for this specific target. Same as refresh_root minus
+            # the registry membership check.
+            invalidate_cache(target)
+            _start_build_thread(target)
+            res = {"root": target, "status": "refresh_started",
+                   "dry_run": False,
+                   "note": ("refresh: target is a descendant of a confirmed "
+                            "ancestor, no fresh clarify needed — only "
+                            "re-indexing."),
+                   "files_indexed": len(indexable)}
+            return json.dumps(res, ensure_ascii=False)
 
     # ── transcript 兜底（Q3, owner 定：模型推 clarify，transcript 兜底）──
     # 宿主 clarify 工具是原生单选卡，_sum_clarify 在 context_compressor 里
