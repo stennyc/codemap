@@ -685,13 +685,19 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             "note": "dry-run: nothing indexed. Pass yes=true to build.",
         }, ensure_ascii=False)
 
-    # OPT: if target already in registry, skip transcript check and just refresh.
-    # Already-confirmed targets don't need re-clarification every session —
-    # the registry itself is the persistent authorization record. This
-    # eliminates the "asked and confirmed last session, asked again this
-    # session" loop while keeping the gate fail-closed for NEW targets.
+    # OPT: if target already in registry, or is a descendant of a confirmed
+    # root, skip transcript check and just refresh. Already-confirmed targets
+    # (and their sub-paths) don't need re-clarification every session — the
+    # registry itself is the persistent authorization record. This eliminates
+    # the "asked and confirmed last session, asked again this session" loop
+    # while keeping the gate fail-closed for TRULY NEW targets.
     from . import rootreg
-    if rootreg.is_confirmed_root(target):
+    _confirmed_targets = rootreg.confirmed_targets()
+    _is_confirmed_or_descendant = (
+        target in _confirmed_targets
+        or any(target.startswith(ct + os.sep) for ct in _confirmed_targets)
+    )
+    if _is_confirmed_or_descendant:
         from .state import refresh_root
         res = refresh_root(root, path)
         if res.get("status") != "build_started":
