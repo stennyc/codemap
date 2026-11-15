@@ -24,8 +24,8 @@ provides_hooks:
   - transform_tool_result
   - post_tool_call
 config_schema:
-  granted_capabilities:
-    type: str
-    default: "tools.override"
-    label: "Granted capabilities"
-    description: "宿主 capability 门禁：该插件被授权的能力（逗号分隔，如 tools.override）。启用/能力由 hermes plugins 侧控制。"
+  override_tools:
+    type: bool
+    default: true
+    label: "Allow tool override"
+    description: "授权 code_map 覆盖宿主原生 read_file/search_files 结果（注入符号大纲 + 跨文件 import 边）。关闭后工具面退回宿主原生行为。"
