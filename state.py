@@ -7,6 +7,8 @@ BUILD_COMMIT_BATCH files.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import uuid
 from typing import Any, Dict, Optional
@@ -26,26 +28,103 @@ _log = logging.getLogger("code_map.state")
 # target before e.g. rmtree'ing its db dir can join them (test hygiene;
 # production callers may ignore this list entirely).
 _live_build_threads: "list[threading.Thread]" = []
+# Process-isolated builds (owner 2026-11-17): fire-and-forget CHILD processes
+# running _run_build. A same-process daemon thread soft-competes the main
+# process's GIL / CPU / memory for a heavy tree-sitter parse + sqlite commit;
+# a child process does not (cross-process sqlite safety is already handled by
+# WAL + the lockfile). Tracked the same way _live_build_threads is so
+# join_live_build_threads can quiesce both kinds before a dir cleanup.
+_live_build_processes: "list[subprocess.Popen]" = []
 _live_threads_lock = threading.Lock()
 
 
 def join_live_build_threads(timeout: Optional[float] = 30.0) -> bool:
-    """Wait for all in-flight fire-and-forget build threads to finish.
+    """Wait for all in-flight fire-and-forget builds to finish.
 
-    Returns True if every live thread finished within `timeout` seconds
-    (or there were none), False if at least one is still running past
-    the deadline (the caller then proceeds at its own risk — daemon
-    threads will still be reaped at interpreter exit, but any dir/file
-    cleanup racing them may observe partial/leaked paths)."""
+    Covers BOTH the in-process daemon build threads (the heal path / the
+    spawn-hiccup fallback) AND the process-isolated build child processes
+    (owner 2026-11-17). Returns True if every in-flight build finished within
+    `timeout` seconds (or there were none), False if at least one is still
+    running past the deadline (the caller then proceeds at its own risk —
+    daemon threads / child processes are reaped at interpreter exit, but any
+    dir/file cleanup racing them may observe partial/leaked paths)."""
+    done = True
     with _live_threads_lock:
         threads = [t for t in _live_build_threads if t.is_alive()]
     for t in threads:
         t.join(timeout)
         if timeout is not None:
             timeout = max(0.0, timeout - 0.1)  # crude budget split
+        if t.is_alive():
+            done = False
     with _live_threads_lock:
         _live_build_threads[:] = [t for t in _live_build_threads if t.is_alive()]
-    return not any(t.is_alive() for t in threads)
+    # AND reap the process-isolated build children (quiesce before a dir
+    # cleanup can rmtree their db dir out from under a still-writing child).
+    with _live_threads_lock:
+        procs = [p for p in _live_build_processes if p.poll() is None]
+    for p in procs:
+        try:
+            p.wait(timeout=timeout)
+        except Exception:
+            pass
+        if p.poll() is None:
+            done = False
+    with _live_threads_lock:
+        _live_build_processes[:] = [
+            p for p in _live_build_processes if p.poll() is None]
+    return done
+
+
+def _build_entry_script() -> str:
+    """Path to the standalone build-subprocess entry (lives in the plugin dir,
+    run by <this interpreter> build_subprocess_entry.py <target>)."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "build_subprocess_entry.py")
+
+
+def _start_build_process(target: str):
+    """Fire-and-forget build in a CHILD process (owner 2026-11-17), NOT a
+    same-process daemon thread.
+
+    The heavy full build (_run_build: tree-sitter parse + sqlite commit) runs
+    in a child process so it does NOT share the main process's GIL / CPU /
+    memory — a same-process thread would soft-contend the main process's
+    concurrent work (the user's 'indexing 打断主进程' fix). The child runs
+    `build_subprocess_entry.py <target>` under the SAME interpreter
+    (sys.executable): it self-bootstraps (import code_map -> fcntl shim +
+    ensure_dep_paths splices tree-sitter) and runs _run_build under the
+    cross-process write_lock (advisory; sqlite WAL keeps the db correct
+    regardless). Exit 0 = built; non-zero + a traceback on the host stderr =
+    a visible failure (mirrors _safe_run_build's fail-visible posture).
+
+    The Popen handle is tracked in _live_build_processes (bounded + reaped by
+    join_live_build_threads). Fail-soft: if Popen itself fails (no
+    interpreter / spawn error), fall back to the IN-PROCESS daemon thread so a
+    build is never lost to a spawn hiccup — we just give up the isolation."""
+    entry = _build_entry_script()
+    try:
+        kwargs = dict(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            # inherit the host stderr so a child traceback lands in the
+            # gateway log (fail-visible, mirroring _safe_run_build).
+            stderr=None,
+        )
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen([sys.executable, entry, target], **kwargs)
+    except Exception as exc:
+        logging.getLogger("code_map.state").warning(
+            "code_map build subprocess spawn failed (%s); falling back to an "
+            "in-process build thread", exc)
+        return _start_build_thread(target)
+    with _live_threads_lock:
+        _live_build_processes.append(proc)
+        # bound: prune already-exited, cap the live list (oldest trimmed)
+        _live_build_processes[:] = [
+            p for p in _live_build_processes if p.poll() is None][-8:]
+    return proc
 
 
 def _start_build_thread(target: str) -> threading.Thread:
@@ -147,7 +226,7 @@ def confirm_root(root_path: str = "", path: str = "") -> Dict[str, Any]:
     target = rootreg._join_target(root_path, path)
     assert target is not None  # gate returned None (pass) above
     rootreg.write_confirmed_root(target)
-    _start_build_thread(target)
+    _start_build_process(target)
     return {"root": target, "path": path, "status": "build_started",
             "build_id": str(uuid.uuid4())}
 
@@ -175,7 +254,7 @@ def refresh_root(root_path: str, path: str = "") -> Dict[str, Any]:
         return {"root": target, "status": "invalid",
                 "note": "root not confirmed; call code_map_confirm_root first"}
     invalidate_cache(target)
-    _start_build_thread(target)
+    _start_build_process(target)
     # Enrich the return so the caller can verify the refresh WITHOUT a
     # terminal/log tail: db_path is deterministic from the target, and
     # files_indexed is a cheap sqlite COUNT of the current index state

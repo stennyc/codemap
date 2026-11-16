@@ -988,7 +988,7 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
         or any(target.startswith(ct + os.sep) for ct in _confirmed_targets)
     )
     if _is_confirmed_or_descendant:
-        from .state import invalidate_cache, _start_build_thread
+        from .state import invalidate_cache, _start_build_process
         # For exact-match confirmed targets use refresh_root (includes
         # the files_indexed count). For sub-paths (descendants only),
         # call the internals directly since the sub-path target is not
@@ -1009,7 +1009,7 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
             # build for this specific target. Same as refresh_root minus
             # the registry membership check.
             invalidate_cache(target)
-            _start_build_thread(target)
+            _start_build_process(target)
             res = {"root": target, "status": "refresh_started",
                    "dry_run": False,
                    "note": ("refresh: target is a descendant of a confirmed "
