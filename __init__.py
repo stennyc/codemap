@@ -243,7 +243,13 @@ _TOOL_SCHEMAS = {
             "path is the RELATIVE sub-path inside it, and the joined target "
             "is what gets indexed. A root-only call (whole-boundary index, "
             "the 382k-file incident) or a path-only call is invalid; a path "
-            "that escapes the boundary via ../ is invalid. Triggers an "
+            "that escapes the boundary via ../ is invalid. NEW "
+            "targets additionally require a same-session affirmative "
+            "clarify confirmation for this exact target (transcript "
+            "evidence, fail-closed — same policy as check_root(yes=true); "
+            "the registry itself exempts already-confirmed targets and "
+            "their sub-paths); a miss is refused with blocked_by_policy "
+            "and logged to data/confirm_root_log.jsonl. Triggers an "
             "async, non-blocking build."
         ),
         "parameters": {

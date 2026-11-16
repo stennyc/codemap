@@ -805,6 +805,25 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
     return json.dumps(res, ensure_ascii=False)
 
 
+def _append_confirm_audit_line(rec: Dict[str, Any]) -> Path:
+    """Append one audit row to data/confirm_root_log.jsonl (both success and
+    evidence-miss outcomes — 2026-11-16: a miss without a logged reason is
+    what forced the disk-archaeology diagnosis of the 17:00 incident).
+    Fail-soft: an audit hiccup never blocks or breaks the confirm path."""
+    import datetime
+    log_path = data_dir() / "confirm_root_log.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.datetime.now().isoformat(),
+                **rec,
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    return log_path
+
+
 def code_map_confirm_root(args: Dict[str, Any]) -> str:
     """code_map_confirm_root: lock a (root, path) target and build.
 
@@ -814,8 +833,16 @@ def code_map_confirm_root(args: Dict[str, Any]) -> str:
     indexed and registered. A root-only call (whole-boundary index —
     the 382k-file incident) or a path-only call (no boundary) is
     rejected; the bare filesystem root '/' is rejected; a path that
-    escapes the boundary via ../ is rejected."""
-    from .state import confirm_root
+    escapes the boundary via ../ is rejected.
+
+    Evidence gate (2026-11-16): like check_root(yes=true), a TRULY NEW
+    target requires a same-session affirmative clarify evidence line for
+    that exact target (or an ancestor boundary, the Q3 descent
+    relaxation); the registry itself (target or a confirmed ancestor)
+    remains the persistent authorization record and exempts re-asks.
+    Without qualifying evidence the call is refused with
+    blocked_by_policy and a logged miss row."""
+    from .state import confirm_root, _gate10
     root = args.get("root", "")
     path = args.get("path", "")
     # Legacy single-arg call shape: root_path= full target, no
@@ -824,7 +851,60 @@ def code_map_confirm_root(args: Dict[str, Any]) -> str:
     # legacy callers must migrate to the (root, path) pair.
     if not root and args.get("root_path"):
         root = args["root_path"]
+    gate = _gate10(root, path)
+    if gate is not None:
+        return json.dumps(gate, ensure_ascii=False)
+    target = rootreg._join_target(root, path)
+    if target is None:  # unreachable past a passing gate; keep the type honest
+        return json.dumps({
+            "status": "invalid", "root": root or None, "path": path or None,
+            "reason": "gate: could not derive the joined target",
+        }, ensure_ascii=False)
+
+    # ── transcript-evidence gate (mirror of check_root's fail-closed) ──
+    _confirmed = rootreg.confirmed_targets()
+    _registry_hit = target in _confirmed
+    _registry_descendant = (not _registry_hit) and any(
+        target.startswith(ct + os.sep) for ct in _confirmed)
+    evidence = None
+    if not (_registry_hit or _registry_descendant):
+        evidence = _clarify_evidence(target, root, path)
+        if evidence is None:
+            _append_confirm_audit_line({
+                "action": "confirm_root",
+                "result": "blocked_evidence_miss",
+                "root": target, "boundary": root, "rel_path": path,
+                "note": ("no qualifying affirmative clarify evidence for "
+                         "this exact target in this session"),
+            })
+            return json.dumps({
+                "status": "blocked_by_policy",
+                "root": target,
+                "note": ("a NEW target requires a prior user confirmation "
+                         "for this exact target, in this session — same "
+                         "fail-closed policy as code_map_check_root(yes=true). "
+                         "Call code_map_check_root (dry-run) and ask the user "
+                         "via the host `clarify` tool first; the user's "
+                         "affirmative reply is the transcript evidence this "
+                         "gate accepts. Already-confirmed targets (and their "
+                         "sub-paths) are exempt."),
+                "next": "code_map_check_root(root, path) + clarify, then retry",
+            }, ensure_ascii=False)
+
     result = confirm_root(root, path)
+    if result.get("status") != "build_started":
+        return json.dumps(result, ensure_ascii=False)
+
+    _append_confirm_audit_line({
+        "action": "confirm_root",
+        "result": "confirmed",
+        "root": target, "boundary": root, "rel_path": path,
+        "transcript_evidence": evidence,
+        "exemption": (None if evidence is not None
+                      else ("registry_hit" if _registry_hit
+                            else "registry_descendant")),
+    })
+    result["audit"] = str(data_dir() / "confirm_root_log.jsonl")
     return json.dumps(result, ensure_ascii=False)
 
 
