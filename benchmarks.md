@@ -35,7 +35,26 @@ Owner-gated performance gates + campaign data. Gate numbers are hard:
 - T-C 修改影响面「min_score 0.3→0.5 波及哪些入口级函数/类」——TC-INDEX（parameter→kwarg_usage 翻页→depth=2 hop-2 def 侧）vs TC-GREP（词面+精读）；GT b 段 = 84 行/19 文件（逐文件分布已算，__init__.py 6 行 + 18 测试文件）；c 段 = 各臂「入口候选」对 hop-2 def 侧锚集报召回率。
 **口径**：源树在动，GT 以起跑时刻为准、漂移如实标注；宿主钩子全局 attach 使 grep 臂背着 3.5KB policy + 符号 attach 块（历史口径不变）；n=1/臂、单目标（128 文件/35k 行）；grep 臂禁 code_map 工具（transcript 记录违规，计口径备注）。
 **判分**：准确性（逐行对 GT；索引行⊄正则行的差集 = 注释/docstring/位置传参，逐条归因，方向与 L2.2 一致：索引比词面精确）+ 效率（有效调用/总调用，误调用单列）+ T-B 首报命中率 + T-C c 段召回率。
-（臂结果回报后追加：结果表 + 结论）
+**臂结果（deleg_8ae4c877，2026-11-17 01:11 起跑，filemem 35000 行库，宿主侧 db 核验过）**
+
+| 臂 | 有效/总调用 | 墙钟 | 准确性（vs 库/正则核验） |
+|---|---|---|---|
+| TA-INDEX | 24/27（2 次误调 + 3 次边界踩坑） | 309 s | 4/4 行全对（含嵌套类 BoundStore，我的 `^class` 正则 GT 漏的那行它没漏） |
+| TA-GREP | 4（8 子步） | 105 s | 4/4 行全对 + 3 个 .bak 噪声行被正确标出 |
+| TB-BRIDGE | 5 主查 + 2 补查 + 2 核验读 | 117 s | 1/5 干净命中（stale→is_stale）；min score 臂自判 `score` 命中（宽松），严格 GT 计 0；dirty/supersede/bringback 三族 GT 漂移（源码当日重构，库内 0 行） |
+| TC-INDEX | 26/28（2 次 root 写错被拒） | 281 s | a 段 4 个活声明点与 grep 臂逐行一致；b 段 total=84 = 正则 GT 84 ✓（文件分布 ±源动） |
+| TC-GREP | 7 api（~30 子步） | 353 s | b 段 101 行/24 文件（= 84 语法节点 + 17 文本提及：.bak×15/文档×2）；c 段语义最富（host hook/doc-sync/.bak 审计） |
+
+**三项新发现的缺口（按性价比）**
+1. **L2.4b 候选层三缺陷**（TB 3/5 miss 的根因，全部 db 核验）：
+   - 候选列表按**行**不按**名**——`score` 6 行（多为 call_site）挤占 limit=3，`min_score`（含 min+score 双词根）被挤出：应按名去重（一行一名 + total 计数 + 多词根 boost）；
+   - 前缀 tier 不剥前导下划线——`_bringback_*`/`_supersede_*` 实现符号系统性掉出 tier-2，测试 kwarg/函数名顶上来；
+   - 概念词做后缀时（confirm_**supersede**）掉 tier-3，输给短 kwarg 前缀名。
+2. **L2.3b 根级 kind 聚合缺失**（TA 索引臂输掉效率的直接原因）：`kind=extends` 目录级/根级调用返回 0 或被拒 → 臂被迫 128 文件逐个拉（128 页）才拿 4 行；一次根级聚合调用即可。
+3. **L2.5b 种子文件自身公共面缺席**（TC c 段）：depth=N 只在消费文件面浮 def，种子文件（`__init__.py`）里的模块级 host hook（filemem_auto_retrieve/register L18208+/L18423）永远不出现在 hop-2——grep 臂靠精读抓到了。
+
+**T-C 精确性主结论成立（源动下仍复现）**：索引 kwarg 84 行 = 正则 84 行逐字节一致；grep 101 行 = 84 语法 + 17 文本提及（.bak/文档/注释），方向与 L2.2 一致。
+**口径备注**：源树在动（llm_caller.py 当日删、dirty_injection_sweep/sweep_dirty_injections/filemem_supersede 已被重构出 35000 行库——T-B 三族 miss 是 GT 漂移非桥 bug，重测需先锁源快照）；grep 臂背宿主钩子 attach（不变）；n=1/臂。
 
 ## L2.5 gate + live probe
 
