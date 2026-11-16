@@ -958,14 +958,27 @@ def code_map_query(args: Dict[str, Any]) -> str:
         result = _serialize(page, staleness, root, limit,
                             str(offset + limit), total)
 
-        # Single-page byte budget: truncate if over PAGE_BUDGET_BYTES
+        # Single-page byte budget: over PAGE_BUDGET_BYTES, find the largest
+        # fitting prefix in O(log n) serializations (bisect; the L2.4b
+        # rep-trim precedent — a linear per-row loop was O(n²) dumps of the
+        # whole page). Cursor semantics are UNCHANGED: emitted k rows ->
+        # str(offset + k); when even 1 row exceeds the budget, 1 row is
+        # kept and the breach is visible via the cursor.
         if len(result.encode("utf-8")) > PAGE_BUDGET_BYTES:
-            while len(page) > 1:
-                page = page[:-1]
-                result = _serialize(page, staleness, root, limit,
-                                    str(offset + len(page)), total)
-                if len(result.encode("utf-8")) <= PAGE_BUDGET_BYTES:
-                    break
+            lo, hi = 1, len(page) - 1
+            best = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = _serialize(page[:mid], staleness, root, limit,
+                                  str(offset + mid), total)
+                if len(cand.encode("utf-8")) <= PAGE_BUDGET_BYTES:
+                    best = cand
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            result = best if best is not None else \
+                _serialize(page[:1], staleness, root, limit,
+                           str(offset + 1), total)
 
         payload = json.loads(result)
         payload["query_ms"] = elapsed_ms

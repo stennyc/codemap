@@ -104,3 +104,86 @@ def test_total_on_unbuilt_index_is_zero(tmp_path, monkeypatch):
     p = _page(root, "z_does_not_exist", 5, "0")
     assert p["count"] == 0, p
     assert p["total"] == 0, p
+
+
+SRC200 = ("def f(x=1):\n    pass\n\n"
+          + "\n".join(f"r{i} = f(x={i})" for i in range(200)))
+
+
+def test_exact_branch_byte_cap_trim_is_log_not_linear(tmp_path, monkeypatch):
+    """The exact (no-fuzzy, no-depth) branch's byte-cap trim was the last
+    O(n²) dump loop left in the query path (found 2026-11-17): it
+    re-serialized the whole shrinking page once per row. Find the largest
+    fitting prefix in O(log n) serializations instead. Cursor semantics are
+    UNCHANGED: emitted k rows -> cursor str(offset+k); when even 1 row
+    exceeds the budget, 1 row is kept and the breach is visible via the
+    cursor.
+
+    Expected k is computed with the ORIGINAL serializer (independent of the
+    implementation under test); the call count is asserted against the log
+    bound (RED against the linear loop, which did ~n-1 serializations).
+    """
+    if not available_for("python"):
+        import pytest
+        pytest.skip("python grammar not installed")
+    import math
+    import code_map.query as qm
+    from code_map.db import init_db, query_symbols
+    root = _seed(tmp_path, SRC200, monkeypatch)
+
+    conn = init_db(root)
+    page = query_symbols(conn, root, "x", kind="kwarg_usage", limit=200, offset=0)
+    total_rows = len(page)
+    conn.close()
+    assert total_rows == 200, total_rows
+
+    orig = qm._serialize
+
+    # 1) no trim (explicitly huge budget): exactly ONE serialization,
+    #    cursor = offset+limit semantics; capture the staleness/root/limit
+    #    args the implementation passes so the expected-k computation
+    #    below uses identical inputs (signature: rows, staleness, root,
+    #    limit, cursor, total). The DEFAULT budget is smaller than a
+    #    full 200-row page here (long absolute paths), so it must be
+    #    raised explicitly.
+    monkeypatch.setattr(qm, "PAGE_BUDGET_BYTES", 1_000_000)
+    calls = []
+    def counting(*args, **kw):
+        calls.append(args)
+        return orig(*args, **kw)
+    monkeypatch.setattr(qm, "_serialize", counting)
+    p_full = json.loads(qm.code_map_query({
+        "root": root, "name": "x", "kind": "kwarg_usage",
+        "limit": 200, "cursor": "0"}))
+    assert p_full["count"] == total_rows, p_full
+    assert p_full["cursor"] == str(total_rows), p_full
+    assert len(calls) == 1, calls
+    _, staleness, root_arg, limit_arg = calls[0][:4]
+    full = orig(calls[0][0], staleness, root_arg, limit_arg,
+                calls[0][4], total_rows)
+    full_bytes = len(full.encode("utf-8"))
+
+    # 2) tight budget: expected k = largest prefix that fits (original
+    #    serializer, same staleness/root/limit), with the implementation's
+    #    1-row floor (`while len(page) > 1`)
+    budget = full_bytes // 4
+    expected = 0
+    for k in range(1, total_rows + 1):
+        if len(orig(page[:k], staleness, root_arg, limit_arg,
+                    str(k), total_rows).encode("utf-8")) <= budget:
+            expected = k
+    expected = max(expected, 1)
+    assert expected < total_rows, "budget must force a trim"
+
+    monkeypatch.setattr(qm, "PAGE_BUDGET_BYTES", budget)
+    calls.clear()
+    p = json.loads(qm.code_map_query({
+        "root": root, "name": "x", "kind": "kwarg_usage",
+        "limit": 200, "cursor": "0"}))
+    # semantics unchanged (cursor = offset + emitted)
+    assert p["count"] == expected, (p["count"], expected)
+    assert p["total"] == total_rows, p
+    assert p["cursor"] == str(expected), (p["cursor"], expected)
+    # performance: log bound, not the linear ~total_rows-1
+    assert len(calls) <= 2 + math.ceil(math.log2(total_rows)), \
+        f"{len(calls)} serializations for {total_rows} rows"
