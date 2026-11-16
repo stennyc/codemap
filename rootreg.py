@@ -48,7 +48,7 @@ def _read_heal_attempts() -> Dict[str, int]:
         return {}
     out: Dict[str, int] = {}
     try:
-        for line in f.read_text().splitlines():
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split("\t")
             if len(parts) == 2:
                 out[os.path.abspath(parts[0].strip())] = int(parts[1])
@@ -96,7 +96,7 @@ def mark_dirty(target: str) -> None:
     current: List[str] = []
     if f.exists():
         try:
-            current = [l for l in f.read_text().splitlines() if l.strip()]
+            current = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
         except OSError:
             current = []
     if target not in current:
@@ -114,7 +114,7 @@ def clear_dirty(target: str) -> None:
     if not f.exists():
         return
     try:
-        remaining = [l for l in f.read_text().splitlines()
+        remaining = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines()
                      if l.strip() and os.path.abspath(l.strip()) != target]
         f.write_text("\n".join(remaining) + ("\n" if remaining else ""),
                      encoding="utf-8")
@@ -129,7 +129,7 @@ def is_dirty(target: str) -> bool:
     if not f.exists():
         return False
     try:
-        lines = [l for l in f.read_text().splitlines() if l.strip()]
+        lines = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
     except OSError:
         return False
     return any(os.path.abspath(l.strip()) == target for l in lines)
@@ -172,7 +172,7 @@ def confirmed_targets() -> List[str]:
     if not reg.exists():
         return []
     try:
-        lines = [l.strip() for l in reg.read_text().splitlines() if l.strip()]
+        lines = [l.strip() for l in reg.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
     except OSError:
         return []
     out: List[str] = []
@@ -227,10 +227,10 @@ def write_confirmed_root(target: str) -> None:
         if reg.exists():
             try:
                 existing = {os.path.abspath(l.strip())
-                            for l in reg.read_text().splitlines() if l.strip()}
+                            for l in reg.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()}
             except OSError:
                 existing = set()
         if abspath in existing:
             return
-        with open(reg, "a") as f:
+        with open(reg, "a", encoding="utf-8") as f:
             f.write(abspath + "\n")

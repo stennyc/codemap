@@ -177,7 +177,7 @@ def _check_data_dir_sanity() -> None:
         ref = (st.st_dev, st.st_ino)
         if ref_path.exists():
             try:
-                old_dev, old_ino = map(int, ref_path.read_text().split())
+                old_dev, old_ino = map(int, ref_path.read_text(encoding="utf-8", errors="replace").split())
                 if (old_dev, old_ino) != ref:
                     logging.getLogger("code_map").warning(
                         "code_map: data dir physical identity changed since "

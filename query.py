@@ -390,7 +390,7 @@ def _clarify_evidence(target: str, root: str, path: str,
         return None
     try:
         rows = []
-        for line in log.read_text().splitlines():
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -770,7 +770,7 @@ def code_map_check_root(args: Dict[str, Any]) -> str:
     # confirmation chain from data/confirm_root_log.jsonl alone.
     digest = hashlib.sha1(target.encode("utf-8")).hexdigest()[:16]
     log_path = data_dir() / "confirm_root_log.jsonl"
-    with open(log_path, "a") as f:
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps({
             "ts": datetime.datetime.now().isoformat(),
             "action": "confirm_root",
