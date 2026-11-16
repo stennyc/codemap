@@ -24,8 +24,16 @@ from code_map.query import code_map_query  # noqa: E402
 import json  # noqa: E402
 
 
-def _seed(tmp_path, source_text: str) -> str:
-    """One-file index with confirmed root; returns the root string."""
+def _seed(tmp_path, source_text: str, monkeypatch) -> str:
+    """One-file index with confirmed root; returns the root string.
+
+    HERMES_HOME isolation (owner 2026-11-16, _registry leak fix): without
+    this, write_confirmed_root appended pytest tmp dirs to the PRODUCTION
+    _registry (the L9-L11 leak: pytest-of-user\\pytest-2\\test_* rows in
+    both host-level and profile-level data dirs). Redirect data_dir into
+    the per-test tmp before anything touches the registry.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     root = str(tmp_path)
     fpath = os.path.join(root, "a.py")
     with open(fpath, "w") as f:
@@ -49,11 +57,11 @@ SRC5 = ("def f(x=1):\n    pass\n\n"
         + "\n".join(f"r{i} = f(x={i})" for i in range(5)))
 
 
-def test_total_present_and_constant_across_pages(tmp_path):
+def test_total_present_and_constant_across_pages(tmp_path, monkeypatch):
     if not available_for("python"):
         import pytest
         pytest.skip("python grammar not installed")
-    root = _seed(tmp_path, SRC5)
+    root = _seed(tmp_path, SRC5, monkeypatch)
     p1 = _page(root, "x", 2, "0")
     assert p1["count"] == 2, p1
     assert p1["total"] == 5, p1
@@ -72,11 +80,11 @@ def test_total_present_and_constant_across_pages(tmp_path):
     assert p4["total"] == 5, p4
 
 
-def test_total_is_filter_aware(tmp_path):
+def test_total_is_filter_aware(tmp_path, monkeypatch):
     if not available_for("python"):
         import pytest
         pytest.skip("python grammar not installed")
-    root = _seed(tmp_path, "def g(p=1, q=2):\n    pass\n\ng(q=9)\ng(p=3)\n")
+    root = _seed(tmp_path, "def g(p=1, q=2):\n    pass\n\ng(q=9)\ng(p=3)\n", monkeypatch)
     # kwarg_usage rows only: p -> 1 (g(p=3)), q -> 1 (g(q=9))
     rp = _page(root, "p", 20, "0")
     rq = _page(root, "q", 20, "0")
@@ -88,11 +96,11 @@ def test_total_is_filter_aware(tmp_path):
     assert rp_all["total"] == 2, rp_all
 
 
-def test_total_on_unbuilt_index_is_zero(tmp_path):
+def test_total_on_unbuilt_index_is_zero(tmp_path, monkeypatch):
     if not available_for("python"):
         import pytest
         pytest.skip("python grammar not installed")
-    root = _seed(tmp_path, "def h(a=1):\n    pass\n")
+    root = _seed(tmp_path, "def h(a=1):\n    pass\n", monkeypatch)
     p = _page(root, "z_does_not_exist", 5, "0")
     assert p["count"] == 0, p
     assert p["total"] == 0, p

@@ -79,14 +79,20 @@ def test_gate2_receiver_qualified_call_not_bare_identifier():
 
 
 # ---- gate ④: query_ms timing window includes call_site SQL -------------------
-def test_gate4_query_ms_includes_call_site_path():
+def test_gate4_query_ms_includes_call_site_path(tmp_path, monkeypatch):
     """kind='call_site' must be a first-class, timed query path."""
     from code_map.config import QUERY_GATE_MS, root_db_path
     from code_map.db import init_db, insert_symbols, upsert_file
     from code_map.query import code_map_query
 
     import shutil
-    root = "/tmp/cm_gate4_query_ms"
+    # HERMES_HOME isolation (owner 2026-11-16): the legacy hardcoded
+    # "/tmp/cm_gate4_query_ms" leaked a row into the PRODUCTION _registry on
+    # Windows (abspath re-roots "/tmp/..." onto C:\tmp\..., and the
+    # self-cleanup removal matched the raw literal, not the normalized row —
+    # the L2 leak in both data dirs). Redirect the data dir into tmp_path.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    root = str(tmp_path / "cm_gate4_query_ms")
     shutil.rmtree(root, ignore_errors=True)
     _confirmed_root_written = False
     try:
@@ -103,9 +109,9 @@ def test_gate4_query_ms_includes_call_site_path():
         insert_symbols(conn, root, fpath, parse_file(fpath), commit=True)
         conn.close()
         # 2026-10-11 root gate: the query surface only accepts CONFIRMED roots,
-        # so register this /tmp root (pytest's own tmp dirs land under
-        # /root/.hermes/... which is a gate-10 blocked prefix — same
-        # known-pitfall as test_root_legality.py / test_check_root.py).
+        # so register this root. It lives under tmp_path and the registry is
+        # the ISOLATED one (HERMES_HOME above) — no production pollution
+        # (owner 2026-11-16 leak fix).
         from code_map import rootreg
         rootreg.write_confirmed_root(root)
         _confirmed_root_written = True

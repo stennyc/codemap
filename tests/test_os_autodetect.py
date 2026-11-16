@@ -21,6 +21,7 @@ Windows twin keeps C:\\Users unguarded for the same reason.
 """
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -138,6 +139,21 @@ def test_data_dir_fallback_windows_uses_localappdata(monkeypatch, tmp_path):
     local = str(tmp_path / "local").lower()
     assert str(d).lower().startswith(local), f"{d} not under LOCALAPPDATA"
     assert ".hermes" not in d.parts, "Windows must never fall back to a POSIX ~/.hermes tree"
+
+
+# ── 6. static guard: no test module may register confirmed roots without
+#    HERMES_HOME isolation (the 2026-11-16 _registry leak, L9-L11/L2) ───────
+def test_seed_helpers_isolate_hermes_home():
+    import re
+    tests_dir = Path(__file__).parent
+    offenders = []
+    for p in sorted(tests_dir.glob("*.py")):
+        src = p.read_text(encoding="utf-8")
+        if re.search(r"write_confirmed_root\s*\(", src) and "HERMES_HOME" not in src:
+            offenders.append(p.name)
+    assert not offenders, (
+        f"test modules that register confirmed roots without HERMES_HOME "
+        f"isolation (production _registry leak): {offenders}")
 
 
 def test_data_dir_env_wins(monkeypatch, tmp_path):
