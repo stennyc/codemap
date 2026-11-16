@@ -299,42 +299,47 @@ def _is_affirmative(text: str) -> bool:
 
 
 _ABS_PATH_RE = None
+_WIN_ABS_PATH_RE = None
+
 
 def _extract_path_mentions(question: str) -> List[str]:
-    """Every ABSOLUTE-path mention (starts with '/' in the question text,
-    >= 2 '/'-separated segments) found in a free-form question string,
-    longest-first. Absolute mentions are explicit, deliberate path
-    references — the realistic case for the hook's new-path evidence
-    fallback. A relative fragment ('x/y') is deliberately NOT returned:
-    a bare fragment of a never-seen target must not mint evidence (the
-    collision risk that made the first, too-loose fix wrong). Pure text,
-    no filesystem access, no side effects.
+    """Every ABSOLUTE-path mention found in a free-form question string,
+    longest-first. Handles both POSIX ('/a/b') and Windows ('C:\\a\\b' or
+    'C:/a/b') absolute paths. Pure text, no filesystem access, no side
+    effects.
 
-    Cross-platform note (reviewer RISK #4, 2026-10-12): this extractor
-    is POSIX-path-shaped and returns whatever raw text is in the
-    question, UNNORMALIZED — callers that compare these mentions
-    against each other (or against a stored target) must do so on the
-    os.path.abspath() form, not the raw string, or distinct raw
-    spellings of the same target (../ folds, double slashes, trailing
-    spaces) will not dedupe. On Windows an 'absolute' path would start
-    with a drive letter, not '/', so this extractor would simply find
-    no mentions there — a real Windows deployment would need a
-    drive-letter-aware variant; not a concern for this host (Linux)
-    today, documented so nobody silently 'fixes' it by swapping in a
-    regex that also matches relative fragments."""
-    global _ABS_PATH_RE
+    A relative fragment ('x/y' or 'x\\y') is deliberately NOT returned:
+    a bare fragment of a never-seen target must not mint evidence (the
+    collision risk that made the first, too-loose fix wrong).
+
+    Cross-platform (2026-11-16 fix): the original POSIX-only extractor
+    (RISK #4, 2026-10-12) silently found no mentions on Windows hosts,
+    where absolute paths start with a drive letter. Now both spellings
+    are recognized; callers still compare on os.path.abspath()."""
+    global _ABS_PATH_RE, _WIN_ABS_PATH_RE
     if _ABS_PATH_RE is None:
         import re as _re
         # NOTE: the character class deliberately EXCLUDES whitespace —
         # that's what makes the "trailing-space variant" dedup case
-        # (reviewer RISK #2, 2026-10-12) work: a reply that types
-        # "/a/b/c " (trailing space) extracts as "/a/b/c", whose
-        # os.path.abspath() matches the question's clean "/a/b/c".
-        # If anyone ever adds \s to this class, that dedup silently
-        # breaks (raw-text comparison would see two distinct strings).
+        # (reviewer RISK #2, 2026-10-12) work. If anyone ever adds \s
+        # to this class, that dedup silently breaks.
         _ABS_PATH_RE = _re.compile(
             r"/(?:[A-Za-z0-9._-]+/){1,}[A-Za-z0-9._-]+")
-    found = set(_ABS_PATH_RE.findall(question or ""))
+        # Windows: drive-letter absolute path with 1+ separator-delimited
+        # segments. Matches both backslash (C:\a\b) and forward-slash
+        # (C:/a/b) spellings. Capture group 1 = the part AFTER the drive
+        # colon+separator; we re-prepend the drive letter so the mention
+        # normalizes correctly under os.path.abspath().
+        _WIN_ABS_PATH_RE = _re.compile(
+            r"([A-Za-z]):[\\/]((?:[A-Za-z0-9._-]+[\\/]){1,}[A-Za-z0-9._-]+)")
+    found = set()
+    found.update(_ABS_PATH_RE.findall(question or ""))
+    # Windows: add drive-letter absolute paths. Normalize backslashes to
+    # forward slashes so os.path.abspath() dedups against POSIX-form
+    # registry entries.
+    if _WIN_ABS_PATH_RE is not None:
+        for drive, rest in _WIN_ABS_PATH_RE.findall(question or ""):
+            found.add(f"{drive}/{rest.replace(chr(92), '/')}")
     return sorted(found, key=len, reverse=True)
 
 
