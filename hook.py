@@ -43,7 +43,8 @@ from typing import Any, Dict, Optional
 from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
-                    READ_SYMBOL_MAX_BYTES, data_dir)
+                    READ_SYMBOL_MAX_BYTES, data_dir, is_system_tree,
+                    IS_WINDOWS)
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
@@ -461,11 +462,15 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
       - the read must NOT already land under a confirmed target (the attach
         path, not the pending path);
       - the project boundary must NOT itself be a real system tree — the
-        hardcoded ("/usr", "/etc", "/opt") guard (plus bare "/") is the
-        gate-⑩ incident shape; those trees are never offered for indexing.
-        /root and /home are deliberately NOT guarded: owner's projects live
-        under /root and ARE the indexable case, and a real project under
-        them resolves to its own marker dir via detect_root, not to /root.
+        per-OS system-tree guard (config.is_system_tree, OS auto-detect,
+        owner 2026-11-16) is the gate-⑩ incident shape: /usr, /etc, /opt
+        + bare "/" on POSIX; C:/Windows, C:/Program Files,
+        C:/Program Files (x86), C:/ProgramData + bare drive roots on
+        Windows. Those trees are never offered for indexing. /root and
+        /home (POSIX) and C:/Users (Windows) are deliberately NOT guarded:
+        owner's projects live under them and ARE the indexable case, and a
+        real project under them resolves to its own marker dir via
+        detect_root, not to the home root.
     Fail-soft: any hiccup -> no ledger line, never breaks the read.
     """
     try:
@@ -502,11 +507,13 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         # real project under them resolves to ITS OWN marker dir via
         # detect_root, not to /root itself.
         proj_abs = os.path.abspath(proj)
-        for prefix in ("/usr", "/etc", "/opt"):
-            p = os.path.abspath(prefix)
-            if proj_abs == p or proj_abs.startswith(p + os.sep):
-                return
-        if proj_abs == os.sep:
+        # Per-OS system-tree guard (OS auto-detect, owner 2026-11-16). The
+        # legacy guard was a hardcoded ("/usr", "/etc", "/opt") loop — dead
+        # on Windows (abspath("/usr") re-roots onto the CWD drive). The live
+        # semantics live in config.is_system_tree: POSIX triple + bare "/";
+        # Windows system dirs + bare drive roots; C:/Users deliberately
+        # unguarded (owner workspace, the POSIX /root//home twin).
+        if is_system_tree(proj_abs, IS_WINDOWS):
             return
         if rootreg.is_confirmed_root(proj):
             return

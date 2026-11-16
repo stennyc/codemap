@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 # ---- limits (all from the sealed contract, not re-derived) -----------------
@@ -73,6 +74,65 @@ ROOT_MARKERS = (
 # `/root` mis-confirm (382k files, 4.2GB db) is the recorded incident that
 # motivated this constant.
 BLOCKED_ROOT_PREFIXES = ("/", "/root", "/home", "/usr", "/etc", "/opt")
+
+# OS auto-detection (owner 2026-11-16): the POSIX-only tuple above is dead on
+# Windows — it never matches a Windows path, so the gate-⑩ shape had no
+# Windows twin. The Windows system-tree list mirrors the POSIX semantics:
+# system dirs + the bare filesystem root. C:\Users is deliberately NOT
+# guarded (the owner workspace — the exact twin of POSIX /root//home,
+# which the hook docstring keeps unguarded so real owner projects stay
+# indexable).
+BLOCKED_ROOT_PREFIXES_WIN = (
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
+)
+IS_WINDOWS = sys.platform == "win32"
+_BARE_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]?$")
+
+
+def is_bare_fs_root(root: str, is_windows: bool) -> bool:
+    """True when `root` names the whole filesystem level.
+
+    POSIX: "" or "/". Windows: a bare drive root — "C:\\", "C:/" or the
+    drive-relative marker "C:" (all normalize to 'index everything on that
+    drive'). Pure string check (no os.path) so it stays testable on any
+    host regardless of the host OS.
+    """
+    r = (root or "").strip()
+    if is_windows:
+        return _BARE_DRIVE_RE.match(r) is not None
+    return r in ("", "/")
+
+
+def is_system_tree(root: str, is_windows: bool) -> bool:
+    """True when `root` is a bare fs root or sits under a per-OS system tree
+    (the gate-⑩ incident shape — never indexable, never offered).
+
+    Semantics are the LIVE guard (single source of truth for rootreg's
+    join gate and the hook ledger's skip guard). POSIX keeps the legacy
+    triple ("/usr", "/etc", "/opt" — /root//home deliberately unguarded:
+    owner projects live there, owner 2026-10-18) plus the bare "/";
+    Windows adds its system dirs + bare drive roots. Case- and
+    separator-insensitive on Windows (mixed / and \\ accepted).
+    """
+    r = (root or "").strip()
+    if is_windows:
+        if _BARE_DRIVE_RE.match(r):
+            return True
+        lr = r.lower().replace("/", "\\")
+        for p in BLOCKED_ROOT_PREFIXES_WIN:
+            pl = p.lower()
+            if lr == pl or lr.startswith(pl + "\\"):
+                return True
+        return False
+    if r in ("", "/"):
+        return True
+    for p in ("/usr", "/etc", "/opt"):
+        if r == p or r.startswith(p + "/"):
+            return True
+    return False
 
 # SQLite tuning (contract ⑦): WAL + busy_timeout + per-file single-writer lock.
 WAL_BUSY_TIMEOUT_MS = 5000
@@ -172,11 +232,23 @@ def data_dir() -> Path:
         base = Path(home)
     else:
         try:
-            # Hermes resolves its own home (per-profile). Fall back to ~/.hermes.
+            # Hermes resolves its own home (per-profile). Fall back to the
+            # per-OS canonical data dir.
             from hermes_constants import get_hermes_home  # type: ignore
             base = Path(get_hermes_home())
         except Exception:
-            base = Path.home() / ".hermes"
+            if IS_WINDOWS:
+                # OS auto-detect (owner 2026-11-16): the canonical Windows
+                # data dir is %LOCALAPPDATA%\hermes. The old POSIX
+                # ~/.hermes fallback created a phantom second tree on this
+                # host (C:\Users\user\.hermes forensics, 2026-11-16) —
+                # Windows must NEVER fall back to a home-dir .hermes.
+                local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
+                    os.path.expanduser("~"), "AppData", "Local"
+                )
+                base = Path(local_appdata) / "hermes"
+            else:
+                base = Path.home() / ".hermes"
     d = base / "plugins" / "code_map" / "data"
     d.mkdir(parents=True, exist_ok=True)
     return d

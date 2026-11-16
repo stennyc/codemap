@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 
-from .config import data_dir
+from .config import IS_WINDOWS, data_dir, is_bare_fs_root, is_system_tree
 
 
 def _registry_file():
@@ -140,22 +140,30 @@ def _join_target(root: str, path: str) -> Optional[str]:
 
     Returns None when the pair fails gate 10:
       - root empty, or path empty          (both fields mandatory)
-      - root normalizes to "/"             (bare filesystem root)
+      - root is a bare filesystem root     ("/" on POSIX, "C:\\" / "C:" on
+        Windows — OS auto-detect, owner 2026-11-16)
+      - root is a per-OS system tree       (gate ⑩ incident shape: /usr/
+        /etc//opt on POSIX; C:/Windows, C:/Program Files, C:/ProgramData,
+        bare drive roots on Windows)
       - path is absolute                   (no boundary semantics)
       - joined target escapes root        (`../` traversal)
-      - joined target is "/" or empty
+      - joined target is bare root or empty
     """
     root = (root or "").strip()
     path = (path or "").strip()
     if not root or not path:
         return None
+    # Bare-drive check on the RAW input: abspath("C:") re-roots onto the CWD
+    # on the C: drive, so the bare marker is only detectable pre-abspath.
+    if is_bare_fs_root(root, IS_WINDOWS):
+        return None
     root_abs = os.path.abspath(root)
-    if root_abs == os.sep:
+    if is_system_tree(root_abs, IS_WINDOWS):
         return None
     if os.path.isabs(path):
         return None
     target = os.path.normpath(os.path.join(root_abs, path))
-    if target in ("", os.sep):
+    if target in ("", os.sep) or is_bare_fs_root(target, IS_WINDOWS):
         return None
     # The target must stay inside the boundary root (no ../ escape).
     if target != root_abs and not target.startswith(root_abs + os.sep):
