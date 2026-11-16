@@ -331,8 +331,10 @@ def _extract_path_mentions(question: str) -> List[str]:
         # Windows: drive-letter absolute path with 1+ separator-delimited
         # segments. Matches both backslash (C:\a\b) and forward-slash
         # (C:/a/b) spellings. Capture group 1 = the part AFTER the drive
-        # colon+separator; we re-prepend the drive letter so the mention
-        # normalizes correctly under os.path.abspath().
+        # colon+separator; the caller re-prepends drive + colon + separator
+        # so the mention stays ABSOLUTE under os.path.abspath() (a
+        # colon-less drive mention is RELATIVE on Windows and re-roots onto
+        # the CWD — the 2026-11-17 gotcha (b)).
         _WIN_ABS_PATH_RE = _re.compile(
             r"([A-Za-z]):[\\/]((?:[A-Za-z0-9._-]+[\\/]){1,}[A-Za-z0-9._-]+)")
     found = set()
@@ -342,7 +344,13 @@ def _extract_path_mentions(question: str) -> List[str]:
     # registry entries.
     if _WIN_ABS_PATH_RE is not None:
         for drive, rest in _WIN_ABS_PATH_RE.findall(question or ""):
-            found.add(f"{drive}/{rest.replace(chr(92), '/')}")
+            # rebuild as drive + ":" + "/" + backslash-normalized rest
+            # (gotcha (b) fix, see the comment above the compile): keep
+            # the drive colon + separator so the mention stays ABSOLUTE
+            # under os.path.abspath (no CWD re-rooting); one canonical
+            # with-colon forward-slash mention per target, so both
+            # spellings dedup.
+            found.add(drive + ":/" + rest.replace(chr(92), '/'))
     return sorted(found, key=len, reverse=True)
 
 
