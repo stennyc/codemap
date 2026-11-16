@@ -17,8 +17,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import PAGE_BUDGET_BYTES, PAGE_MAX_SYMBOLS, data_dir, root_db_path
-from .db import init_db, count_symbols, query_symbols, stale_paths
+from .config import (CONCEPT_RARITY_MAX_CANDIDATES, PAGE_BUDGET_BYTES,
+                    PAGE_MAX_SYMBOLS, data_dir, root_db_path)
+from .db import (init_db, count_symbols, count_concept, query_symbols,
+                query_concept, stale_paths)
 from .fingerprint import diff_indexed, invalidate_cache, on_disk_files
 from . import rootreg
 
@@ -579,6 +581,97 @@ def _serialize(page: list, staleness: str, root: str,
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _serialize_concept(page: list, staleness: str, root: str,
+                       limit: int, cursor: str, total: int,
+                       rarity_on: bool = True) -> str:
+    """L2.4 concept-bridge payload: candidate rows carry tier + occ (name
+    rarity in this root). The disclosure pins the accuracy contract:
+    candidates are word-surface matches, NOT a semantic verdict — verify
+    sig/docstring before use; 0 hits carry a grep-fallback note (word
+    surface miss != concept absent)."""
+    rows = [
+        {"root": r[0], "path": r[1], "name": r[2], "kind": r[3],
+         "line": r[4], "sig": r[5], "tier": r[6], "occ": r[7],
+         "staleness": staleness}
+        for r in page
+    ]
+    payload: Dict[str, Any] = {
+        "symbols": rows,
+        "count": len(rows),
+        "total": total,
+        "limit": limit,
+        "cursor": str(cursor),
+        "staleness": staleness,
+        "match": "fuzzy",
+    }
+    rarity_note = (
+        "ranked by tier then name rarity (rare names first)"
+        if rarity_on else
+        "large candidate set: rarity ranking skipped for the query-time "
+        "budget (occ=0); ranked by tier, name, path, line instead")
+    payload["disclosure"] = (
+        "fuzzy=true: rows are word-surface CANDIDATES, not a verdict — "
+        "tier 1=name-equal, 2=prefix, 3=substring (case-insensitive, "
+        "min tier per row across the concept's tokens); " + rarity_note
+        + ". Verify each candidate's sig/docstring before relying on it. "
+        + _PAGING_DISCLOSURE
+    )
+    if total == 0:
+        payload["note"] = (
+            "0 word-surface candidates: this does NOT mean the concept is "
+            "absent — the target symbol may share no characters with the "
+            "queried words (e.g. 'rebuild' vs 'flush_stale_rows'). Fall "
+            "back to grep (search_files) for concept words the name index "
+            "cannot surface."
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+_PAGING_DISCLOSURE = (
+    "Paging: count = rows on THIS page (byte-capped); total = all "
+    "matching rows; follow 'cursor' until a page returns count=0, "
+    "otherwise you have a partial set.")
+
+
+def _run_fuzzy_branch(conn, root: str, name, path_filter, kind,
+                      limit: int, offset: int, staleness: str) -> str:
+    """L2.4 concept bridge: word-surface candidate rows for a concept word.
+
+    Accuracy contract (owner 2026-11-16 discussion): candidates are
+    tiered (exact/prefix/substring) + rarity-ranked, disclosed as
+    over-approximations, and a 0-hit set carries an explicit
+    grep-fallback note so a word-surface miss never masquerades as
+    'the concept does not exist'.
+    """
+    tokens = re.findall(r"[a-z0-9_]+", str(name).lower())[:5]
+    if not tokens:
+        return _invalid(
+            "fuzzy=true needs at least one alphanumeric token in name",
+            limit)
+    t0 = time.perf_counter()
+    total = count_concept(conn, root, tokens, path=path_filter, kind=kind)
+    # gate ④ budget: rarity JOIN only pays off on small candidate sets;
+    # above the threshold fall back to the no-rarity fast path (occ=0).
+    rarity_on = total <= CONCEPT_RARITY_MAX_CANDIDATES
+    rows = query_concept(conn, root, tokens, path=path_filter, kind=kind,
+                         limit=limit, offset=offset, rarity=rarity_on)
+    page = rows[:PAGE_MAX_SYMBOLS]
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    result = _serialize_concept(page, staleness, root, limit,
+                                str(offset + limit), total, rarity_on)
+    if len(result.encode("utf-8")) > PAGE_BUDGET_BYTES:
+        while len(page) > 1:
+            page = page[:-1]
+            result = _serialize_concept(page, staleness, root, limit,
+                                        str(offset + len(page)), total,
+                                        rarity_on)
+            if len(result.encode("utf-8")) <= PAGE_BUDGET_BYTES:
+                break
+    payload = json.loads(result)
+    payload["query_ms"] = elapsed_ms
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def code_map_query(args: Dict[str, Any]) -> str:
     """code_map_query tool handler. Paged symbol lookup.
 
@@ -594,6 +687,7 @@ def code_map_query(args: Dict[str, Any]) -> str:
     kind = args.get("kind")
     limit = args.get("limit", PAGE_MAX_SYMBOLS)
     cursor = args.get("cursor", "0")
+    fuzzy = bool(args.get("fuzzy"))  # L2.4 concept bridge (owner 2026-11-16)
 
     # --- root gate: required + confirmed (registry is the single source) ---
     root = args.get("root") or ""
@@ -636,6 +730,11 @@ def code_map_query(args: Dict[str, Any]) -> str:
         t0 = time.perf_counter()  # L45
         staleness = _staleness(root, conn)  # L64
         offset = int(cursor) if cursor.isdigit() else 0
+        if fuzzy:
+            # L2.4: word-surface candidates (the exact path below stays
+            # byte-identical when fuzzy is absent/false — regression guard).
+            return _run_fuzzy_branch(conn, root, name, path_filter, kind,
+                                     limit, offset, staleness)
         # 'total' = ALL-page match count (2026-11-16): byte-capped pages
         # carry count=rows-on-this-page only; without total, a consumer
         # reading count<=limit stops early and undercounts (L2.2 bench:

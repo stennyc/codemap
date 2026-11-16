@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
+-- L2.4 concept bridge (owner 2026-11-16): expression index for
+-- prefix/exact candidate legs on large roots (SQLite can drive
+-- lower(name) LIKE 'tok%' off it; leading-wildcard substring legs
+-- remain scan-bound by design).
+CREATE INDEX IF NOT EXISTS idx_symbols_lname ON symbols(lower(name));
 """
 
 
@@ -126,6 +131,104 @@ def count_symbols(conn: sqlite3.Connection, root: str,
         query += " AND kind = ?"
         params.append(kind)
     return conn.execute(query, params).fetchone()[0]
+
+
+def _concept_predicate(root: str, tokens: list,
+                       path: Optional[str], kind: Optional[str]) -> tuple:
+    """(sql_where_fragment, params) for a concept query.
+
+    A row is a candidate when ANY token occurs as a word-surface slice of
+    the symbol name (case-insensitive substring — the widest tier; the
+    per-row tier is computed separately in the SELECT, not the WHERE).
+    """
+    ors: list = []
+    params: list = [root]
+    for t in tokens:
+        ors.append("lower(name) LIKE ?")
+        params.append(f"%{t}%")
+    frag = "root = ? AND (" + " OR ".join(ors) + ")"
+    if path:
+        frag += " AND path = ?"
+        params.append(os.path.abspath(path))
+    if kind:
+        frag += " AND kind = ?"
+        params.append(kind)
+    return frag, params
+
+
+def _tier_exprs(tokens: list) -> tuple:
+    """Per-token tier CASE exprs for a MIN(): 1=name-equal, 2=prefix,
+    3=substring (a row reaches this query only via the substring OR).
+
+    NOTE: the joined exprs must NOT be wrapped in one outer paren pair —
+    MIN((a, b)) is a row-value arg (sqlite 'row value misused');
+    MIN(a, b) is the multi-arg min we want."""
+    exprs = []
+    params: list = []
+    for t in tokens:
+        exprs.append(
+            f"(CASE WHEN lower(name) = ? THEN 1"
+            f" WHEN lower(name) LIKE ? THEN 2 ELSE 3 END)")
+        params.extend([t, t + "%"])
+    return ", ".join(exprs), params
+
+
+def query_concept(conn: sqlite3.Connection, root: str, tokens: list,
+                  path: Optional[str] = None, kind: Optional[str] = None,
+                  limit: int = 200, offset: int = 0,
+                  rarity: bool = True) -> list:
+    """L2.4 concept bridge (owner 2026-11-16): word-surface candidate
+    rows ranked (tier ASC, name-rarity ASC, then stable keys).
+
+    Rarity = how many rows in THIS root share the candidate's exact name
+    (GROUP BY pass): a rare name like `rebuild_dirty` outranks a common
+    one like `build` for the same token — the accuracy guard against
+    top-1 over-trust. When rarity=False (large candidate sets, gate ④
+    budget) the occ column is 0 and ranking falls back to
+    (tier, name, path, line) — the caller picks via candidate total.
+    Rows: (root, path, name, kind, line, sig, tier, occ).
+    """
+    where, wparams = _concept_predicate(root, tokens, path, kind)
+    tier_sql, tparams = _tier_exprs(tokens)
+    if rarity:
+        query = (
+            "SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
+            f" MIN({tier_sql}) AS tier, r.occ AS occ"
+            " FROM symbols s"
+            " JOIN (SELECT lower(name) ln, COUNT(*) occ FROM symbols"
+            "       WHERE root = ? GROUP BY 1) r ON r.ln = lower(s.name)"
+            f" WHERE {where}"
+            " GROUP BY s.root, s.path, s.name, s.kind, s.line, s.sig, r.occ"
+            " ORDER BY tier, occ, s.name, s.path, s.line"
+            " LIMIT ? OFFSET ?"
+        )
+        # SQLite binds placeholders in SQL-TEXT order:
+        #   1. SELECT: tier CASE exprs (tparams: per token -> tok, tok%)
+        #   2. FROM subquery: the join root
+        #   3. WHERE fragment: wparams (leading root + LIKE %tok% + path/kind)
+        #   4. LIMIT / OFFSET
+        params = tparams + [root] + wparams + [limit, offset]
+    else:
+        # No-rarity fast path: plain tier-ordered scan (no GROUP BY JOIN —
+        # the rarity join is O(root size) and would blow the 50ms gate on
+        # 30k-row roots). occ is 0; callers disclose the fallback ranking.
+        query = (
+            "SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
+            f" MIN({tier_sql}) AS tier, 0 AS occ"
+            f" FROM symbols s WHERE {where}"
+            " ORDER BY tier, s.name, s.path, s.line"
+            " LIMIT ? OFFSET ?"
+        )
+        params = tparams + wparams + [limit, offset]
+    return conn.execute(query, params).fetchall()
+
+
+def count_concept(conn: sqlite3.Connection, root: str, tokens: list,
+                  path: Optional[str] = None, kind: Optional[str] = None) -> int:
+    """All-page candidate count for a concept query (feeds 'total')."""
+    where, params = _concept_predicate(root, tokens, path, kind)
+    q = f"SELECT COUNT(*) FROM symbols WHERE {where}"
+    return conn.execute(q, params).fetchone()[0]
 
 
 def stale_paths(conn: sqlite3.Connection, root: str,

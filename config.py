@@ -204,6 +204,17 @@ READ_HEAL_MAX_FILES = 2000
 #   just stop trying.
 READ_HEAL_MAX_ATTEMPTS = 3
 
+# L2.4 concept bridge (owner 2026-11-16): rarity ranking (the GROUP BY JOIN
+# pass) only runs when the candidate set is at or under this size — above
+# it the query takes the no-rarity fast path (occ=0) so the budget holds
+# on 30k-row roots.
+CONCEPT_RARITY_MAX_CANDIDATES = 2000
+# The concept bridge is scan-bound (word-surface LIKE over the root's rows):
+# its own budget, distinct from the sealed QUERY_GATE_MS=50 which covers the
+# EXACT name/path query paths (index-driven, must stay <50ms). Measured
+# 2026-11-16: 20k-row root, substring token ~83ms worst case -> 150ms cap.
+CONCEPT_QUERY_GATE_MS = 150
+
 # Build-path commit batching (gate ① wall-time fix). The build loop upserts
 # files with the NO-COMMIT variant and issues one WAL commit per this many
 # files, turning 500 per-file fsyncs into ~500/N. The hook/refresh path keeps

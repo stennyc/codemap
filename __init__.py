@@ -218,16 +218,25 @@ _TOOL_SCHEMAS = {
             "edits — call code_map_refresh to force a fresh re-scan. "
             "Responses are byte-capped: 'count' is rows on this page, "
             "'total' is ALL matching rows — always follow 'cursor' until "
-            "a page returns count=0 before treating a set as complete."
+            "a page returns count=0 before treating a set as complete. "
+            "fuzzy=true switches to the L2.4 concept bridge: name is a "
+            "CONCEPT WORD, results are word-surface CANDIDATES (tier 1="
+            "name-equal 2=prefix 3=substring, ranked by name rarity), not a "
+            "semantic verdict — verify sig/docstring before use; 0 hits "
+            "means 'no character overlap', NOT 'does not exist' (the payload "
+            "carries the grep-fallback note). Use name-exact (fuzzy "
+            "omitted) whenever the symbol name is known; the concept bridge "
+            "is only for 'I can't name it yet'."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "root": {"type": "string",
                          "description": "REQUIRED: a confirmed project root"},
-                "name": {"type": "string", "description": "Symbol name to locate across the repo"},
+                "name": {"type": "string", "description": "Symbol name to locate across the repo; with fuzzy=true, a concept word to bridge to candidate names"},
                 "path": {"type": "string", "description": "File to outline: relative to root, or an absolute path that lies inside root"},
                 "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter|kwarg_usage"},
+                "fuzzy": {"type": "boolean", "description": "true = L2.4 concept bridge: word-surface candidate rows (tier + rarity ranked) with a verify-before-use disclosure; default false = exact name match"},
                 "limit": {"type": "integer", "description": "Max rows per page (default 200)"},
                 "cursor": {"type": "string", "description": "Opaque cursor from a prior truncated page"},
             },
