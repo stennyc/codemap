@@ -215,6 +215,14 @@ CONCEPT_RARITY_MAX_CANDIDATES = 2000
 # 2026-11-16: 20k-row root, substring token ~83ms worst case -> 150ms cap.
 CONCEPT_QUERY_GATE_MS = 150
 
+# L2.5 multi-hop impact propagation (owner 2026-11-16, roadmap ①):
+# depth=N walks the name<->file bipartite frontier in N stages (odd stages
+# = consumer rows of the frontier names, even stages = def-side symbols in
+# those files). The cap keeps a single call bounded on dense roots; the
+# frontier IN-lists are capped separately (SQLite bind-variable limit).
+HOP_MAX_DEPTH = 3            # max propagation stages per call (cycle-safe)
+HOP_FRONTIER_CAP = 500      # per-stage IN-list cap
+
 # Build-path commit batching (gate ① wall-time fix). The build loop upserts
 # files with the NO-COMMIT variant and issues one WAL commit per this many
 # files, turning 500 per-file fsyncs into ~500/N. The hook/refresh path keeps

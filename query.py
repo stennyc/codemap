@@ -17,7 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import (CONCEPT_RARITY_MAX_CANDIDATES, PAGE_BUDGET_BYTES,
+from .config import (CONCEPT_RARITY_MAX_CANDIDATES, HOP_FRONTIER_CAP,
+                    HOP_MAX_DEPTH, PAGE_BUDGET_BYTES,
                     PAGE_MAX_SYMBOLS, data_dir, root_db_path)
 from .db import (init_db, count_symbols, count_concept, query_symbols,
                 query_concept, stale_paths)
@@ -672,6 +673,140 @@ def _run_fuzzy_branch(conn, root: str, name, path_filter, kind,
     return json.dumps(payload, ensure_ascii=False)
 
 
+# ── L2.5 multi-hop impact propagation (owner 2026-11-16, roadmap ①) ────────
+# The edges already live in the symbols table (call_site / kwarg_usage /
+# import rows = file->name consumer edges; function / method / class rows =
+# def-side). This is the query face over them: alternating frontier stages
+# (odd = consumers of the frontier names, even = defs inside those files).
+# Name-level OVER-approximation (disclosed in every payload): aliases and
+# overloads merge, the seed's own def is never re-emitted, positional-
+# argument consumers are absent (no name to key on — that is grep's lane).
+# Each stage is a plain index-range SELECT (no recursive CTE: SQLite limits
+# the recursive table to one self-reference; Python-side unrolling over the
+# bounded stage count is simpler and equally fast on index-driven stages).
+_HOP_CONSUMER_KINDS = ("call_site", "kwarg_usage", "import")
+_HOP_DEF_KINDS = ("function", "method", "class")
+
+
+def _query_hops(conn, root: str, seed: str, depth: int):
+    """Walk `depth` frontier stages from `seed`. Returns (rows, total,
+    frontier_capped). rows carry a `hop` key; dedup is global over
+    (name, path, line) with the MIN hop winning (stages ascend)."""
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    frontier_names = [seed]
+    frontier_files: List[str] = []
+    frontier_capped = False
+
+    def _stage(consumer: bool, keys: List[str]) -> List[tuple]:
+        ph = ", ".join("?" * len(keys))
+        kinds = _HOP_CONSUMER_KINDS if consumer else _HOP_DEF_KINDS
+        kindph = ", ".join("?" * len(kinds))
+        sql = ("SELECT name, path, line, kind, sig FROM symbols "
+               f"WHERE root = ? AND {('name IN' if consumer else 'path IN')} ({ph}) "
+               f"AND kind IN ({kindph})")
+        params = [root, *keys, *kinds]
+        if not consumer:
+            sql += " AND name != ?"  # the seed's own def is not a frontier
+            params.append(seed)
+        return conn.execute(sql, params).fetchall()
+
+    for hop in range(1, depth + 1):
+        if hop % 2 == 1:
+            keys = frontier_names[:HOP_FRONTIER_CAP]
+            if len(frontier_names) > len(keys):
+                frontier_capped = True
+            stage = _stage(True, keys)
+        else:
+            keys = frontier_files[:HOP_FRONTIER_CAP]
+            if len(frontier_files) > len(keys):
+                frontier_capped = True
+            if not keys:
+                break
+            stage = _stage(False, keys)
+        fresh = []
+        for r in stage:  # (name, path, line, kind, sig)
+            key = (r[0], r[1], r[2])
+            if key in seen:
+                continue
+            seen.add(key)
+            fresh.append({"root": root, "path": r[1], "name": r[0],
+                           "kind": r[3], "line": r[2], "sig": r[4],
+                           "hop": hop})
+        rows.extend(fresh)
+        if hop % 2 == 1:
+            frontier_files = sorted({s["path"] for s in fresh})
+            if not frontier_files:
+                break
+        else:
+            frontier_names = sorted({s["name"] for s in fresh})
+            if not frontier_names:
+                break
+    return rows, len(rows), frontier_capped
+
+
+def _serialize_hops(rows: list, staleness: str, root: str,
+                    depth: int, depth_effective: int, total: int,
+                    frontier_capped: bool) -> str:
+    """Byte-capped hop payload: over budget, the DEEPEST hops are dropped
+    first (least-certain propagation); `total` keeps counting ALL rows."""
+    disclosure = (
+        "L2.5 multi-hop impact propagation from the seed name: odd hops = "
+        "consumer rows (call_site/kwarg_usage/import), even hops = def-side "
+        "symbols (function/method/class) inside those consumer files. "
+        "NAME-LEVEL over-approximation: aliases/overloads merge; the seed's "
+        "own def is not re-emitted; positional-argument consumers are NOT "
+        "covered (grep for those). Deduped by (name,path,line), min hop "
+        "wins. No cursor paging in depth mode: over the byte budget the "
+        "SHALLOWEST hops are dropped first (hop 1 is the exact-name query "
+        "redundant; deep hops carry the NEW propagation); total still "
+        "counts all rows — re-query a frontier name for a layer's detail. "
+        "path/kind/cursor/limit are ignored in depth mode."
+    )
+
+    def _build(out_rows: list, truncated: bool) -> str:
+        payload = {
+            "status": "ok",
+            "symbols": out_rows,
+            "count": len(out_rows),
+            "total": total,
+            "depth": depth,
+            "depth_effective": depth_effective,
+            "hops_returned": max((r["hop"] for r in out_rows), default=0),
+            "truncated": truncated,
+            "frontier_capped": frontier_capped,
+            "staleness": staleness,
+            "cursor": "0",
+            "disclosure": disclosure,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    out_rows = list(rows)
+    result = _build(out_rows, False)
+    if len(result.encode("utf-8")) > PAGE_BUDGET_BYTES:
+        # ① whole-hop drops while >1 hop is present (shallowest first)
+        while out_rows:
+            hops_present = {r["hop"] for r in out_rows}
+            if len(hops_present) < 2:
+                break
+            bottom = min(hops_present)
+            out_rows = [r for r in out_rows if r["hop"] > bottom]
+        # ② single-hop remainder: binary-search the largest PREFIX that
+        # fits the budget (row counts are size-monotonic — O(log n)
+        # serializations instead of O(n²) trim-and-serialize)
+        if out_rows and len(_build(out_rows, True).encode("utf-8")) > PAGE_BUDGET_BYTES:
+            lo, hi, best = 0, len(out_rows), 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if len(_build(out_rows[:mid], True).encode("utf-8")) <= PAGE_BUDGET_BYTES:
+                    best, lo = mid, mid + 1
+                else:
+                    hi = mid - 1
+            out_rows = out_rows[:best]
+        result = _build(out_rows, True)
+    return result
+
+
 def code_map_query(args: Dict[str, Any]) -> str:
     """code_map_query tool handler. Paged symbol lookup.
 
@@ -730,6 +865,34 @@ def code_map_query(args: Dict[str, Any]) -> str:
         t0 = time.perf_counter()  # L45
         staleness = _staleness(root, conn)  # L64
         offset = int(cursor) if cursor.isdigit() else 0
+        # L2.5 multi-hop impact propagation: depth >= 1 takes precedence
+        # over BOTH the exact-name and the fuzzy paths; path/kind/cursor/
+        # limit are intentionally ignored (documented in the payload).
+        depth_arg = args.get("depth")
+        if depth_arg:
+            try:
+                depth_req = int(depth_arg)
+            except (TypeError, ValueError):
+                return _invalid(
+                    f"depth must be an integer 1..{HOP_MAX_DEPTH} "
+                    f"(got {depth_arg!r})", limit)
+            if not name:
+                return _invalid(
+                    "depth mode requires an exact seed name (a concept word "
+                    "needs fuzzy=true, which has no propagation semantics)",
+                    limit)
+            if fuzzy:
+                return _invalid(
+                    "depth mode and fuzzy=true are mutually exclusive: "
+                    "bridge candidates are word-surface, not propagation "
+                    "seeds — resolve the exact name first", limit)
+            depth_eff = min(max(depth_req, 1), HOP_MAX_DEPTH)
+            hrows, htotal, hcap = _query_hops(conn, root, name, depth_eff)
+            result = _serialize_hops(hrows, staleness, root,
+                                     depth_req, depth_eff, htotal, hcap)
+            payload = json.loads(result)
+            payload["query_ms"] = int((time.perf_counter() - t0) * 1000)
+            return json.dumps(payload, ensure_ascii=False)
         if fuzzy:
             # L2.4: word-surface candidates (the exact path below stays
             # byte-identical when fuzzy is absent/false — regression guard).

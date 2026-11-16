@@ -226,7 +226,20 @@ _TOOL_SCHEMAS = {
             "means 'no character overlap', NOT 'does not exist' (the payload "
             "carries the grep-fallback note). Use name-exact (fuzzy "
             "omitted) whenever the symbol name is known; the concept bridge "
-            "is only for 'I can't name it yet'."
+            "is only for 'I can't name it yet'. "
+            "depth=N (1-3) switches to L2.5 multi-hop impact propagation "
+            "from the exact seed name: odd hops = consumer rows "
+            "(call_site/kwarg_usage/import), even hops = def-side symbols "
+            "(function/method/class) inside those consumer files — "
+            "'change X, who is affected'. NAME-LEVEL over-approximation "
+            "(aliases/overloads merge; positional-argument consumers "
+            "absent); deduped by (name,path,line); byte-capped — over "
+            "budget the SHALLOWEST hops are dropped first (hop 1 is the "
+            "exact-name query, redundant; deep hops carry the new "
+            "propagation), truncated=true; total keeps all rows; no "
+            "cursor paging in depth mode). depth and fuzzy are "
+            "mutually exclusive; path/kind/cursor are ignored in depth "
+            "mode."
         ),
         "parameters": {
             "type": "object",
@@ -237,6 +250,7 @@ _TOOL_SCHEMAS = {
                 "path": {"type": "string", "description": "File to outline: relative to root, or an absolute path that lies inside root"},
                 "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter|kwarg_usage"},
                 "fuzzy": {"type": "boolean", "description": "true = L2.4 concept bridge: word-surface candidate rows (tier + rarity ranked) with a verify-before-use disclosure; default false = exact name match"},
+                "depth": {"type": "integer", "description": "L2.5 multi-hop impact propagation from the exact seed name (1-3, clamped; mutually exclusive with fuzzy; path/kind/cursor ignored): odd hops list consumers of the frontier names, even hops list def-side symbols in those files"},
                 "limit": {"type": "integer", "description": "Max rows per page (default 200)"},
                 "cursor": {"type": "string", "description": "Opaque cursor from a prior truncated page"},
             },
