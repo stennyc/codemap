@@ -136,9 +136,15 @@ _ROOT_POLICY_TEXT = (
     "<confirmed target>, name=... or path=...) FIRST — one indexed "
     "round-trip instead of a whole-tree glob/grep. Honor the one-line "
     "[code_map] pointer a directory-anchored search_files (path=<dir> under "
-    "a confirmed target) already carries. Fall back to whole-tree "
-    "search_files/grep ONLY when the target is not confirmed, or the match "
-    "is content/regex (which the index does not rank). Hard default."
+    "a confirmed target) already carries. When you cannot spell the "
+    "symbol name exactly (a CONCEPT WORD: 'the dirty-rebuild function'), "
+    "use the L2.4b concept bridge — code_map_query(root, name=<concept "
+    "word>, fuzzy=true) ranks DISTINCT-NAME word-surface candidates "
+    "(verify the winner's sig/docstring; 0 hits does NOT mean the "
+    "concept is absent) — and fall back to whole-tree search_files/grep "
+    "only after the bridge returns nothing usable, or when the match is "
+    "arbitrary content/regex (the index ranks symbol names, not free "
+    "text). Hard default."
 )
 
 
@@ -219,14 +225,23 @@ _TOOL_SCHEMAS = {
             "Responses are byte-capped: 'count' is rows on this page, "
             "'total' is ALL matching rows — always follow 'cursor' until "
             "a page returns count=0 before treating a set as complete. "
-            "fuzzy=true switches to the L2.4 concept bridge: name is a "
-            "CONCEPT WORD, results are word-surface CANDIDATES (tier 1="
-            "name-equal 2=prefix 3=substring, ranked by name rarity), not a "
-            "semantic verdict — verify sig/docstring before use; 0 hits "
-            "means 'no character overlap', NOT 'does not exist' (the payload "
-            "carries the grep-fallback note). Use name-exact (fuzzy "
-            "omitted) whenever the symbol name is known; the concept bridge "
-            "is only for 'I can't name it yet'. "
+            "fuzzy=true switches to the L2.4b concept bridge: name is a "
+            "CONCEPT WORD, results are DISTINCT-NAME word-surface "
+            "CANDIDATES (one row per name, occ = its row count, total = "
+            "distinct-name count; a multi-row usage family no longer "
+            "drowns the name that carries the concept), tier 1=name-equal "
+            "2=delimited-strong (leading-underscore prefix or "
+            "underscore-delimited suffix) 3=bare substring, ranked hits "
+            "DESC (how many concept words match strongly) then tier then "
+            "declaration-rows-before-usage (defside=true marks a "
+            "declaration row) then name rarity — not a semantic verdict, "
+            "verify sig/docstring before use; 0 hits means 'no character "
+            "overlap', NOT 'does not exist' (the payload carries the "
+            "grep-fallback note). A candidate set over the gate-④ "
+            "threshold degrades ranking to (tier, name) with placeholder "
+            "aggregates — the payload discloses this. Use name-exact "
+            "(fuzzy omitted) whenever the symbol name is known; the "
+            "concept bridge is only for 'I can't name it yet'. "
             "depth=N (1-3) switches to L2.5 multi-hop impact propagation "
             "from the exact seed name: odd hops = consumer rows "
             "(call_site/kwarg_usage/import), even hops = def-side symbols "
@@ -249,7 +264,7 @@ _TOOL_SCHEMAS = {
                 "name": {"type": "string", "description": "Symbol name to locate across the repo; with fuzzy=true, a concept word to bridge to candidate names"},
                 "path": {"type": "string", "description": "File to outline: relative to root, or an absolute path that lies inside root"},
                 "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter|kwarg_usage|extends|decorator"},
-                "fuzzy": {"type": "boolean", "description": "true = L2.4 concept bridge: word-surface candidate rows (tier + rarity ranked) with a verify-before-use disclosure; default false = exact name match"},
+                "fuzzy": {"type": "boolean", "description": "true = L2.4b concept bridge: DISTINCT-NAME word-surface candidates (one row per name; tier 1=equal 2=delimited-strong 3=substring, ranked hits->tier->defside->rarity) with a verify-before-use + grep-fallback disclosure; a candidate set over the gate-④ threshold degrades to (tier,name) ranking (disclosed in payload); default false = exact name match"},
                 "depth": {"type": "integer", "description": "L2.5 multi-hop impact propagation from the exact seed name (1-3, clamped; mutually exclusive with fuzzy; path/kind/cursor ignored): odd hops list consumers of the frontier names, even hops list def-side symbols in those files"},
                 "limit": {"type": "integer", "description": "Max rows per page (default 200)"},
                 "cursor": {"type": "string", "description": "Opaque cursor from a prior truncated page"},

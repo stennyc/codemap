@@ -42,7 +42,7 @@ L2.6 发现 #1（TB 桥 3/5 miss 根因）的修复落盘，全部 TDD + 实测�
 - rep 改写 `lower(name) IN (...)` 走 expression index `idx_symbols_lname`（每名一次索引探测）→ 913ms → ~20ms；
 - 线性 byte-cap trim（200 行页 → 15 行 = 187 次 json.dumps，cProfile 实测 61ms）→ **二分裁行（9 次 dumps）**；
 - gate④ 大候选集降级路径（`CONCEPT_RARITY_MAX_CANDIDATES=2000` 之上）：保留按名去重、丢 per-name 聚合（occ/hits/defmark 置占位 0），排序退化 (tier, name)，payload 披露 degraded；降级路径参数绑定单独核过（strong-flag CASE 缺席时**不得**供 strong params——12vs8 binding shift 回归测试在案）；
-- 终局：warm 稳态 **115ms < 150ms gate**（count 16 + rank 55 + rep IN ~18 + 入口开销 ~30）；20k gate 测试 = 预热 1 次 + min-of-3 稳态计时（批内负载容忍），双批 27/27 绿。
+- 终局：warm 稳态 **115ms < 150ms gate**（count 16 + rank 55 + rep IN ~18 + 入口开销 ~30）；20k gate 测试量的是 **payload `query_ms`（count+rank+rep 的 O(N) 扫描面，~80-115ms 稳态）**而非整调用墙钟——整调用含 O(1) 入口开销（连接/registry/staleness/dispatch），负载下 115↔230ms 抖动，不作门禁对象；测试 = 预热 1 次 + query_ms min-of-3。
 
 **测试面**
 - `tests/test_fuzzy_ranking.py`（owner 2026-11-17）6/6：名去重/occ、limit 按名翻页（cursor walk 记账修正：seen 从 page 0 起、空页不入账）、多词根 boost、前导下划线 tier-2、delimited 后缀 + def-side 优先、精确名回归守卫；
