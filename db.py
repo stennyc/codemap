@@ -137,9 +137,10 @@ def _concept_predicate(root: str, tokens: list,
                        path: Optional[str], kind: Optional[str]) -> tuple:
     """(sql_where_fragment, params) for a concept query.
 
-    A row is a candidate when ANY token occurs as a word-surface slice of
+    A name is a candidate when ANY token occurs as a word-surface slice of
     the symbol name (case-insensitive substring — the widest tier; the
-    per-row tier is computed separately in the SELECT, not the WHERE).
+    per-name tier / strong-hit count are computed separately in the
+    SELECT, not the WHERE).
     """
     ors: list = []
     params: list = [root]
@@ -156,78 +157,177 @@ def _concept_predicate(root: str, tokens: list,
     return frag, params
 
 
-def _tier_exprs(tokens: list) -> tuple:
-    """Per-token tier CASE exprs for a MIN(): 1=name-equal, 2=prefix,
-    3=substring (a row reaches this query only via the substring OR).
+# L2.4b declaration-side kinds: a candidate row on one of these kinds is the
+# SYMBOL ITSELF (where the thing is declared / what it is named after);
+# every other kind (call_site / kwarg_usage / import / extends) is a USAGE
+# of some name. Def-side candidates rank above usage candidates at equal
+# rank keys (owner ruling 2026-11-17, T-B finding #4: implementation-side
+# names must not lose to their own kwarg/call rows).
+_DEF_SIDE_KINDS = ("function", "method", "class", "parameter", "decorator")
+_DEF_SIDE_SQL = "kind IN (" + ", ".join("?" for _ in _DEF_SIDE_KINDS) + ")"
 
-    NOTE: the joined exprs must NOT be wrapped in one outer paren pair —
-    MIN((a, b)) is a row-value arg (sqlite 'row value misused');
-    MIN(a, b) is the multi-arg min we want."""
-    exprs = []
-    params: list = []
+
+def _concept_rank_sql(tokens: list, where: str, wparams: list,
+                     limit: int, offset: int, rarity: bool = True) -> tuple:
+    """L2.4b candidate SQL: DISTINCT-NAME ranking (aggregation only — no
+    c0 re-JOIN; the representative row is fetched by query_concept's
+    second, index-driven query).
+
+    One candidate per distinct NAME (a 6-row call_site family is ONE
+    candidate with occ=6 — the T-B drown fix). ORDER: strong hits DESC
+    (a name that matches every concept word beats one that matches a
+    single word), then tier ASC, then def-side before usage, then rarity
+    (rare names first — the original L2.4 accuracy guard), then name.
+
+    `rarity=False` is the large-candidate-set path (gate ④,
+    CONCEPT_RARITY_MAX_CANDIDATES): the per-name aggregates (occ / hits /
+    defmark) are dropped — a plain GROUP BY over distinct names is far
+    cheaper than the counted one, and the caller discloses the degraded
+    ranking. Dedup-by-name is KEPT (that is the point of L2.4b even at
+    scale).
+
+    Tier-2 = DELIMITED strong match, built with GLOB for the underscore
+    anchors: GLOB patterns treat '_' literally (a LIKE '_x%' would let
+    the '_' wildcard swallow ANY leading character — 'xheal_y' must stay
+    tier-3 for 'heal'). WHERE keeps the widest substring net.
+    """
+    tier_cases = []
+    strong_flags = []
+    tier_params: list = []
+    strong_params: list = []
     for t in tokens:
-        exprs.append(
-            f"(CASE WHEN lower(name) = ? THEN 1"
-            f" WHEN lower(name) LIKE ? THEN 2 ELSE 3 END)")
-        params.extend([t, t + "%"])
-    return ", ".join(exprs), params
+        tier_cases.append(
+            "(CASE WHEN lower(name) = ? THEN 1"
+            " WHEN lower(name) LIKE ? OR lower(name) GLOB ?"
+            " OR lower(name) GLOB ? THEN 2 ELSE 3 END)")
+        strong_flags.append(
+            "(CASE WHEN lower(name) = ? THEN 1"
+            " WHEN lower(name) LIKE ? OR lower(name) GLOB ?"
+            " OR lower(name) GLOB ? THEN 1 ELSE 0 END)")
+        for p in (t, t + "%", "_" + t + "*", "*_" + t):
+            tier_params.append(p)
+            strong_params.append(p)
+    # SELECT list order: ALL tier CASEs first, then ALL strong-flag CASEs
+    # (the params must follow that order — interleaving per token is the
+    # binding shift that silently zeroed multi-token tiers)
+    tparams = tier_params + strong_params
+    least = (tier_cases[0] if len(tier_cases) == 1
+             else "MIN(" + ", ".join(tier_cases) + ")")
+    # single-token: ((flag)) is a plain expression — safe; MIN((x)) would
+    # be a single-arg AGGREGATE that collapses a bare SELECT to one row
+    if rarity:
+        hits_sum = (((" + ".join(strong_flags))
+                     if len(strong_flags) > 1
+                     else strong_flags[0]) + " AS hits")
+        ranked_core = (
+            " MIN(c.tier) AS tier, MIN(c.hits) AS hits, COUNT(*) AS occ,"
+            f" MIN(CASE WHEN {_DEF_SIDE_SQL}"
+            " THEN 0 ELSE 1 END) AS defmark, MIN(c.line) AS minline")
+        order = "ORDER BY hits DESC, tier, defmark, occ, ln"
+        tail = (" SELECT root, name, ln, tier, hits, occ, defmark, minline"
+                " FROM ranked " + order + " LIMIT ? OFFSET ?")
+        ranked_params = (tparams + wparams + list(_DEF_SIDE_KINDS)
+                         + [limit, offset])
+    else:
+        # gate-④ degraded path (rarity=False): no per-name aggregates
+        # (the counted GROUP BY is the 100ms+ cost at 20k+ candidates);
+        # dedup by name stays. NOTE: c0 carries the tier CASEs only —
+        # the strong-flag CASEs are absent, so the strong params must
+        # NOT be supplied (binding shift = ProgrammingError).
+        hits_sum = "0 AS hits"
+        ranked_core = (
+            " MIN(c.tier) AS tier, 0 AS hits, 0 AS occ, 1 AS defmark,"
+            " MIN(c.line) AS minline")
+        order = "ORDER BY tier, ln"
+        tail = (" SELECT root, name, ln, tier, hits, occ, defmark, minline"
+                " FROM ranked " + order + " LIMIT ? OFFSET ?")
+        ranked_params = tier_params + wparams + [limit, offset]
+    ranked_sql = (
+        "WITH c0 AS ("
+        " SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
+        f" {least} AS tier, {hits_sum}"
+        f" FROM symbols s WHERE {where}"
+        "), ranked AS ("
+        " SELECT c.root, lower(c.name) AS ln, c.name AS name,"
+        + ranked_core
+        + " FROM c0 c GROUP BY c.root, lower(c.name)"
+        ")"
+        + tail
+    )
+    return ranked_sql, ranked_params
+
+
+def _concept_rep_sql(root: str, lns: list) -> tuple:
+    """Second query of query_concept: the REPRESENTATIVE rows for the
+    ranked names — a single IN over the lower(name) EXPRESSION index
+    (idx_symbols_lname), so each name is an index probe. (An OR chain of
+    `(lower(name)=? AND line=?)` pairs is NOT sargable as a whole:
+    SQLite full-scans the table — measured 913ms at 20k rows vs tens of
+    ms for the IN.) The caller picks each name's min-line row in
+    Python. Match on lower(name) (the GROUP BY key) — the ranked CTE's
+    bare `name` column carries an arbitrary-case value and must not
+    drive the lookup."""
+    if not lns:
+        return None, None
+    placeholders = ", ".join("?" for _ in lns)
+    sql = (f"SELECT name, kind, path, line, sig FROM symbols"
+           f" WHERE root = ? AND lower(name) IN ({placeholders})")
+    return sql, [root, *lns]
 
 
 def query_concept(conn: sqlite3.Connection, root: str, tokens: list,
                   path: Optional[str] = None, kind: Optional[str] = None,
                   limit: int = 200, offset: int = 0,
                   rarity: bool = True) -> list:
-    """L2.4 concept bridge (owner 2026-11-16): word-surface candidate
-    rows ranked (tier ASC, name-rarity ASC, then stable keys).
+    """L2.4b concept bridge: DISTINCT-NAME word-surface candidates,
+    ranked (strong-hits DESC, tier ASC, def-side first, rarity ASC,
+    stable keys).
 
-    Rarity = how many rows in THIS root share the candidate's exact name
-    (GROUP BY pass): a rare name like `rebuild_dirty` outranks a common
-    one like `build` for the same token — the accuracy guard against
-    top-1 over-trust. When rarity=False (large candidate sets, gate ④
-    budget) the occ column is 0 and ranking falls back to
-    (tier, name, path, line) — the caller picks via candidate total.
-    Rows: (root, path, name, kind, line, sig, tier, occ).
+    L2.4b (owner 2026-11-17) replaced the row-level candidate list: a
+    multi-row usage family no longer drowns the one distinct name that
+    carries the concept; tiers promote leading-underscore prefixes and
+    underscore-delimited suffixes; with 2+ concept tokens a name that
+    strongly matches every token outranks single-token names; within a
+    rank, declaration rows (function/method/class/parameter/decorator)
+    outrank usage rows.
+
+    `rarity=False` is gate ④ (CONCEPT_RARITY_MAX_CANDIDATES): the
+    per-name aggregates (occ / hits / defmark) are placeholders and the
+    ranking degrades to (tier, name) — dedup-by-name stays; the caller
+    discloses the degraded payload.
+
+    Rows: (root, path, name, kind, line, sig, tier, occ, hits, defmark).
     """
     where, wparams = _concept_predicate(root, tokens, path, kind)
-    tier_sql, tparams = _tier_exprs(tokens)
-    if rarity:
-        query = (
-            "SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
-            f" MIN({tier_sql}) AS tier, r.occ AS occ"
-            " FROM symbols s"
-            " JOIN (SELECT lower(name) ln, COUNT(*) occ FROM symbols"
-            "       WHERE root = ? GROUP BY 1) r ON r.ln = lower(s.name)"
-            f" WHERE {where}"
-            " GROUP BY s.root, s.path, s.name, s.kind, s.line, s.sig, r.occ"
-            " ORDER BY tier, occ, s.name, s.path, s.line"
-            " LIMIT ? OFFSET ?"
-        )
-        # SQLite binds placeholders in SQL-TEXT order:
-        #   1. SELECT: tier CASE exprs (tparams: per token -> tok, tok%)
-        #   2. FROM subquery: the join root
-        #   3. WHERE fragment: wparams (leading root + LIKE %tok% + path/kind)
-        #   4. LIMIT / OFFSET
-        params = tparams + [root] + wparams + [limit, offset]
-    else:
-        # No-rarity fast path: plain tier-ordered scan (no GROUP BY JOIN —
-        # the rarity join is O(root size) and would blow the 50ms gate on
-        # 30k-row roots). occ is 0; callers disclose the fallback ranking.
-        query = (
-            "SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
-            f" MIN({tier_sql}) AS tier, 0 AS occ"
-            f" FROM symbols s WHERE {where}"
-            " ORDER BY tier, s.name, s.path, s.line"
-            " LIMIT ? OFFSET ?"
-        )
-        params = tparams + wparams + [limit, offset]
-    return conn.execute(query, params).fetchall()
+    ranked_sql, ranked_params = _concept_rank_sql(
+        tokens, where, wparams, limit, offset, rarity)
+    ranked = conn.execute(ranked_sql, ranked_params).fetchall()
+    # (root, name, ln, tier, hits, occ, defmark, minline)
+    if not ranked:
+        return []
+    rep_sql, rep_params = _concept_rep_sql(root, [r[2] for r in ranked])
+    reps = {}
+    for rr in conn.execute(rep_sql, rep_params).fetchall():
+        # (name, kind, path, line, sig) — key on (lower-name, line) so a
+        # name's many rows stay distinguishable; the min-line row wins
+        reps[(rr[0].lower(), rr[3])] = rr
+    out = []
+    for r in ranked:
+        root_v, _name, ln, tier, hits, occ, defmark, minline = r
+        rep = reps.get((ln, minline))
+        if rep is None:
+            continue  # the min-line row left the index mid-query
+        out.append((root_v, rep[2], rep[0], rep[1], rep[3], rep[4],
+                    tier, occ, hits, defmark))
+    return out
 
 
 def count_concept(conn: sqlite3.Connection, root: str, tokens: list,
                   path: Optional[str] = None, kind: Optional[str] = None) -> int:
-    """All-page candidate count for a concept query (feeds 'total')."""
+    """All-candidate DISTINCT-NAME count for a concept query (feeds
+    'total' — L2.4b: total is names, not rows)."""
     where, params = _concept_predicate(root, tokens, path, kind)
-    q = f"SELECT COUNT(*) FROM symbols WHERE {where}"
+    q = f"SELECT COUNT(DISTINCT lower(name)) FROM symbols WHERE {where}"
     return conn.execute(q, params).fetchone()[0]
 
 

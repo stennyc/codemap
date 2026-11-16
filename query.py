@@ -597,15 +597,20 @@ def _serialize(page: list, staleness: str, root: str,
 
 def _serialize_concept(page: list, staleness: str, root: str,
                        limit: int, cursor: str, total: int,
-                       rarity_on: bool = True) -> str:
-    """L2.4 concept-bridge payload: candidate rows carry tier + occ (name
-    rarity in this root). The disclosure pins the accuracy contract:
-    candidates are word-surface matches, NOT a semantic verdict — verify
-    sig/docstring before use; 0 hits carry a grep-fallback note (word
-    surface miss != concept absent)."""
+                       rarity_on: bool = True, truncated: bool = False) -> str:
+    """L2.4b concept-bridge payload: DISTINCT-NAME candidates carry tier
+    (1=equal, 2=delimited strong — leading-underscore prefix or
+    underscore-delimited suffix, 3=bare substring), hits (how many of
+    the concept's tokens strongly match the name), occ (total rows in
+    this root sharing the name) and defmark (0 = a declaration-side row
+    represents this name, 1 = usage-side). The disclosure pins the
+    accuracy contract: candidates are word-surface matches, NOT a
+    semantic verdict — verify sig/docstring before use; 0 hits carry a
+    grep-fallback note (word-surface miss != concept absent)."""
     rows = [
         {"root": r[0], "path": r[1], "name": r[2], "kind": r[3],
          "line": r[4], "sig": r[5], "tier": r[6], "occ": r[7],
+         "hits": r[8], "defside": (not r[9]),
          "staleness": staleness}
         for r in page
     ]
@@ -618,16 +623,28 @@ def _serialize_concept(page: list, staleness: str, root: str,
         "staleness": staleness,
         "match": "fuzzy",
     }
-    rarity_note = (
-        "ranked by tier then name rarity (rare names first)"
-        if rarity_on else
-        "large candidate set: rarity ranking skipped for the query-time "
-        "budget (occ=0); ranked by tier, name, path, line instead")
+    if truncated:
+        payload["truncated"] = True
+        payload["truncated_note"] = (
+            "byte cap dropped the TAIL of this name page; the cursor "
+            "still advances by ALL fetched names — the dropped names are "
+            "unreachable via this cursor (re-query with a smaller limit)")
     payload["disclosure"] = (
-        "fuzzy=true: rows are word-surface CANDIDATES, not a verdict — "
-        "tier 1=name-equal, 2=prefix, 3=substring (case-insensitive, "
-        "min tier per row across the concept's tokens); " + rarity_note
-        + ". Verify each candidate's sig/docstring before relying on it. "
+        "fuzzy=true (L2.4b): DISTINCT-NAME word-surface CANDIDATES "
+        "(a multi-row call_site/kwarg family is ONE candidate carrying "
+        "occ=its row count), not a verdict — tier 1=name-equal, 2="
+        "delimited strong match (leading-underscore prefix or "
+        "underscore-delimited suffix, case-insensitive), 3=bare in-word "
+        "substring; hits = how many of the concept's tokens match "
+        "strongly (names matching every word outrank single-word names; "
+        "rank: hits DESC, tier, declaration rows before usage rows, "
+        "then name rarity — rare names first). defside=true marks the "
+        "candidate's representative row as a declaration "
+        "(function/method/class/parameter/decorator). "
+        "Verify each candidate's sig/docstring before relying on it. "
+        + (("Large candidate set (gate ④): per-name aggregates are "
+            "placeholder zeros (occ/hits/defside uncomputed) and "
+            "ranking degrades to (tier, name). ") if not rarity_on else "")
         + _PAGING_DISCLOSURE
     )
     if total == 0:
@@ -649,11 +666,16 @@ _PAGING_DISCLOSURE = (
 
 def _run_fuzzy_branch(conn, root: str, name, path_filter, kind,
                       limit: int, offset: int, staleness: str) -> str:
-    """L2.4 concept bridge: word-surface candidate rows for a concept word.
+    """L2.4b concept bridge: DISTINCT-NAME word-surface candidates for a
+    concept word.
 
-    Accuracy contract (owner 2026-11-16 discussion): candidates are
-    tiered (exact/prefix/substring) + rarity-ranked, disclosed as
-    over-approximations, and a 0-hit set carries an explicit
+    Accuracy contract (owner 2026-11-16 discussion, L2.4b refinements
+    2026-11-17): candidates are deduped to one row per name (occ = its
+    row count), tiered (exact/delimited-strong/substring) with
+    leading-underscore prefixes and underscore-delimited suffixes at
+    tier 2, strong-hit boosted (every concept word > one word),
+    declaration-side rows ahead of usage rows, rarity-ranked — disclosed
+    as over-approximations, and a 0-hit set carries an explicit
     grep-fallback note so a word-surface miss never masquerades as
     'the concept does not exist'.
     """
@@ -664,23 +686,34 @@ def _run_fuzzy_branch(conn, root: str, name, path_filter, kind,
             limit)
     t0 = time.perf_counter()
     total = count_concept(conn, root, tokens, path=path_filter, kind=kind)
-    # gate ④ budget: rarity JOIN only pays off on small candidate sets;
-    # above the threshold fall back to the no-rarity fast path (occ=0).
+    # gate ④ budget: the full per-name aggregates (occ / hits / defmark)
+    # are the 100ms+ cost at 20k+ candidates; above the threshold keep
+    # the name-dedup (L2.4b's point at scale) but drop the aggregates —
+    # ranking degrades to (tier, name) and the payload discloses it.
     rarity_on = total <= CONCEPT_RARITY_MAX_CANDIDATES
     rows = query_concept(conn, root, tokens, path=path_filter, kind=kind,
                          limit=limit, offset=offset, rarity=rarity_on)
     page = rows[:PAGE_MAX_SYMBOLS]
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     result = _serialize_concept(page, staleness, root, limit,
-                                str(offset + limit), total, rarity_on)
+                                str(offset + len(rows)), total, rarity_on)
     if len(result.encode("utf-8")) > PAGE_BUDGET_BYTES:
-        while len(page) > 1:
-            page = page[:-1]
-            result = _serialize_concept(page, staleness, root, limit,
-                                        str(offset + len(page)), total,
-                                        rarity_on)
-            if len(result.encode("utf-8")) <= PAGE_BUDGET_BYTES:
-                break
+        # binary-search the largest fitting prefix: the old linear loop
+        # re-serialized up to ~190 times on a 200-row page (~60ms of the
+        # 150ms gate budget at 20k candidates — cProfile-measured)
+        lo, hi, k, best = 1, len(page), 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand = _serialize_concept(page[:mid], staleness, root, limit,
+                                      str(offset + len(rows)), total,
+                                      rarity_on, truncated=True)
+            if len(cand.encode("utf-8")) <= PAGE_BUDGET_BYTES:
+                k, best, lo = mid, cand, mid + 1
+            else:
+                hi = mid - 1
+        result = best if best is not None else _serialize_concept(
+            page[:1], staleness, root, limit,
+            str(offset + len(rows)), total, rarity_on, truncated=True)
     payload = json.loads(result)
     payload["query_ms"] = elapsed_ms
     return json.dumps(payload, ensure_ascii=False)

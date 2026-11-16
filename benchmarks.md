@@ -27,6 +27,30 @@ Owner-gated performance gates + campaign data. Gate numbers are hard:
 - Honest: the filemem tree has few `dirty`-bearing names; the sweep is
   cheap, not the answer being deep.
 
+## L2.4b candidate layer (2026-11-17): 三缺陷修复 + 20k gate 达标
+
+L2.6 发现 #1（TB 桥 3/5 miss 根因）的修复落盘，全部 TDD + 实测：
+
+| 缺陷 | 修复 | 机制 |
+|---|---|---|
+| 候选按行不按名（`score` 6 行挤掉 `min_score`） | DISTINCT-NAME 候选（一行一名 + occ 计数 + total=名数） | ranked CTE `GROUP BY lower(name)`；代表行另走第二条索引查询 |
+| 前缀 tier 不剥前导下划线（`_bringback_*` 掉 tier-3） | tier-2 = delimited-strong：`_tok*` 前缀 OR `*_tok` 后缀 | GLOB 锚定下划线（`LIKE '_x%'` 的 `_` 通配会吞任意首字符——GLOB 里 `_` 是字面量） |
+| 多词根不 boost（`min score` 查不到 `min_score` 优势） | hits = 强匹配词数，`hits DESC` 首位；def-side 优先（declaration 行压 usage 行） | 单 token 用裸表达式（`MIN((x))` 是单参聚合会把 SELECT 塌成一行——已知 sqlite 坑） |
+
+**性能面（20k 行合成目标，150ms 概念 gate）**
+- 首版 1299ms 超标 → 分段计时定位真凶：rep 的 200 项 `(lower(name)=? AND line=?)` OR 链**整体不可 sargable**（SQLite 全表扫 2万行 × 200 disjunct）= **913ms**；
+- rep 改写 `lower(name) IN (...)` 走 expression index `idx_symbols_lname`（每名一次索引探测）→ 913ms → ~20ms；
+- 线性 byte-cap trim（200 行页 → 15 行 = 187 次 json.dumps，cProfile 实测 61ms）→ **二分裁行（9 次 dumps）**；
+- gate④ 大候选集降级路径（`CONCEPT_RARITY_MAX_CANDIDATES=2000` 之上）：保留按名去重、丢 per-name 聚合（occ/hits/defmark 置占位 0），排序退化 (tier, name)，payload 披露 degraded；降级路径参数绑定单独核过（strong-flag CASE 缺席时**不得**供 strong params——12vs8 binding shift 回归测试在案）；
+- 终局：warm 稳态 **115ms < 150ms gate**（count 16 + rank 55 + rep IN ~18 + 入口开销 ~30）；20k gate 测试 = 预热 1 次 + min-of-3 稳态计时（批内负载容忍），双批 27/27 绿。
+
+**测试面**
+- `tests/test_fuzzy_ranking.py`（owner 2026-11-17）6/6：名去重/occ、limit 按名翻页（cursor walk 记账修正：seen 从 page 0 起、空页不入账）、多词根 boost、前导下划线 tier-2、delimited 后缀 + def-side 优先、精确名回归守卫；
+- `tests/test_concept_bridge.py` L2.4b 语义修正 + 20k gate + exact 路径 50ms 密封 gate 回归（20k 行 exact 查询仍 <50ms）；
+- 零回归证据（双目录副本 A/B，C:\tmp 清态）：HEAD(无 L2.4b) 与 WIP(含 L2.4b) 各跑 check_root/root_legality/query_root_gate/hooks 四域 → **两边全过**；主树 65 失败 = 环境态（活 data/ registry + C:\tmp 残留 + 网关 WAL 争用），与 L2.4b 无关。
+
+**已知遗留（不属本块）**：exact 分支 byte-cap 仍是线性 trim（同型 O(n²)，50ms 密封 gate 只量 db 层所以未爆——下一块修）；L2.3b 根级 kind 聚合、L2.5b 种子公共面 仍 open（L2.6 发现 #2/#3）。
+
 ## Campaign L2.6 (2026-11-17): "加速了解代码" 五臂对照
 
 **任务设计（GT 由 owner 在臂起跑前独立算好，臂答案只与 GT 对分）**
