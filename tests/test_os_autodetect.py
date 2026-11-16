@@ -160,3 +160,73 @@ def test_data_dir_env_wins(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env_home"))
     d = config.data_dir()
     assert str(d) == str(tmp_path / "env_home" / "plugins" / "code_map" / "data")
+
+
+# ── 7. db LIKE prefixes must use the host OS path separator ────────────────
+# The files table stores os.walk paths (native separators: "\\" on Windows,
+# "/" on POSIX). `diff_indexed` / `stale_paths` filtered rows with a POSIX
+# forward-slash prefix (`f"{root}/%"`) — on Windows that LIKE matched ZERO
+# rows, so every query falsely reported staleness='partial' and deleted
+# files were never reported as removed. Each test below is RED on a
+# Windows host before the os.sep fix.
+def _build_indexed_root(tmp_path, monkeypatch) -> str:
+    """Build a 2-file index under a HERMES_HOME-isolated tmp home."""
+    import time
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    for m in [m for m in list(sys.modules) if m.startswith("code_map")]:
+        sys.modules.pop(m, None)
+    import importlib
+    from code_map import fingerprint as fp, db as cdb
+    importlib.reload(fp)
+    importlib.reload(cdb)
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (proj / "sub" / "b.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+    root = str(proj)
+    # index by upserting the files exactly as the scanner stores them
+    # (native-separator absolute paths from os.walk):
+    import os as _os
+    on_disk = fp.on_disk_files(root)
+    conn = cdb.init_db(root)
+    try:
+        for p in sorted(on_disk):
+            st = _os.stat(p)
+            cdb.upsert_file(conn, p, st.st_mtime, st.st_size, "python",
+                            build_id="t", commit=False)
+            cdb.insert_symbols(conn, root, p, [], commit=False)
+        conn.commit()
+    finally:
+        conn.close()
+    return root
+
+
+def test_diff_indexed_clean_root_reports_no_delta(tmp_path, monkeypatch):
+    import os
+    root = _build_indexed_root(tmp_path, monkeypatch)
+    for m in [m for m in list(sys.modules) if m.startswith("code_map")]:
+        sys.modules.pop(m, None)
+    from code_map import fingerprint as fp
+    on_disk = fp.on_disk_files(root)
+    added, removed = fp.diff_indexed(root, on_disk)
+    assert added == set(), f"fully-indexed root must have no 'added'; got {len(added)}: {sorted(added)[:3]}"
+    assert removed == set(), f"no files deleted; got removed {sorted(removed)[:3]}"
+
+
+def test_stale_paths_reports_on_disk_deletion(tmp_path, monkeypatch):
+    import os
+    root = _build_indexed_root(tmp_path, monkeypatch)
+    os.remove(os.path.join(root, "a.py"))
+    for m in [m for m in list(sys.modules) if m.startswith("code_map")]:
+        sys.modules.pop(m, None)
+    from code_map import db as cdb, fingerprint as fp
+    fp.invalidate_cache(root)  # on_disk_files caches with a TTL: force re-walk
+    conn = cdb.init_db(root)
+    try:
+        remaining = fp.on_disk_files(root)
+        gone = cdb.stale_paths(conn, root, remaining)
+    finally:
+        conn.close()
+    assert gone == {os.path.join(root, "a.py")}, (
+        f"deleted file must surface in stale_paths; got {sorted(gone)[:3]}"
+    )

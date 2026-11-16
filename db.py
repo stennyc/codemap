@@ -236,7 +236,7 @@ def stale_paths(conn: sqlite3.Connection, root: str,
     """Return paths in the index that are no longer on disk."""
     rows = conn.execute(
         "SELECT path FROM files WHERE path LIKE ?",
-        (f"{root}/%",),
+        (f"{root}{os.sep}%",),
     ).fetchall()
     indexed = {r[0] for r in rows}
     return indexed - set(on_disk)

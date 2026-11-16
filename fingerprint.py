@@ -85,7 +85,7 @@ def diff_indexed(root: str, on_disk: FrozenSet[str]) -> Tuple[Set[str], Set[str]
         # added = on_disk - indexed
         indexed = set()
         for r in db.execute("SELECT path FROM files WHERE path LIKE ?",
-                            (f"{root}/%",)):
+                            (f"{root}{os.sep}%",)):
             indexed.add(r[0])
         added = set(on_disk - indexed)
         return added, removed
