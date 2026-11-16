@@ -224,7 +224,7 @@ _TOOL_SCHEMAS = {
                          "description": "REQUIRED: a confirmed project root"},
                 "name": {"type": "string", "description": "Symbol name to locate across the repo"},
                 "path": {"type": "string", "description": "File to outline: relative to root, or an absolute path that lies inside root"},
-                "kind": {"type": "string", "description": "Optional filter: function|class|method|import"},
+                "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter"},
                 "limit": {"type": "integer", "description": "Max rows per page (default 200)"},
                 "cursor": {"type": "string", "description": "Opaque cursor from a prior truncated page"},
             },

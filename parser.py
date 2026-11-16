@@ -229,6 +229,58 @@ def _call_site_row(node, in_class: bool, lang: str) -> Optional[SymbolRow]:
     return (nm, "call_site", node.start_point[0] + 1, _sig_for(node))
 
 
+# L2.1 parameter rows (python v1): node types that wrap (or ARE) one
+# declared parameter inside a `parameters` node. Covers this tree-sitter-
+# python build's shapes: bare names are DIRECT `identifier` children;
+# annotation+default is `typed_default_parameter`; splats are
+# list/dictionary_splat_pattern. The legacy wrapper names are kept so a
+# grammar-version switch does not silently drop rows.
+_PARAM_NODE_TYPES = (
+    "identifier",  # bare `x` — a direct identifier child of parameters
+    "simple_parameter", "default_parameter", "typed_parameter",
+    "typed_default_parameter", "keyword_parameter",
+    "keyword_default_parameter", "positional_parameter",
+    "list_splat_pattern", "dictionary_splat_pattern",
+)
+
+
+def _parameter_rows(fn_node) -> List[SymbolRow]:
+    """Emit kind='parameter' rows for the declared parameters of a Python
+    (async) function definition.
+
+    L2.1 (2026-11-16, owner request: 参数/变量被谁消费, code-graph gap):
+    "where is parameter X declared / what is its default" becomes a name
+    lookup instead of a whole-tree grep. line = the parameter's OWN line
+    (multi-line defs matter); sig = the declaration text (name +
+    annotation + default). self/cls are universal, zero-signal: never
+    indexed. Lambda parameters are not captured (v1, documented).
+    Other languages are unchanged in v1."""
+    out: List[SymbolRow] = []
+    params = fn_node.child_by_field_name("parameters")
+    if params is None:
+        return out
+    for pnode in params.children:
+        if pnode.type not in _PARAM_NODE_TYPES:
+            continue
+        if pnode.type == "identifier":
+            # Bare parameter: the node itself is the name.
+            nm = pnode.text.decode("utf-8", "replace")
+        else:
+            # The declared name is the first identifier/dotted_name child
+            # (skips leading '*'/'**' punctuation of splat params and the
+            # annotation/value tails of typed/default params).
+            nm = None
+            for sub in pnode.children:
+                if sub.type in ("identifier", "dotted_name"):
+                    nm = sub.text.decode("utf-8", "replace")
+                    break
+        if not nm or nm in ("self", "cls"):
+            continue
+        out.append((nm, "parameter", pnode.start_point[0] + 1,
+                    pnode.text.decode("utf-8", "replace").strip()))
+    return out
+
+
 def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -> List[SymbolRow]:
     """Recurse a tree node, emitting symbol rows for the MVP kind set."""
     rows: List[SymbolRow] = []
@@ -275,6 +327,9 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
                 if name:
                     kind = "method" if in_class else "function"
                     rows.append((name, kind, child.start_point[0] + 1, _sig_for(child)))
+                # L2.1: parameter-name rows (python v1).
+                if lang == "python":
+                    rows.extend(_parameter_rows(child))
                 body = child.child_by_field_name("body")
                 if body is None:
                     body = child.child_by_field_name("body")

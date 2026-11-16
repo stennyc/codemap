@@ -562,7 +562,11 @@ def _serialize(page: list, staleness: str, root: str,
         "Go/Rust: method names are unqualified; Rust methods "
         "surface as kind=function. "
         "call_site rows are name-level: `obj.m()` -> 'm', "
-        "`std::puts()` -> 'puts' (receiver/namespace not resolved)."
+        "`std::puts()` -> 'puts' (receiver/namespace not resolved). "
+        "parameter rows (kind=parameter, python) are name-level "
+        "declarations: common names (query, limit, ...) match across "
+        "modules — no scope resolution; a row names the declaration "
+        "site, not the keyword-argument consumers (grep for those)."
     )
     return json.dumps(payload, ensure_ascii=False)
 
