@@ -248,7 +248,7 @@ _TOOL_SCHEMAS = {
                          "description": "REQUIRED: a confirmed project root"},
                 "name": {"type": "string", "description": "Symbol name to locate across the repo; with fuzzy=true, a concept word to bridge to candidate names"},
                 "path": {"type": "string", "description": "File to outline: relative to root, or an absolute path that lies inside root"},
-                "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter|kwarg_usage"},
+                "kind": {"type": "string", "description": "Optional filter: function|class|method|import|call_site|parameter|kwarg_usage|extends|decorator"},
                 "fuzzy": {"type": "boolean", "description": "true = L2.4 concept bridge: word-surface candidate rows (tier + rarity ranked) with a verify-before-use disclosure; default false = exact name match"},
                 "depth": {"type": "integer", "description": "L2.5 multi-hop impact propagation from the exact seed name (1-3, clamped; mutually exclusive with fuzzy; path/kind/cursor ignored): odd hops list consumers of the frontier names, even hops list def-side symbols in those files"},
                 "limit": {"type": "integer", "description": "Max rows per page (default 200)"},

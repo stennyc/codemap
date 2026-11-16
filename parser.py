@@ -10,6 +10,10 @@ never O(directory).
 
 Kinds emitted (per-language):
   Python:    class, function, method, import
+             + L2: call_site
+             + L2.1: parameter (python v1)
+             + L2.2: kwarg_usage (python v1, every nesting depth)
+             + L2.3: extends, decorator (python v1, owner 2026-11-16)
   TypeScript: class, function, method, import, interface
   JavaScript: class, function, method, import
   Go:        function, method, import, type
@@ -29,6 +33,19 @@ so that "who calls X" is answerable by symbol-name lookup, not just by import
 edges.  This is a NAME-level approximation (same class of approximation as
 the import rows — alias-shadowing and dynamic dispatch are not disambiguated)
 and is disclosed in the query payload alongside the L1.5 disclosure line.
+
+L2.3 (owner 2026-11-16, roadmap ② — "改这里影响哪里" 的调用面全量块):
+python's call_site layer moved from conservative direct-child capture to
+EVERY syntactically-visible call expression at any nesting depth
+(`_l2_3_python_rows` whole-tree walk; the conservative gate is skipped for
+python — it would double-emit). Plus two edge kinds: `extends` (class
+bases — query "who extends Base") and `decorator` (the decorator's
+callee — query "who is decorated with X"). SYNTACTICALLY-visible
+volume, not semantic: dynamic dispatch (`getattr(x, "f")()`) yields the
+WRAPPER row only ("getattr"); string-dispatched targets, callbacks and
+`__call__` objects are never rows. Positional-argument attribution stays
+grep/LSP territory. Python v1 only — the other languages keep the
+conservative gate (disclosed).
 """
 from __future__ import annotations
 
@@ -313,6 +330,89 @@ def _all_kwarg_usage_rows(node) -> List[SymbolRow]:
     return out
 
 
+# L2.3 (owner 2026-11-16, roadmap ②): full syntactic call volume +
+# inheritance/decorator edges — PYTHON V1 (like L2.1/L2.2; other languages
+# keep the conservative direct-child capture below).
+#
+# Probed node shapes on THIS host's tree-sitter-python build (2026-11-16;
+# L2.1 lesson — never trust docs, dual-compat the legacy names):
+#   class-base list = `argument_list` node (NOT the legacy
+#   `superclass_list` wrapper); bases are identifier | attribute (dotted);
+#   decorators wrap a `decorator` node whose payload is identifier |
+#   attribute | call (a decorator call's callee reuses the call_site rule:
+#   last identifier of the function chain — `@app.route("/x")` -> "route").
+# Grammar-version switch-proof: both wrapper names stay in the match set.
+_L23_BASE_LIST_NODE_TYPES = ("argument_list", "superclass_list")
+
+
+def _l2_3_python_rows(node) -> List[SymbolRow]:
+    """One whole-tree pass over the python module root emitting:
+
+    - every `call` node -> call_site row (NESTING-INDEPENDENT: arguments,
+      assignment values, dict literals, comprehensions, ternaries and
+      lambda bodies — each call node is visited exactly once, so
+      `f(g(1))` yields rows for BOTH f and g). This supersedes the
+      conservative direct-child capture for python (its gate below is
+      skipped when lang == "python").
+    - every `decorator` node -> decorator row (the decorator's callee).
+    - `class_definition` bases -> extends rows (one row per base; a dotted
+      base `A.B` yields the LAST segment "B" — name-level, disclosed).
+
+    Honest ceiling: dynamic dispatch (`getattr(x, "f")()`) is syntactically
+    visible only at the WRAPPER level — the row names "getattr"; the
+    string-dispatched target is never a row. Positional-argument
+    attribution stays grep/LSP territory (no name-level key).
+    """
+    out: List[SymbolRow] = []
+
+    def _callee(n) -> Optional[str]:
+        # last identifier of the callee chain (call_site rule, L163)
+        fn = n.child_by_field_name("function") if n.type == "call" else n
+        if fn is None:
+            return None
+        idents = [c for c in fn.children if c.type in (
+            "identifier", "property_identifier", "field_identifier",
+            "type_identifier", "namespace_identifier")]
+        if not idents:
+            t = fn.text.decode("utf-8", "replace").strip()
+            return t or None
+        return idents[-1].text.decode("utf-8", "replace")
+
+    def walk(n):
+        if n.type == "call":
+            nm = _callee(n)
+            if nm:
+                out.append((nm, "call_site", n.start_point[0] + 1, _sig_for(n)))
+        elif n.type == "decorator":
+            for c in n.children:
+                if c.type == "call":
+                    nm = _callee(c)
+                    if nm:
+                        out.append((nm, "decorator", c.start_point[0] + 1,
+                                    _sig_for(c)))
+                elif c.type in ("identifier", "attribute"):
+                    nm = c.text.decode("utf-8", "replace").split(".")[-1]
+                    if nm:
+                        out.append((nm, "decorator", c.start_point[0] + 1,
+                                    _sig_for(c)))
+        elif n.type == "class_definition":
+            for c in n.children:
+                if c.type in _L23_BASE_LIST_NODE_TYPES:
+                    for base in c.children:
+                        if base.type in ("identifier", "attribute",
+                                         "dotted_name"):
+                            nm = base.text.decode("utf-8", "replace").split(".")[-1]
+                            if nm:
+                                out.append((nm, "extends",
+                                           base.start_point[0] + 1,
+                                           _sig_for(base)))
+        for c in n.children:
+            walk(c)
+
+    walk(node)
+    return out
+
+
 def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -> List[SymbolRow]:
     """Recurse a tree node, emitting symbol rows for the MVP kind set."""
     rows: List[SymbolRow] = []
@@ -323,6 +423,10 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
         # of surrounding structure.  Dart's call shape has no "call"-named node
         # (expression_statement + identifier + selector/argument_part), so it is
         # handled in the `lang == "dart"` branch just below.
+        # L2.3 (python v1): python is EXCLUDED — its call rows come from the
+        # whole-tree _l2_3_python_rows walk (a strict superset; the gate would
+        # double-emit the identical rows for calls that sit directly under a
+        # visited block).
         _call_node_types = (
             "call",                # python
             "call_expression",    # typescript, javascript, go, rust, c, cpp, kotlin
@@ -330,7 +434,8 @@ def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -
             "function_call_expression",  # php
             "member_call_expression",    # php
         )
-        if ctype in _call_node_types or (lang == "dart" and ctype == "expression_statement"):
+        if (ctype in _call_node_types and lang != "python") or \
+           (lang == "dart" and ctype == "expression_statement"):
             row = _call_site_row(child, in_class, lang)
             if row is not None:
                 rows.append(row)
@@ -811,6 +916,9 @@ def parse_bytes(source: bytes, lang: Optional[str] = None) -> List[SymbolRow]:
         # (python v1; other languages unchanged).
         if detected == "python":
             rows.extend(_all_kwarg_usage_rows(tree.root_node))
+            # L2.3: full syntactic call volume + decorator/extends edges
+            # (python v1 — supersedes the conservative gate for python).
+            rows.extend(_l2_3_python_rows(tree.root_node))
         return rows
     finally:
         tree = None  # release

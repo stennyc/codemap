@@ -65,9 +65,11 @@ def test_call_site_rows_still_present():
     kinds = {k for (n, k, l, s) in parse_bytes(SRC)}
     assert "call_site" in kinds
     assert "kwarg_usage" in kinds
-    # call_site remains the CONSERVATIVE bare-statement capture (L6 only —
-    # the assignment/comprehension-nested calls at L7/L8 are the known
-    # documented gap; kwarg_usage above is what covers their usage side).
-    calls = [(n, l) for (n, k, l, s) in parse_bytes(SRC)
-             if k == "call_site" and n == "target"]
-    assert calls == [("target", 6)], calls
+    # L2.3 (owner 2026-11-16, roadmap ②): python call_site is now the FULL
+    # syntactic volume — ALL three call sites (bare L6, assignment value L7,
+    # comprehension L8). The old "conservative bare-only" assertion (calls ==
+    # [("target", 6)]) encoded the documented gap L2.3 closed on python;
+    # kwarg_usage above is unchanged (L2.2 full-volume usage side).
+    calls = sorted((n, l) for (n, k, l, s) in parse_bytes(SRC)
+                   if k == "call_site" and n == "target")
+    assert calls == [("target", 6), ("target", 7), ("target", 8)], calls
