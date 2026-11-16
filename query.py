@@ -566,7 +566,11 @@ def _serialize(page: list, staleness: str, root: str,
         "parameter rows (kind=parameter, python) are name-level "
         "declarations: common names (query, limit, ...) match across "
         "modules — no scope resolution; a row names the declaration "
-        "site, not the keyword-argument consumers (grep for those)."
+        "site, not the keyword-argument consumers (grep for those). "
+        "kwarg_usage rows (kind=kwarg_usage, python) are every "
+        "keyword-argument usage at any call-nesting depth — positional "
+        "arguments are NOT covered (no name to key on; that needs "
+        "type resolution)."
     )
     return json.dumps(payload, ensure_ascii=False)
 

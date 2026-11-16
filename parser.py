@@ -281,6 +281,38 @@ def _parameter_rows(fn_node) -> List[SymbolRow]:
     return out
 
 
+def _all_kwarg_usage_rows(node) -> List[SymbolRow]:
+    """L2.2: every keyword_argument under `node`, at ANY nesting depth
+    (bare statement, assignment value, comprehension, literal — and
+    kwargs of calls nested inside other kwargs' values).
+
+    A whole-tree pass, deliberately INDEPENDENT of the call-site
+    walker's conservative recursion (that one stays unchanged; its
+    documented gap — nested calls — is what this pass closes on the
+    usage side). Positional arguments carry no name and are NOT
+    captured (resolving which parameter a positional lands on needs
+    type resolution — LSP class, outside the name-level contract;
+    disclosed in the query payload)."""
+    out: List[SymbolRow] = []
+
+    def walk(n):
+        if n.type == "keyword_argument":
+            name_node = n.child_by_field_name("name")
+            if name_node is None:
+                name_node = next((c for c in n.children
+                                  if c.type in ("identifier", "dotted_name")), None)
+            if name_node is not None:
+                nm = name_node.text.decode("utf-8", "replace")
+                if nm:
+                    out.append((nm, "kwarg_usage", n.start_point[0] + 1,
+                                n.text.decode("utf-8", "replace").strip()))
+        for c in n.children:
+            walk(c)
+
+    walk(node)
+    return out
+
+
 def _symbol_rows_from_node(node, in_class: bool = False, lang: str = "python") -> List[SymbolRow]:
     """Recurse a tree node, emitting symbol rows for the MVP kind set."""
     rows: List[SymbolRow] = []
@@ -774,7 +806,12 @@ def parse_bytes(source: bytes, lang: Optional[str] = None) -> List[SymbolRow]:
     tree = p.parse(source)
     try:
         detected = lang or "python"
-        return _symbol_rows_from_node(tree.root_node, in_class=False, lang=detected)
+        rows = _symbol_rows_from_node(tree.root_node, in_class=False, lang=detected)
+        # L2.2: keyword-argument usage rows at every nesting depth
+        # (python v1; other languages unchanged).
+        if detected == "python":
+            rows.extend(_all_kwarg_usage_rows(tree.root_node))
+        return rows
     finally:
         tree = None  # release
 
