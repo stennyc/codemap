@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import PAGE_BUDGET_BYTES, PAGE_MAX_SYMBOLS, data_dir, root_db_path
-from .db import init_db, query_symbols, stale_paths
+from .db import init_db, count_symbols, query_symbols, stale_paths
 from .fingerprint import diff_indexed, invalidate_cache, on_disk_files
 from . import rootreg
 
@@ -539,7 +539,7 @@ def _staleness(root: str, conn) -> str:
 
 
 def _serialize(page: list, staleness: str, root: str,
-               limit: int, cursor: str) -> str:
+               limit: int, cursor: str, total: int) -> str:
     # query_symbols row shape: (root, path, name, kind, line, sig)
     rows = [
         {"root": r[0], "path": r[1], "name": r[2],
@@ -549,6 +549,7 @@ def _serialize(page: list, staleness: str, root: str,
     payload: Dict[str, Any] = {
         "symbols": rows,
         "count": len(rows),
+        "total": total,
         "limit": limit,
         "cursor": str(cursor),
         "staleness": staleness,
@@ -570,7 +571,10 @@ def _serialize(page: list, staleness: str, root: str,
         "kwarg_usage rows (kind=kwarg_usage, python) are every "
         "keyword-argument usage at any call-nesting depth — positional "
         "arguments are NOT covered (no name to key on; that needs "
-        "type resolution)."
+        "type resolution). "
+        "Paging: count = rows on THIS page (byte-capped); total = all "
+        "matching rows; follow 'cursor' until a page returns count=0, "
+        "otherwise you have a partial set."
     )
     return json.dumps(payload, ensure_ascii=False)
 
@@ -621,7 +625,7 @@ def code_map_query(args: Dict[str, Any]) -> str:
     db_path = root_db_path(root)
     if not db_path.exists():
         return json.dumps({
-            "symbols": [], "count": 0, "limit": limit,
+            "symbols": [], "count": 0, "total": 0, "limit": limit,
             "cursor": "0", "staleness": "partial",
             "note": "index not built for this root yet; "
                     "call code_map_refresh to re-scan",
@@ -632,20 +636,26 @@ def code_map_query(args: Dict[str, Any]) -> str:
         t0 = time.perf_counter()  # L45
         staleness = _staleness(root, conn)  # L64
         offset = int(cursor) if cursor.isdigit() else 0
+        # 'total' = ALL-page match count (2026-11-16): byte-capped pages
+        # carry count=rows-on-this-page only; without total, a consumer
+        # reading count<=limit stops early and undercounts (L2.2 bench:
+        # a 22-row page of a 76-row set was read as 'complete').
+        total = count_symbols(conn, root, name=name, path=path_filter,
+                              kind=kind)
         rows = query_symbols(conn, root, name=name, path=path_filter,
                              kind=kind, limit=limit, offset=offset)
         page = rows[:PAGE_MAX_SYMBOLS]
         elapsed_ms = int((time.perf_counter() - t0) * 1000)  # L90
 
         result = _serialize(page, staleness, root, limit,
-                            str(offset + limit))
+                            str(offset + limit), total)
 
         # Single-page byte budget: truncate if over PAGE_BUDGET_BYTES
         if len(result.encode("utf-8")) > PAGE_BUDGET_BYTES:
             while len(page) > 1:
                 page = page[:-1]
                 result = _serialize(page, staleness, root, limit,
-                                    str(offset + len(page)))
+                                    str(offset + len(page)), total)
                 if len(result.encode("utf-8")) <= PAGE_BUDGET_BYTES:
                     break
 

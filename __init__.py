@@ -215,7 +215,10 @@ _TOOL_SCHEMAS = {
             "root) for a single-file outline; a root-only or path-only call "
             "is invalid. Paged; pass cursor to continue. Returns a "
             "staleness flag: 'partial' means the index may lag in-place "
-            "edits — call code_map_refresh to force a fresh re-scan."
+            "edits — call code_map_refresh to force a fresh re-scan. "
+            "Responses are byte-capped: 'count' is rows on this page, "
+            "'total' is ALL matching rows — always follow 'cursor' until "
+            "a page returns count=0 before treating a set as complete."
         ),
         "parameters": {
             "type": "object",

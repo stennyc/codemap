@@ -105,6 +105,29 @@ def query_symbols(conn: sqlite3.Connection, root: str,
     return conn.execute(query, params).fetchall()
 
 
+def count_symbols(conn: sqlite3.Connection, root: str,
+                  name: Optional[str] = None,
+                  path: Optional[str] = None,
+                  kind: Optional[str] = None) -> int:
+    """Total matching rows across ALL pages (same filters as
+    query_symbols, without LIMIT/OFFSET). Feeds the query-response
+    'total' field so a consumer can tell '22-row page of a 76-row
+    set' (byte-capped page) from 'all 22 rows'.
+    """
+    query = "SELECT COUNT(*) FROM symbols WHERE root = ?"
+    params: list = [root]
+    if name:
+        query += " AND name = ?"
+        params.append(name)
+    if path:
+        query += " AND path = ?"
+        params.append(os.path.abspath(path))
+    if kind:
+        query += " AND kind = ?"
+        params.append(kind)
+    return conn.execute(query, params).fetchone()[0]
+
+
 def stale_paths(conn: sqlite3.Connection, root: str,
                 on_disk) -> set:
     """Return paths in the index that are no longer on disk."""
