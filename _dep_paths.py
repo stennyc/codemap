@@ -96,6 +96,18 @@ def ensure_dep_paths() -> List[str]:
     """
     import sys
 
+    # F5 ruling (owner 2026-11-17, option C — "record the intentional
+    # divergence, do NOT change behaviour"): this resolution is DELIBERATELY
+    # different from config.hermes_home().
+    #   - config.hermes_home() returns the PROFILE home (where the profile's
+    #     data dir lives, e.g. .../hermes/profiles/<name> on this host).
+    #   - _dep_paths needs the INSTALL home — the dir that holds `installs/`
+    #     (the shared managed-venv tree; .../hermes/installs on this host,
+    #     %LOCALAPPDATA%\hermes on Windows) so _find_hermes_managed_venv can
+    #     resolve the canonical venv. Pointing it at the profile home would
+    #     break the lookup (there is no installs/ under a profile home).
+    # So keep HERMES_HOME-env > ~/.hermes here; do NOT "dedup" to
+    # config.hermes_home() — that is a different layer (owner ruling).
     hermes_home = os.environ.get(
         "HERMES_HOME", str(Path.home() / ".hermes")
     )
