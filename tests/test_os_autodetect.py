@@ -428,6 +428,21 @@ def test_is_container_root_blocks_shared_hermes_home(tmp_path, monkeypatch):
     assert config.is_container_root(str(la / "hermes" / "profiles" / "coder"), True) is True
 
 
+def test_is_container_root_blocks_shared_profiles_root(tmp_path, monkeypatch):
+    """F-A (owner 2026-11-17): the SHARED profiles root (LOCALAPPDATA/hermes/
+    profiles, parent of every profile home) is a container root that slipped the
+    exact-match set — hermes_home() returns the PROFILE home, so base/profiles
+    was a phantom and the shared .../hermes/profiles was not a candidate. Now
+    blocked. Subdir-safe: an unrelated profile-home / project UNDER the shared
+    profiles root stays open."""
+    from code_map import config
+    la = tmp_path / "AppData" / "Local"
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    monkeypatch.setenv("HERMES_HOME", str(la / "hermes" / "profiles" / "coder"))
+    assert config.is_container_root(str(la / "hermes" / "profiles"), True) is True
+    assert config.is_container_root(str(la / "hermes" / "profiles" / "other"), True) is False
+
+
 def test_is_transient_dir_blocks_autonomous_ai_agents_class(tmp_path):
     """The skills CLASS dir 'autonomous-ai-agents' (markdown skill docs' parent,
     not a source project) is a transient marker -> never proposed. Over-

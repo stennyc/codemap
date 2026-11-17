@@ -217,6 +217,13 @@ def is_container_root(proj: str, is_windows: bool = False) -> bool:
             # hermes_home() returns on this host. Subdir-safe: only the bare
             # shared home matches, so .../hermes/plugins/<name> stays open.
             candidates.append(Path(la) / "hermes")
+            # F-A (owner 2026-11-17): the SHARED profiles root
+            # (LOCALAPPDATA/hermes/profiles, parent of every profile home).
+            # hermes_home() returns the PROFILE home (.../profiles/coder), so
+            # base/profiles was a phantom and this real shared root was NOT a
+            # candidate (the reviewer's 复盘 gap). Subdir-safe: only the bare
+            # .../hermes/profiles matches, so a profile home under it stays open.
+            candidates.append(Path(la) / "hermes" / "profiles")
     # F3 (owner 2026-11-17): guard home resolution — Path.home() can raise
     # (RuntimeError/OSError) when no home is defined; degrade to skipping the
     # .hermes mirror candidate rather than crashing the whole predicate (which
