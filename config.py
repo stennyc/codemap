@@ -18,8 +18,11 @@ from pathlib import Path
 # gate-table; the user re-affirmed 1500 tokens, so the 6KB value is final.)
 PAGE_BUDGET_BYTES = 6000        # ~1500 tokens
 PAGE_MAX_SYMBOLS = 200          # structural backstop
-# F-minor: query gate is measured on the 5k-file fixture and INCLUDES the B+
-# scandir diff cost.
+# F-minor: query gate is measured on the 5k-file fixture. W1 (780c58a,
+# 2026-11-17): the exact-branch query_ms t0 now starts AFTER the staleness
+# fingerprint walk (on_disk_files + diff_indexed), so the gated window is
+# the query layer only; the walk still runs (staleness reporting unchanged)
+# but no longer inflates the metric (busy-host 133-file walk dominated it).
 QUERY_GATE_MS = 50
 
 # L2.3c (2026-11-17): parser-generation stamp. Cross-generation phantom
