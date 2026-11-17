@@ -533,8 +533,24 @@ def gen_stale_paths(conn: sqlite3.Connection, root: str) -> set:
     deleted is handled by the disk-missing path, not the re-parse set).
     Legacy '' rows (pre-L2.3c, unknown generation) are re-parsed by
     design, so `!= PARSER_GENERATION` is the right shape.
+
+    Separator-normalization: legacy rows were stored with the path
+    separator of the ERA that minted them (forward-slash kernel roots
+    vs backslash registry roots), so a LIKE prefix over the raw root
+    string misses cross-era rows — they would sit gen-stale forever
+    (the code_map target's 4 files, found 2026-11-18). Match on the
+    normalized form (os.sep in the query value, '/' in the stored value)
+    so both separator families are covered.
     """
+    norm = lambda p: p.replace("/", os.sep).replace(os.sep, "/")
+    norm_root = root.replace("/", os.sep).replace(os.sep, "/")
+    # LIKE in BOTH separator families (stored-era keys can be either;
+    # the Python-side prefix filter below enforces exactness — LIKE is
+    # only the narrowing leg).
     rows = conn.execute(
-        "SELECT path FROM files WHERE path LIKE ? AND parser_gen != ?",
-        (f"{root}{os.sep}%", PARSER_GENERATION)).fetchall()
-    return {r[0] for r in rows}
+        "SELECT path FROM files WHERE (path LIKE ? OR path LIKE ?)"
+        " AND parser_gen != ?",
+        ("%" + norm_root + "%",
+         "%" + norm_root.replace("/", os.sep) + "%",
+         PARSER_GENERATION)).fetchall()
+    return {r[0] for r in rows if norm(r[0]).startswith(norm_root + "/")}

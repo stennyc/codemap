@@ -312,10 +312,20 @@ def _run_build(root: str) -> None:
         # confirm build) clears the L2.3c staleness flag instead of
         # re-manufacturing it on every refresh (the kernel BuildScanner
         # already had this; the host path did not — task_95 / L2.8i).
-        gen_stale = gen_stale_paths(conn, root) & on_disk
+        # L2.8k: cross-era separator convergence — intersect on the
+        # NORMALIZED form (legacy forward-slash rows never match a literal
+        # backslash on_disk set), clearing BOTH key families so the
+        # re-parse lands a single row family.
+        raw_stale = gen_stale_paths(conn, root)
+        on_disk_norm = {os.path.normpath(o) for o in on_disk}
+        gen_stale = {os.path.normpath(p) for p in raw_stale
+                     if os.path.normpath(p) in on_disk_norm}
         did_remove = did_remove or bool(gen_stale)
         if gen_stale:
-            remove_paths(conn, gen_stale, commit=False, prune_vocab=False)
+            remove_paths(conn,
+                         set(gen_stale) | {p for p in raw_stale
+                                            if os.path.normpath(p) in on_disk_norm},
+                         commit=False, prune_vocab=False)
         # Parse new/changed files in batches
         batch: list = []
         for fpath in sorted(added | gen_stale):

@@ -278,3 +278,54 @@ def test_refresh_face_note_stays_accurate(monkeypatch, tmp_path):
     assert "clears each stale file" in note and "re-stamps" in note, \
         "the note promises the refresh face clears + re-stamps — L2.8i " \
         "makes that true, so the pin is the contract"
+
+
+# ── 8. L2.8k: cross-era separator convergence ─────────────────────────────
+
+def test_cross_era_separator_gen_stale(monkeypatch, tmp_path):
+    """A legacy row stored under the OTHER separator family (forward-slash
+    kernel-era keys vs the backslash registry root, found live on the
+    code_map target 2026-11-18) must still be gen-detected, its twin key
+    cleared, and the canonical key landed — no double-counted twins.
+    """
+    root = _seed_root(monkeypatch, tmp_path, files=1)
+    _fresh_imports()
+    from code_map import db as cdb, state, config
+
+    p_sep = "\\" if os.name == "nt" else "/"
+    p_canon = f"{root}{p_sep}m0.py"
+    p_era = p_canon.replace(os.sep, "/") if os.name == "nt" else p_canon
+    conn = cdb.init_db(root)
+    try:
+        cdb.upsert_file(conn, p_era, 0.0, 1, "python", "s",
+                        parser_gen="l2.3c-1")
+        cdb.insert_symbols(conn, root, p_era,
+                           [("xera_fn", "function", 1, "def xera_fn():")])
+        conn.commit()
+        raw = cdb.gen_stale_paths(conn, root)
+        assert p_era in raw, (
+            "the cross-era stored key must be gen-detected "
+            f"(got {raw!r} for root {root!r})")
+    finally:
+        conn.close()
+
+    state._run_build(root)
+
+    conn = cdb.init_db(root)
+    try:
+        n_era = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path=?", (p_era,)).fetchone()[0]
+        n_canon = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path=?", (p_canon,)).fetchone()[0]
+        assert n_era == 0, "the legacy twin files key must be cleared"
+        assert n_canon == 1, "the canonical files key must exist"
+        n_sym_twin = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE path=? AND name='xera_fn'",
+            (p_era,)).fetchone()[0]
+        assert n_sym_twin == 0, "twin symbol rows cleared"
+        gen = {r[0] for r in conn.execute(
+            "SELECT DISTINCT parser_gen FROM files")}
+        assert gen == {config.PARSER_GENERATION}, \
+            "single stamped key family after convergence"
+    finally:
+        conn.close()

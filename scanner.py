@@ -60,7 +60,16 @@ class BuildScanner:
         # generation) — re-parsed by design (one-shot self-heal). The
         # re-parse clears the file's rows FIRST (an older generation's
         # orphan rows are not overwritten by INSERT OR REPLACE).
-        gen_stale = gen_stale_paths(conn, self.root) & on_disk
+        # L2.8k: cross-era separator convergence — legacy rows were
+        # stored with the separator of the era that minted them
+        # (forward-slash kernel roots vs backslash registry roots), so a
+        # literal `& on_disk` misses cross-era rows forever. Intersect on
+        # the NORMALIZED form, and clear BOTH key families so the re-parse
+        # lands a single row family (no double-counted twin rows).
+        raw_stale = gen_stale_paths(conn, self.root)
+        on_disk_norm = {os.path.normpath(o) for o in on_disk}
+        gen_stale = {os.path.normpath(p) for p in raw_stale
+                     if os.path.normpath(p) in on_disk_norm}
         batch: List[tuple] = []
         for fpath in sorted(added | gen_stale):
             ext = os.path.splitext(fpath)[1].lower()
@@ -73,7 +82,10 @@ class BuildScanner:
                 # index-driven set op after the loop (the old correlated
                 # prune per gen-re-parsed file was ~15 s/file at the live
                 # 32k-row scale; 136 files ≈ 34 min).
-                remove_paths(conn, {fpath}, commit=False, prune_vocab=False)
+                # L2.8k: clear the normalized key AND the raw stored-era key.
+                remove_paths(conn, {fpath} | {p for p in raw_stale
+                              if os.path.normpath(p) == fpath},
+                             commit=False, prune_vocab=False)
                 did_remove = True
                 self._stats["gen_reparsed"] += 1
             rows = parse_file(fpath)
