@@ -59,6 +59,7 @@ registry.py       data-dir registry
 prune.py          prune stale rows from deleted files
 scanner.py        file-walk + estimation
 _dep_paths.py     venv bootstrap (tree_sitter + grammars)
+dep_install.py    auto-install of missing grammar packages (fail-soft)
 ```
 
 ### Data layout
@@ -82,6 +83,25 @@ pip install tree-sitter tree-sitter-python tree-sitter-typescript \
             tree-sitter-java tree-sitter-dart tree-sitter-c \
             tree-sitter-cpp tree-sitter-php tree-sitter-kotlin
 ```
+
+### Dependency auto-install (fail-soft self-heal)
+
+On every fresh import of the plugin (gateway start, each L3 build
+subprocess), `dep_install.maybe_auto_install()` diffs the installed
+grammars against `registry.SUPPORTED_LANGUAGES` (the complete set
+above) and installs any missing ones into the Hermes-managed venv
+(resolved via `facts.json` — never hardcoded; `uv pip install
+--python <venv>` when `uv` is on PATH, else the venv's own pip).
+Rate-limited by a 24h marker in `data/_dep_autoinstall.json` (the
+marker re-arms when the missing set changes).
+
+Env controls: `CODE_MAP_AUTO_INSTALL=off` disables, `=dry` reports the
+would-run command without installing, `CODE_MAP_AUTO_INSTALL_VENV`
+points the install at an explicit venv root. The test suite pins it
+OFF (`tests/conftest.py`) so a suite run never mutates the real venvs.
+
+Note: a freshly installed grammar is visible to FRESH processes
+immediately; the importing process sees it at its next restart.
 
 ## Running the tests
 

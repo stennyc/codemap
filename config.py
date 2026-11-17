@@ -35,7 +35,9 @@ QUERY_GATE_MS = 50
 # ON EVERY PARSER-OR-GRAMMAR CHANGE (parser.py, grammar installs) so the
 # next build re-parses; the legacy '' stamp (pre-L2.3c dbs) is always
 # stale by design — the first post-upgrade build self-heals them.
-PARSER_GENERATION = "l2.3c-1"
+# l2.8g-1 (2026-11-17): grammar-install generation — dep_install auto-
+# heal landed; the next build re-parses under the wider grammar set.
+PARSER_GENERATION = "l2.8g-1"
 
 # Walk / estimation gate (contract ⑤): pure stat-only walk of a candidate root
 # must complete <2s; above 20k files we warn + invite free-input narrowing.

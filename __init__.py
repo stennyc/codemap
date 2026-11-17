@@ -46,6 +46,34 @@ def _ensure_code_map_dep_paths() -> None:
 _ensure_code_map_dep_paths()
 
 
+def _maybe_auto_install_grammars() -> None:
+    """Fail-soft dep self-heal (owner directive 2026-11-17): when the dep
+    venv lacks tree-sitter grammar packages that code_map needs
+    (registry.SUPPORTED_LANGUAGES is the complete list), attempt a
+    rate-limited install into it (24h marker in the data dir; the marker
+    re-arms when the missing set changes).
+
+    Runs on every fresh import of the plugin — gateway start and each
+    L3 build subprocess (a fresh interpreter re-splices and re-probes).
+    Newly installed grammars are visible to FRESH processes
+    immediately; this process sees them at its next restart (its
+    module imports already happened).
+
+    Env: CODE_MAP_AUTO_INSTALL=off disables; =dry reports the would-run
+    command without installing. A self-heal problem must NEVER break
+    the plugin import — any error is swallowed here (the report dict
+    stays inspectable via dep_install.maybe_auto_install()).
+    """
+    try:
+        from .dep_install import maybe_auto_install
+        maybe_auto_install()
+    except Exception:
+        pass
+
+
+_maybe_auto_install_grammars()
+
+
 def _ensure_fcntl_module() -> None:
     """Make the bare ``import fcntl`` in hook.py/lockfile.py resolvable on Windows.
 
