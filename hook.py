@@ -45,6 +45,7 @@ from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
                     READ_SYMBOL_MAX_BYTES, data_dir, is_container_root,
                     is_system_tree, is_transient_dir, IS_WINDOWS)
+from . import config
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
@@ -1670,6 +1671,7 @@ def _attach_symbols(root: str, file_path: str) -> Optional[str]:
     db_path = root_db_path(root)
     if not db_path.exists():
         return None
+    stamp: Optional[str] = None
     try:
         conn = init_db(root)
         try:
@@ -1682,6 +1684,9 @@ def _attach_symbols(root: str, file_path: str) -> Optional[str]:
             import_rows = query_symbols(conn, root, path=abs_path,
                                        kind="import",
                                        limit=READ_IMPORT_EDGES)
+            # L2.8h: generation + staleness stamp for THIS block (so old
+            # blocks left in history can be ordered by their stamps)
+            stamp = _attach_index_stamp(root, conn)
         finally:
             conn.close()
     except Exception as exc:
@@ -1720,10 +1725,48 @@ def _attach_symbols(root: str, file_path: str) -> Optional[str]:
     cross = _cross_folder_signal(root, file_path, import_rows)
     if cross:
         out = out + "\n" + cross
+    # L2.8h: the stamp line rides AFTER the cross-folder signal, outside the
+    # byte cap — it is the last (most recent) thing the model reads on this
+    # block; a failed stamp query simply drops the line (never breaks the
+    # block).
+    if stamp:
+        out = out + "\n" + stamp
     return out
 
 
 # ── host-facing dispatcher ──────────────────────────────────────────────────
+
+def _attach_index_stamp(root: str, conn) -> Optional[str]:
+    """L2.8h: one-line generation + staleness stamp appended to EVERY attach
+    block (after the cross-folder signal, outside the byte cap).
+
+    Old blocks stay in the conversation history (append-only context — the
+    plugin cannot retract a past tool result); each block carries its OWN
+    stamp (parser generation + row count + index state at read time) so the
+    model can order the snapshots and treat the NEWEST stamp as
+    authoritative.
+
+    Staleness reuses the query face's disk fingerprint walk
+    (query._staleness — the SAME function the code_map_query payloads
+    report, so the attach and query faces never disagree) — but ONLY under
+    the Q3 cap: the indexed-file count (O(1) files-table read) must be
+    <= config.ATTACH_STALENESS_WALK_MAX_FILES, else the walk is SKIPPED
+    and the stamp degrades to 'unknown(large target)' (fail-soft, never
+    a lie about freshness). Owner parallel saves that miss the write-side
+    stamp (plain OS writes fire no tool event) surface here as 'partial'.
+    """
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        n_files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        if n_files > config.ATTACH_STALENESS_WALK_MAX_FILES:
+            status = "unknown(large target)"
+        else:
+            from .query import _staleness
+            status = _staleness(root, conn)
+        return f"index: gen {config.PARSER_GENERATION} · {rows} rows · {status}"
+    except Exception:
+        return None
+
 
 def on_result(
     tool_name: str = "",

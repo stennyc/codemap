@@ -286,6 +286,13 @@ CROSS_FOLDER_LINE_MAX_BYTES = 208
 READ_SELF_SYMBOLS = 30
 READ_IMPORT_EDGES = 8
 READ_SYMBOL_MAX_BYTES = 1500
+
+# L2.8h (owner Q3 ruling 2026-11-17): the attach-block staleness stamp runs
+# the fingerprint disk walk ONLY when the target's indexed file count is
+# within this cap (checked via the files table, O(1) — the walk itself is
+# O(files) and would be too hot on big targets at read frequency). Above
+# the cap the stamp degrades to "unknown(large target)" instead of lying.
+ATTACH_STALENESS_WALK_MAX_FILES = 50_000
 # 档 2 terminal read-signal (owner 2026-10-15): a one-line pointer appended
 # to terminal stdout when a single-file cat/less of a confirmed-target
 # source file is detected. Deliberately a POINT (byte-capped), NOT a full

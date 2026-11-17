@@ -172,7 +172,15 @@ _ROOT_POLICY_TEXT = (
     "concept is absent) — and fall back to whole-tree search_files/grep "
     "only after the bridge returns nothing usable, or when the match is "
     "arbitrary content/regex (the index ranks symbol names, not free "
-    "text). Hard default."
+    "text). Hard default. "
+    "Layer discipline (L2.8h): per-target brief blocks (## name, "
+    "frozen at session start) are the FROZEN layer — a coarse project "
+    "map that may lag the current tree; NEVER source line anchors from "
+    "a brief. The fresh layer is every [code_map] attach block and "
+    "code_map_query payload: each carries its own 'index: gen ... · N "
+    "rows · fresh|partial|...' stamp — order blocks by stamp and trust "
+    "the NEWEST; a 'partial' stamp means the tree moved since that "
+    "snapshot (re-query or refresh before relying on it)."
 )
 
 
@@ -395,8 +403,21 @@ def _register_tools(ctx: Any) -> None:
 
 
 def _register_prompt_section(ctx: Any) -> None:
-    """2B: freeze the root-confirm policy into every new session prompt."""
-    ctx.register_system_prompt_section("code_map_root_policy", _ROOT_POLICY_TEXT)
+    """2B + L2.8h: freeze the root-confirm policy + per-target briefs into
+    every new session prompt.
+
+    L2.8h: the host accepts a section callable — it renders it ONCE per
+    session and freezes the result (byte-stable within the session →
+    prefix-cache stable; re-frozen per new session: owner rule
+    2026-11-17, injection stability > token cost). The callable builds
+    the static policy text + a frozen brief block per confirmed target
+    (entry face / module shape / dependency skeleton / public names —
+    slow variables only, no line anchors). Fail-soft: a brief error
+    degrades to the static policy text only (never a broken section).
+    """
+    from . import brief
+    ctx.register_system_prompt_section(
+        "code_map_root_policy", brief.section_content)
 
 
 # ---- hooks ---------------------------------------------------------------

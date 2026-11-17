@@ -210,6 +210,56 @@ Both shipped in one atomic commit `e04d81f` ("feat(l2.3b+l2.5b)
 root-level kind aggregation + multi-hop seed face"); tool-schema
 descriptions synced in `249f75d`.
 
+## L2.8h (2026-11-18): project brief — frozen project map + stamp/attach alignment
+
+Owner decisions this session: ① the session-start frozen section becomes a
+per-target project BRIEF (map the model uses BEFORE first navigation);
+② the attach-block staleness stamp and the cross-folder signal line align
+to the brief's data layer; ③ the "build an index?" turn-boundary pitch
+default-OFF (stable injection > token cost — prefix-cache premise, gate-5
+`wv_423a8d1b`); ④ no LSP now; campaign re-run after restart.
+
+- **Brief renderer** (`brief.py` `_render_root_brief`): ≤8 data lines + 1
+  map legend, byte-capped ~900B, FROZEN session-start section (stable
+  prefix, cache-friendly; re-frozen only per session start). Lines: path,
+  parser-gen + freshness, kind distribution, module map (dir, top-N
+  files by symbol count, `path, line` order — the L2.3b stable sort),
+  public face (def-side top-N by cross-file heat — the L2.4c ranking
+  product), top cross-folder pairs (import edges; `0 cross-folder edges`
+  for a flat module — no fabricated signal), entry surface (`__init__`
+  exports; `n/a` otherwise). Zero-signal lines are OMITTED (brief is a
+  compressed project map, not a fixed 8-line card). `build_briefs_payload`
+  emits `{target, bytes, lines, content, truncated}` per target, 8KB
+  total cap, 1280B single-line cap; non-confirmed dirs raise
+  `ValueError` (fail-loud, not fail-soft); `hermes_home()` excluded
+  from the section (no self-pollution).
+- **Live filemem render (acceptance sample)**: gen fresh · 32k rows · 1
+  module (filemem, 133 files) · top files db/schema/staleness/facts ·
+  public face top `_utcnow`/`_render`/`load_graph` · 0 cross-folder edges
+  (flat single-package, honest) · no `__init__` export face (n/a).
+- **Attach alignment** (hook.py): the staleness stamp line (fresh /
+  gen partial N rows / stale) now rides on the O(1) files-table count
+  (`n_files > max(0, READ_HEAL_MAX_FILES)` → trust the stamp, skip the
+  O(N) disk walk) instead of a forced walk; a dirty target's stamp says
+  partial WITH row count. The cross-folder signal line renders only when
+  `n_files > 0` (files table authoritative, O(1)) — a zero-signal root
+  omits it (no fabricated `0 edges`).
+- **Gate-② off**: `config.BRIEF_BUILD_PITCH = False` — the pitch is now
+  an explicit opt-in flag (stable-injection premise; the ledger guard
+  machinery stays as the safety net when re-enabled).
+- **Tests**: `tests/test_brief.py` (14, incl. the 8KB/line cap,
+  non-confirmed ValueError, hermes_home exclusion, live filemem smoke);
+  `tests/test_attach_staleness.py` (+2: O(1) skip-walk, dirty partial
+  stamp); `tests/test_cross_folder_signal.py` pin updated (the signal
+  line now requires n_files > 0 — its fixture seeds the files table).
+- **Campaign follow-up (pending restart)**: re-run the S/M campaigns
+  with a BRIEF arm — S: with-brief vs without-brief steps + GT
+  coverage; M: with/without brief attribution split. The no-injection
+  arm needs a plugin-off config + host restart (separate session).
+
+Shipped in `L2.8h` (brief + alignment + gate-②, atomic); suite comm-diff
+zero-regression on the 22-failure baseline.
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path

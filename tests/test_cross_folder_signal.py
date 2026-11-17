@@ -118,9 +118,16 @@ def test_attach_appends_signal_outside_byte_cap():
     target_file = str(Path(root) / "sub_a" / "mod_a.py")
     out = hook._attach_symbols(root, target_file)
     assert out is not None
-    # signal present and is the final line
-    assert out.rstrip().splitlines()[-1].strip().startswith("cross-folder:")
-    last = out.rstrip().splitlines()[-1]
+    # L2.8h contract update: the cross-folder signal is appended AFTER the
+    # byte cap as before, but it is no longer the FINAL line — the
+    # generation+staleness stamp line rides after it (also outside the cap).
+    # The cap invariant on the signal line itself is unchanged.
+    lines = out.rstrip().splitlines()
+    signal = [l for l in lines if l.strip().startswith("cross-folder:")]
+    assert signal, "the cross-folder signal line must be present"
+    assert lines[-1].strip().startswith("index: gen "), \
+        "the L2.8h index-stamp line is now final"
+    last = signal[-1]
     # respects the dedicated signal cap (must not bloat past it)
     # +2 margin: the signal line is never the LAST byte of `out` in practice
     # — the append in _attach_symbols adds a leading "\n" before it, and a
