@@ -162,6 +162,10 @@ TRANSIENT_DIR_NAMES = frozenset({
     "hermes-file-memory-plugin",
     "hermes-code-map",  # skill-dir "不再问" (owner 2026-11-17); distinct from the
                        # code_map PLUGIN (leaf 'code_map', underscore) — no false veto
+    "autonomous-ai-agents",  # skills CLASS dir "永不再问" (owner 2026-11-17 row-2
+                       # ruling): markdown skill docs' parent, never a source project;
+                       # component-match vetoes the whole class (all its skill
+                       # subdirs) — no legitimate source project uses this leaf name
 })
 
 
@@ -208,6 +212,11 @@ def is_container_root(proj: str, is_windows: bool = False) -> bool:
         la = os.environ.get("LOCALAPPDATA")
         if la:
             candidates.append(Path(la))
+            # F6/row-1 (owner 2026-11-17): the SHARED hermes home
+            # (LOCALAPPDATA/hermes) — distinct from the profile home that
+            # hermes_home() returns on this host. Subdir-safe: only the bare
+            # shared home matches, so .../hermes/plugins/<name> stays open.
+            candidates.append(Path(la) / "hermes")
     candidates.append(Path.home() / ".hermes")
     candidates = tuple(str(c) for c in candidates)
     if is_windows:

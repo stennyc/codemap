@@ -411,3 +411,28 @@ def test_is_container_root_blocks_home_dot_hermes_mirror(tmp_path, monkeypatch):
     mirror = home / ".hermes"
     assert config.is_container_root(str(mirror), True) is True
     assert config.is_container_root(str(mirror / "plugins" / "filemem"), True) is False
+
+
+# ── 13. residual gaps: shared home (container root) + skills class dir (owner 2026-11-17) ──
+def test_is_container_root_blocks_shared_hermes_home(tmp_path, monkeypatch):
+    """The SHARED hermes home (LOCALAPPDATA/hermes) is a container root
+    (never proposed), distinct from the profile home that hermes_home()
+    returns on this host. Subdir-safe: a plugin UNDER the shared home stays
+    open; the profile home (hermes_home()) is still blocked too."""
+    from code_map import config
+    la = tmp_path / "AppData" / "Local"
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    monkeypatch.setenv("HERMES_HOME", str(la / "hermes" / "profiles" / "coder"))
+    assert config.is_container_root(str(la / "hermes"), True) is True
+    assert config.is_container_root(str(la / "hermes" / "plugins" / "filemem"), True) is False
+    assert config.is_container_root(str(la / "hermes" / "profiles" / "coder"), True) is True
+
+
+def test_is_transient_dir_blocks_autonomous_ai_agents_class(tmp_path):
+    """The skills CLASS dir 'autonomous-ai-agents' (markdown skill docs' parent,
+    not a source project) is a transient marker -> never proposed. Over-
+    suppression guard: a plain source project (no such component) is NOT blocked."""
+    from code_map import config
+    p = str(tmp_path / "hh" / "profiles" / "coder" / "skills" / "autonomous-ai-agents")
+    assert config.is_transient_dir(p, True) is True
+    assert config.is_transient_dir(str(tmp_path / "myproj"), True) is False
