@@ -230,3 +230,63 @@ def test_stale_paths_reports_on_disk_deletion(tmp_path, monkeypatch):
     assert gone == {os.path.join(root, "a.py")}, (
         f"deleted file must surface in stale_paths; got {sorted(gone)[:3]}"
     )
+
+
+# ── 8. transient-dir never-log guard (owner 2026-11-17 "临时目录永不再问") ─
+def test_is_transient_dir_windows():
+    # transient markers anywhere on the path veto indexing (case-insensitive
+    # on Windows, mirroring is_system_tree):
+    for spell in (
+        "C:\\Users\\me\\AppData\\Local\\hermes\\profiles\\coder\\cache\\scratch",
+        "C:\\Users\\me\\AppData\\Local\\hermes\\profiles\\coder\\cache\\spillover",
+        "C:\\Users\\me\\AppData\\Local\\hermes\\filemem\\handoffs",
+        "C:\\Users\\me\\proj\\__pycache__",
+        "C:\\Users\\me\\x\\CACHE",          # case-insensitive on Windows
+        "C:/Users/me/.venv/cache",          # mixed separators
+    ):
+        assert config.is_transient_dir(spell, True) is True, spell
+    # a real owner source project / plugin is NOT transient:
+    assert config.is_transient_dir("C:\\Users\\me\\proj\\src", True) is False
+    assert config.is_transient_dir(
+        "C:\\Users\\me\\AppData\\Local\\hermes\\plugins\\kbs", True) is False
+
+
+def test_is_transient_dir_posix():
+    for spell in ("/home/me/.cache/x", "/home/me/proj/cache",
+                  "/tmp/scratch", "/var/lib/hermes/handoffs"):
+        assert config.is_transient_dir(spell, False) is True, spell
+    assert config.is_transient_dir("/home/me/proj/src", False) is False
+    # POSIX is case-sensitive: a CACHE dir is NOT the cache marker
+    assert config.is_transient_dir("/home/me/CACHE", False) is False
+
+
+def test_ledger_skips_transient_cache_dir(tmp_path, monkeypatch):
+    """Owner 2026-11-17: a read whose resolved boundary is a transient cache
+    tree (carrying a .git marker, i.e. a 'real' boundary) must NOT mint a
+    ledger row — the transient guard fires on the boundary path itself."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    cache = tmp_path / "proj" / "cache"
+    (cache / ".git").mkdir(parents=True)
+    f = cache / "x.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    _log_unindexed_read("read_file", {"path": str(f)}, "s1")
+    ledger = tmp_path / "hh" / "plugins" / "code_map" / "data" / "_unindexed_read_ledger"
+    text = ledger.read_text().strip() if ledger.exists() else ""
+    assert "cache" not in text, "a transient cache dir must never be offered for indexing"
+
+
+def test_ledger_still_logs_real_project_with_cache_subdir(tmp_path, monkeypatch):
+    """Over-suppression guard: the boundary is only tested, not its
+    subtrees — a real project that merely CONTAINS a cache subdir must still
+    be offered (the boundary is the project root, not the cache dir)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    proj = tmp_path / "myproj"
+    (proj / ".git").mkdir(parents=True)
+    (proj / "cache").mkdir()          # a cache SUBDIR inside the project
+    f = proj / "main.py"
+    f.write_text("def f(): pass\n", encoding="utf-8")
+    _log_unindexed_read("read_file", {"path": str(f)}, "s2")
+    ledger = tmp_path / "hh" / "plugins" / "code_map" / "data" / "_unindexed_read_ledger"
+    text = ledger.read_text() if ledger.exists() else ""
+    assert str(proj) in text, \
+        "a real project with a cache subdir must still be offered (boundary = the project)"

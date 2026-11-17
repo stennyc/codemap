@@ -619,3 +619,19 @@ def test_needs_index_build_question_dead_dir_false_live_true(tmp_path):
         "a live unconfirmed, no-db project must remain genuinely pending"
     assert hook._needs_index_build_question(dead) is False, \
         "a folder that does not exist must not be asked about"
+
+
+def test_needs_index_build_question_transient_is_false(tmp_path):
+    """Owner 2026-11-17 '临时目录永不再问': the ASK gate must treat a LIVE
+    transient cache/data dir as NOT genuinely pending (no build question) —
+    distinct from the deleted-dir case (suppressed by the isdir guard). A
+    live real source project must still be True (no over-suppression)."""
+    from code_map import hook
+    trans = tmp_path / "cache" / "scratch"
+    (trans / ".git").mkdir(parents=True)
+    (trans / "f.py").write_text("def f(): pass\n", encoding="utf-8")
+    live = _make_unconfirmed_project(tmp_path, name="projLiveT")
+    assert hook._needs_index_build_question(str(trans)) is False, \
+        "a live transient cache dir must not be offered for indexing"
+    assert hook._needs_index_build_question(str(live)) is True, \
+        "a live real source project must remain genuinely pending"

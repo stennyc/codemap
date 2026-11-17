@@ -44,7 +44,7 @@ from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
                     READ_SYMBOL_MAX_BYTES, data_dir, is_system_tree,
-                    IS_WINDOWS)
+                    is_transient_dir, IS_WINDOWS)
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
@@ -545,6 +545,14 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         # unguarded (owner workspace, the POSIX /root//home twin).
         if is_system_tree(proj_abs, IS_WINDOWS):
             return
+        # Transient / non-source dir guard (owner 2026-11-17 "临时目录永不再
+        # 问"): a resolved boundary that is a cache/scratch/spillover/
+        # handoffs/pyc tree is never a source project — never mint a row for
+        # it (the 12-row clogged-ledger shape). Distinct from the system-tree
+        # guard above (OS dirs); this is the name-marker "not worth indexing"
+        # class.
+        if is_transient_dir(proj_abs, IS_WINDOWS):
+            return
         if rootreg.is_confirmed_root(proj):
             return
         from .config import root_db_path
@@ -867,6 +875,8 @@ def _needs_index_build_question(proj: str) -> bool:
     into a redundant build question (owner 2026-10-19)."""
     if not os.path.isdir(proj):
         return False  # folder deleted since the read -> dead row, never ask
+    if is_transient_dir(proj, IS_WINDOWS):
+        return False  # transient cache/data tree -> never offered (owner 2026-11-17)
     if rootreg.is_confirmed_root(proj):
         return False
     confirmed = _confirmed_roots()

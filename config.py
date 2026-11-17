@@ -134,6 +134,38 @@ def is_system_tree(root: str, is_windows: bool) -> bool:
             return True
     return False
 
+
+# Never-log transient markers (owner 2026-11-17 "临时目录永不再问" ruling):
+# directory names that, anywhere on a resolved boundary path, mark a
+# transient / non-source location code_map must NEVER propose for indexing —
+# caches, scratch space, handoff data, pyc caches. Distinct from
+# DEFAULT_PRUNE_BLACKLIST (the scanner's "skip this subtree INSIDE a confirmed
+# root"): that prunes a walk; this vetoes the clarify-ledger path outright for
+# a boundary that is a cache/data tree, not a source project. Marker match is
+# case-insensitive on Windows (dirs are case-insensitive there), mirroring
+# is_system_tree.
+TRANSIENT_DIR_NAMES = frozenset({
+    "cache", ".cache", "scratch", "spillover", "handoffs", "__pycache__",
+})
+
+
+def is_transient_dir(path: str, is_windows: bool = False) -> bool:
+    """True when `path` is (or sits under) a transient / non-source directory
+    that must never be proposed for indexing — the owner's 2026-11-17
+    "临时目录永不再问" ruling (the 12-row clogged-ledger shape: hermes's own
+    cache/scratch/spillover/handoffs trees).
+
+    Pure string check (no fs access), separator-agnostic (normalizes both
+    "/" and "\\"). Tests every path component against TRANSIENT_DIR_NAMES; a
+    match means the resolved boundary is inside a cache/data tree, which
+    detect_root could not anchor to a source project (no marker above it).
+    `is_windows` makes the marker match case-insensitive, mirroring
+    is_system_tree; POSIX keeps case. Testable on any host."""
+    comps = [c for c in (path or "").replace("\\", "/").split("/") if c]
+    if is_windows:
+        comps = [c.lower() for c in comps]
+    return any(c in TRANSIENT_DIR_NAMES for c in comps)
+
 # SQLite tuning (contract ⑦): WAL + busy_timeout + per-file single-writer lock.
 WAL_BUSY_TIMEOUT_MS = 5000
 # Tier-1 save-hook debounce: agent writes N files in a burst -> one parse job.
