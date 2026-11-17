@@ -224,8 +224,15 @@ def write_confirmed_root(target: str) -> None:
     duplicate, never a broken confirm.
     """
     abspath = os.path.abspath(target)
-    if abspath == os.sep:
-        raise ValueError("bare filesystem root '/' can never be confirmed")
+    # Bare-root backstop, OS-aware (§6.5 discipline): on POSIX the bare root
+    # is "/" (abspath == os.sep); on Windows the bare roots are the drive
+    # roots ("C:\\" / "C:" / "C:/") — the POSIX-only `== os.sep` check let a
+    # whole-drive confirm slip through on Windows (a bare drive re-roots
+    # onto the CWD drive via abspath, so the marker is invisible post-abspath
+    # unless the RAW input is also checked).
+    if abspath == os.sep or is_bare_fs_root(target, IS_WINDOWS) \
+            or is_bare_fs_root(abspath, IS_WINDOWS):
+        raise ValueError("bare filesystem root can never be confirmed")
     reg = _registry_file()
     reg.parent.mkdir(parents=True, exist_ok=True)
     from .lockfile import write_lock

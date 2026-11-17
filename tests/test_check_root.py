@@ -29,15 +29,25 @@ import pytest
 from code_map.query import code_map_check_root
 
 
+def _tmp_base() -> str:
+    """Platform temp base, standing in for the POSIX '/tmp' boundary the
+    suite was authored on: on POSIX it IS '/tmp' (byte-identical behavior);
+    on Windows it is the real temp dir (drive-qualified — the '/tmp' literal
+    re-roots onto a drive-less '\\tmp' here, which mismatches every
+    production abspath)."""
+    import tempfile
+    return "/tmp" if os.name != "nt" else tempfile.gettempdir()
+
+
 def _mk_proj(dir_name: str) -> Path:
-    p = Path(f"/tmp/cm_check_root_{dir_name}")
-    p.mkdir(exist_ok=True)
+    p = Path(_tmp_base()) / f"cm_check_root_{dir_name}"
+    p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def _mk_home(dir_name: str) -> Path:
-    h = Path(f"/tmp/cm_check_home_{dir_name}")
-    h.mkdir(exist_ok=True)
+    h = Path(_tmp_base()) / f"cm_check_home_{dir_name}"
+    h.mkdir(parents=True, exist_ok=True)
     return h
 
 
@@ -68,7 +78,7 @@ def test_check_root_default_is_dry_run(monkeypatch):
     (proj / "b.py").write_text("class Cb:\n    pass\n")
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name}))
+        {"root": _tmp_base(), "path": proj.name}))
     # dry-run: reports count, does NOT start a build, does NOT write audit
     assert res["dry_run"] is True
     assert res["files_indexable"] == 2
@@ -95,13 +105,16 @@ def test_check_root_yes_writes_audit_and_builds(monkeypatch):
     _cleanup(_mk_home("apply"), _mk_proj("apply"))
     home = _mk_home("apply")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)  # sessionless: the wordlist/gate is exercised in isolation from the C-lite session anchor
     proj = _mk_proj("apply")
     (proj / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NB: the target is deliberately NOT pre-confirmed — a confirmed target
+    # is registry-exempt from the evidence gate (refresh_started), so the
+    # NEW-target path is the one under test.
 
     # No evidence yet -> the gate must REFUSE (fail-closed).
     res0 = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res0["status"] == "blocked_by_policy", res0
     assert len(_audit_lines(home)) == 0, "refused build writes no audit line"
 
@@ -109,7 +122,7 @@ def test_check_root_yes_writes_audit_and_builds(monkeypatch):
     # the host hook records it. Then the gate passes.
     record_clarify_evidence(str(proj), "确认")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["dry_run"] is False
     assert res["status"] == "build_started"
 
@@ -153,12 +166,14 @@ def test_check_root_blocked_by_policy_without_clarify_evidence(monkeypatch):
     from code_map import rootreg
     home = _mk_home("q3blocked")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     proj = _mk_proj("q3blocked")
     (proj / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed: a confirmed target is registry-exempt
+    # from the evidence gate).
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
     assert "clarify" in res["note"], res["note"]
     # a blocked build must NOT have started a background build and must
@@ -168,7 +183,7 @@ def test_check_root_blocked_by_policy_without_clarify_evidence(monkeypatch):
     # The dry-run path is UNCHANGED by the gate (it never builds): it must
     # still work with no evidence.
     dry = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name}))
+        {"root": _tmp_base(), "path": proj.name}))
     assert dry["dry_run"] is True and dry["files_indexable"] == 1
 
     _cleanup(home, proj)
@@ -182,19 +197,20 @@ def test_check_root_rejects_non_affirmative_reply(monkeypatch):
     from code_map.query import record_clarify_evidence
     home = _mk_home("q3neg")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     proj = _mk_proj("q3neg")
     (proj / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed: a confirmed target is registry-exempt).
 
     record_clarify_evidence(str(proj), "再想想，先不动手")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
 
     # A later affirmative reply for the SAME target unlocks it.
     record_clarify_evidence(str(proj), "确认")
     res2 = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res2["status"] == "build_started", res2
     assert len(_audit_lines(home)) == 1
 
@@ -208,12 +224,12 @@ def _aff_case(reply: str, expect: bool, monkeypatch, tag: str) -> None:
     from code_map.query import record_clarify_evidence
     home = _mk_home(tag)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     proj = _mk_proj(tag)
     (proj / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
     record_clarify_evidence(str(proj), reply)
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     if expect:
         assert res["status"] == "build_started", (reply, res)
     else:
@@ -317,14 +333,16 @@ def test_check_root_gate_passes_on_partial_path_evidence(monkeypatch):
     deep = proj / "plugins" / "code_map"
     deep.mkdir(parents=True)
     (deep / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(deep))
+    # NEW target: NOT pre-confirmed — a confirmed target is registry-exempt
+    # from the evidence gate, which would make the partial-path fallback
+    # untestable (the gate never runs).
     # sanity: mentioning just the trailing 2 segments ('plugins/code_map')
     # must match the confirmed target (the RISK #6 fallback)
     q = "要 index 一下 plugins/code_map 吗？"
     assert target_match(q, str(deep)) is True, "trailing-subpath mention must match"
     record_clarify_evidence(str(deep), "确认")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": f"{proj.name}/plugins/code_map", "yes": True}))
+        {"root": _tmp_base(), "path": f"{proj.name}/plugins/code_map", "yes": True}))
     assert res["status"] == "build_started", res
     _cleanup(home, proj)
 
@@ -340,13 +358,13 @@ def test_check_root_evidence_scoped_per_target(monkeypatch):
     pb = _mk_proj("q3scoped_b")
     (pa / "a.py").write_text("def fa(): pass\n")
     (pb / "a.py").write_text("def fa(): pass\n")
-    rootreg.write_confirmed_root(str(pa))
-    rootreg.write_confirmed_root(str(pb))
+    # NEW targets: NOT pre-confirmed — a confirmed target is registry-exempt
+    # from the evidence gate, so the per-target scoping would go untested.
     record_clarify_evidence(str(pa), "确认")  # consent for A only
     resa = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": pa.name, "yes": True}))
+        {"root": _tmp_base(), "path": pa.name, "yes": True}))
     resb = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": pb.name, "yes": True}))
+        {"root": _tmp_base(), "path": pb.name, "yes": True}))
     assert resa["status"] == "build_started", resa
     assert resb["status"] == "blocked_by_policy", resb
     _cleanup(home, pa, pb)
@@ -748,12 +766,14 @@ def test_clarify_c_lite_same_session_evidence_passes(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-clitesame")
     proj = _mk_proj("clitesame")
     (proj / "a.py").write_text("def csl(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target: NOT pre-confirmed — the gate (and its session check)
+    # only runs on new targets; a registry hit would bypass to
+    # refresh_started and the session match would go untested.
 
     # Evidence stamped with the SAME session id the caller runs under.
     record_clarify_evidence(str(proj), "确认", session_id="sess-clitesame")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "build_started", res
     _cleanup(home, proj)
 
@@ -769,12 +789,13 @@ def test_clarify_c_lite_cross_session_evidence_blocked(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-clitex")
     proj = _mk_proj("clitex")
     (proj / "a.py").write_text("def csl(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the cross-session REJECT is a
+    # gate decision, so the target must not be registry-exempt.
 
     # Evidence minted in another session.
     record_clarify_evidence(str(proj), "确认", session_id="sess-other")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
     assert "this session" in res["note"], res["note"]
     _cleanup(home, proj)
@@ -792,7 +813,8 @@ def test_clarify_c_lite_unstamped_line_rejected_under_live_session(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-clilegacy")
     proj = _mk_proj("clilegacy")
     (proj / "a.py").write_text("def csl(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the unstamped-line REJECT is a gate
+    # decision, so the target must not be registry-exempt.
 
     # Hand-written line: explicit session_id=None so it lands UN-STAMPED
     # (the record fn only falls back to the env when session_id is None AND we
@@ -810,7 +832,7 @@ def test_clarify_c_lite_unstamped_line_rejected_under_live_session(monkeypatch):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
     _cleanup(home, proj)
 
@@ -827,12 +849,13 @@ def test_clarify_c_lite_sessionless_degrades_to_legacy(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     proj = _mk_proj("clinone")
     (proj / "a.py").write_text("def csl(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the sessionless DEGRADE (accepting the
+    # un-stamped legacy line) is a gate decision.
 
     # No live session -> record fn stamps session_id=None -> un-stamped line.
     record_clarify_evidence(str(proj), "确认")
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "build_started", res
     _cleanup(home, proj)
 
@@ -848,7 +871,8 @@ def test_clarify_c_mid_valid_signature_passes(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidv")
     proj = _mk_proj("cmidv")
     (proj / "a.py").write_text("def cmv(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the sig-VALID accept is a gate
+    # decision (the registry exemption would bypass to refresh_started).
 
     record_clarify_evidence(str(proj), "确认", session_id="sess-cmidv")
     # Verify the line actually carries a non-None sig.
@@ -859,7 +883,7 @@ def test_clarify_c_mid_valid_signature_passes(monkeypatch):
         f"hook-minted lines must carry a C-mid sig: {recs}"
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "build_started", res
     _cleanup(home, proj)
 
@@ -876,7 +900,8 @@ def test_clarify_c_mid_forged_signature_rejected(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidf")
     proj = _mk_proj("cmidf")
     (proj / "a.py").write_text("def cmf(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the forged-sig REJECT is a gate
+    # decision.
 
     # Forge: correct target + correct session_id, but a bogus signature.
     _evidence_log().unlink(missing_ok=True)
@@ -893,7 +918,7 @@ def test_clarify_c_mid_forged_signature_rejected(monkeypatch):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
     _cleanup(home, proj)
 
@@ -912,7 +937,9 @@ def test_clarify_c_mid_forged_sig_with_live_key_exercises_verify(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-cmidv2")
     proj = _mk_proj("cmidv2")
     (proj / "a.py").write_text("def cmv2(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the sig-MISMATCH reject is a gate
+    # decision (the real line mints the key; the forged line is then
+    # verified and fails on content, not on key absence).
 
     # Step 1: mint a real line -> this forces key generation (first mint).
     record_clarify_evidence(str(proj), "确认", session_id="sess-cmidv2")
@@ -937,7 +964,7 @@ def test_clarify_c_mid_forged_sig_with_live_key_exercises_verify(monkeypatch):
     # Now the key EXISTS, so the gate reaches _verify_evidence_line (the sig
     # mismatch branch) and must reject.
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     assert res["status"] == "blocked_by_policy", res
     _cleanup(home, proj)
 
@@ -954,7 +981,8 @@ def test_clarify_c_mid_null_sig_skip_arm_sessionless(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     proj = _mk_proj("cmidns")
     (proj / "a.py").write_text("def cmns(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the sig=null skip-arm ACCEPT is a
+    # gate decision (sessionless degrade).
 
     # Write a line with sig=null explicitly (the fail-soft unsigned shape).
     _evidence_log().unlink(missing_ok=True)
@@ -971,7 +999,7 @@ def test_clarify_c_mid_null_sig_skip_arm_sessionless(monkeypatch):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     # Sessionless + sig=null -> skip arm accepts (C-lite degrade).
     assert res["status"] == "build_started", res
     _cleanup(home, proj)
@@ -990,7 +1018,8 @@ def test_clarify_c_mid_null_sig_rejected_under_live_session(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "sess-live")
     proj = _mk_proj("cmidns2")
     (proj / "a.py").write_text("def cmns2(): pass\n")
-    rootreg.write_confirmed_root(str(proj))
+    # NEW target (not pre-confirmed): the live-session REJECT of the
+    # un-stamped sig=null line is a C-lite gate decision.
 
     _evidence_log().unlink(missing_ok=True)
     _evidence_log().parent.mkdir(parents=True, exist_ok=True)
@@ -1006,7 +1035,7 @@ def test_clarify_c_mid_null_sig_rejected_under_live_session(monkeypatch):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     res = json.loads(code_map_check_root(
-        {"root": "/tmp", "path": proj.name, "yes": True}))
+        {"root": _tmp_base(), "path": proj.name, "yes": True}))
     # Live session + un-stamped line -> C-lite rejects (session mismatch).
     assert res["status"] == "blocked_by_policy", res
     _cleanup(home, proj)
