@@ -158,6 +158,58 @@ the same machine load — the flake is load-driven and PRE-EXISTING,
 zero regression from this batch. Full-suite comm: no new-side
 failures beyond the two documented load-flake gate timings.
 
+## L2.7.5 (2026-11-18): F7 — the last un-stamped write path (restart acceptance)
+
+The restart-acceptance refresh RE-MANUFACTURED `parser_gen_stale`
+rows: the 3 fresh empty-stamped files were exactly the files the
+owner was editing at the moment, and they are written only by the
+host's `state._commit_batch` path (the scanner + hook paths both
+stamp correctly; the batch commit path upserted the default empty
+stamp, so every host refresh re-stamped changed files and the flag
+never cleared on an actively-edited tree). One-kwarg fix +
+`tests/test_parser_gen_stamp_paths.py`. The live db was cleared by a
+kernel-side `BuildScanner` re-stamp (`gen_reparsed=3` → 133/133
+stamped; the flag flipped to `fresh` on the host face — the query
+face is data-driven, so the data plane clears immediately; the code
+fix activates at the NEXT restart). Restart-acceptance numbers: cold
+host probe 97 ms (one-time DDL included), hot 29–67 ms on the
+62k-row db (gate 150 ms).
+
+## L2.3b + L2.5b (e04d81f): root-level kind aggregation + multi-hop seed face — SHIPPED
+
+Resolves the two L2.6 open findings flagged "仍 open" at line ~193
+above (they were open at L2.4b time; this batch closed both):
+
+- **L2.3b root-level kind aggregation**: `code_map_query(kind=X)`
+  WITHOUT a name now aggregates that kind's rows across the whole
+  target — per-file `path` distribution (the point), a directory
+  `path` narrows to that subtree (LIKE prefix, `os.sep`-aware, a FILE
+  path keeps exact-file semantics), stable `ORDER BY "path,line"` for
+  OFFSET paging, payload `kind_aggregation=true` marker + disclosure.
+  An unknown kind with no name fails LOUDLY with the valid list
+  (kind+name stays the legacy silent-0 path, byte-identical pre-L2.3b).
+  Driven by `idx_symbols_kind (kind, path, line)` in `db.py _SCHEMA`
+  (idempotent backfill on open, zero migration): 35k-row gate <50ms
+  (was a 76ms scan+sort). This kills the L2.6 T-A arm's 128 per-file
+  calls that existed to work around the missing root-level path.
+- **L2.5b seed-file public surface**: `depth=N` even hops now ALSO
+  surface the seed's own def files' def-side public surface at the
+  FIRST even hop — host entry points declared in entry files such as
+  `__init__.py` (the pre-L2.5b arm missed them; the grep arm caught
+  them by close-reading) become reachable. NAMED seeds only (a
+  kind-only L2.3b call cannot be a propagation seed — `depth` needs a
+  name). Seeds with no def-side rows (e.g. a parameter name) get NO
+  seed face (byte-identical pre-L2.5b shape). Dedup by
+  (name, path, line) min hop; payload `seed_face=true` flag +
+  disclosure. Legacy `tests/test_multi_hop.py` expectations updated to
+  the L2.5b contract (depth-2/3 totals +1 seed-face row, truncation
+  total 4→5, cycle total 1→2 — the cycle still TERMINATES, the
+  re-emitted seed row dedups at hop 3). Guard: `tests/test_multi_hop_seed_face.py`.
+
+Both shipped in one atomic commit `e04d81f` ("feat(l2.3b+l2.5b)
+root-level kind aggregation + multi-hop seed face"); tool-schema
+descriptions synced in `249f75d`.
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path
