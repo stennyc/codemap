@@ -436,3 +436,34 @@ def test_is_transient_dir_blocks_autonomous_ai_agents_class(tmp_path):
     p = str(tmp_path / "hh" / "profiles" / "coder" / "skills" / "autonomous-ai-agents")
     assert config.is_transient_dir(p, True) is True
     assert config.is_transient_dir(str(tmp_path / "myproj"), True) is False
+
+
+# ── 14. F3/F4 hardening of is_container_root (owner 2026-11-17 '可以') ──
+def test_is_container_root_survives_home_resolution_failure(tmp_path, monkeypatch):
+    """F3: if Path.home() raises (no home defined) the predicate must NOT crash —
+    it degrades to skipping the .hermes mirror candidate. The LOCALAPPDATA
+    candidate still blocks; the call returns normally (no exception)."""
+    import pathlib
+    import code_map.config as config
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "la"))
+
+    def _boom(cls):
+        raise RuntimeError("no home defined")
+
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(_boom))
+    # does not raise; the LOCALAPPDATA bare candidate still blocks:
+    assert config.is_container_root(str(tmp_path / "la"), True) is True
+    # a non-candidate still returns False (the predicate ran to completion):
+    assert config.is_container_root(str(tmp_path / "la" / "somewhere"), True) is False
+
+
+def test_is_container_root_matches_trailing_separator_target(tmp_path, monkeypatch):
+    """F4: a hand-crafted target carrying a trailing separator
+    ('...\\\\la\\\\') still matches after normalization (rstrip of \\ and /)."""
+    import code_map.config as config
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    la = tmp_path / "la"
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    assert config.is_container_root(str(la) + "\\", True) is True
+    assert config.is_container_root(str(la / "hermes") + "/", True) is True

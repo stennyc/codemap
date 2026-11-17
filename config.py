@@ -217,16 +217,28 @@ def is_container_root(proj: str, is_windows: bool = False) -> bool:
             # hermes_home() returns on this host. Subdir-safe: only the bare
             # shared home matches, so .../hermes/plugins/<name> stays open.
             candidates.append(Path(la) / "hermes")
-    candidates.append(Path.home() / ".hermes")
+    # F3 (owner 2026-11-17): guard home resolution — Path.home() can raise
+    # (RuntimeError/OSError) when no home is defined; degrade to skipping the
+    # .hermes mirror candidate rather than crashing the whole predicate (which
+    # fail-soft would swallow, silently disabling the container guard).
+    try:
+        candidates.append(Path.home() / ".hermes")
+    except (RuntimeError, OSError):
+        pass
     candidates = tuple(str(c) for c in candidates)
+    # F4 (owner 2026-11-17): strip trailing separators from a hand-crafted
+    # target (e.g. "C:\...\hermes\") so it still matches a candidate.
+    want_target = target.rstrip("\\/")
+    if not want_target:
+        want_target = target
     if is_windows:
-        want = target.replace("/", "\\").lower()
+        want = want_target.replace("/", "\\").lower()
         for cand in candidates:
             if want == cand.replace("/", "\\").lower():
                 return True
         return False
     for cand in candidates:
-        if target == cand:
+        if want_target == cand:
             return True
     return False
 
