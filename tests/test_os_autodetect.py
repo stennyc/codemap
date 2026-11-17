@@ -383,3 +383,31 @@ def test_is_container_root_no_longer_mkdirs(tmp_path, monkeypatch):
     assert not target.exists()
     assert config.is_container_root(str(target), True) is True
     assert not target.exists(), "is_container_root must not mkdir (F1)"
+
+
+# ── 12. F5: residual container roots (AppData\Local bare + .hermes mirror) ──
+def test_is_container_root_blocks_localappdata_bare(tmp_path, monkeypatch):
+    """F5: the OS local-app-data BARE root (LOCALAPPDATA) is a container root
+    (never proposed), derived from the live env (not hardcoded). Subdir-safe:
+    a sub-project UNDER it (e.g. .../AppData/Local/hermes/plugins/filemem)
+    stays open."""
+    from code_map import config
+    la = tmp_path / "AppData" / "Local"
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    monkeypatch.setenv("HERMES_HOME", str(la / "hermes"))
+    assert config.is_container_root(str(la), True) is True
+    assert config.is_container_root(str(la / "hermes" / "plugins" / "filemem"), True) is False
+
+
+def test_is_container_root_blocks_home_dot_hermes_mirror(tmp_path, monkeypatch):
+    """F5: the home-dir .hermes relay/phantom mirror is a container root
+    (never proposed), derived from Path.home() (not hardcoded). Subdir-safe:
+    a plugin UNDER the mirror stays open."""
+    from code_map import config
+    home = tmp_path / "userhome"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    mirror = home / ".hermes"
+    assert config.is_container_root(str(mirror), True) is True
+    assert config.is_container_root(str(mirror / "plugins" / "filemem"), True) is False

@@ -185,19 +185,31 @@ def is_transient_dir(path: str, is_windows: bool = False) -> bool:
 
 def is_container_root(proj: str, is_windows: bool = False) -> bool:
     """True when `proj` is EXACTLY one of the hermes-internal BARE container
-    roots — HERMES_HOME itself, or HERMES_HOME/profiles — the 'never propose
-    indexing the whole container' case (owner 2026-11-17 '子目录安全的容器根
+    roots — HERMES_HOME itself, HERMES_HOME/profiles, and (F5, owner 2026-11-17)
+    the OS local-app-data BARE root (Windows, from LOCALAPPDATA) and the
+    home-dir .hermes relay/phantom mirror (both OSes, from Path.home()) —
+    the 'never propose indexing the whole container' case ('子目录安全的容器根
     屏蔽'). Subdirectory-safe by construction: only the bare root matches
     (exact, separator/case-normalized comparison on Windows); a sub-project
-    UNDER the container (e.g. .../hermes/plugins/filemem) is NOT a container
-    root and stays indexable. The roots are DERIVED from the live HERMES_HOME
-    via the pure hermes_home() base accessor (no mkdir side-effect, no
-    3-level layout coupling — owner 2026-11-17 F1/F2), never hardcoded."""
+    UNDER any of them (e.g. .../hermes/plugins/filemem) is NOT a container
+    root and stays indexable. All roots are DERIVED from live env/home
+    (hermes_home() + LOCALAPPDATA + Path.home()), never hardcoded."""
     target = (proj or "").strip()
     if not target:
         return False
     base = hermes_home()
-    candidates = (str(base), str(base / "profiles"))
+    candidates = [base, base / "profiles"]
+    # F5 (owner 2026-11-17): the two residual 12-row-clog container roots —
+    # the OS local-app-data BARE root (Windows, from the live LOCALAPPDATA
+    # env, not hardcoded) and the home-dir .hermes relay/phantom mirror
+    # (both OSes, from Path.home(), not hardcoded). Subdir-safe: only the
+    # bare root matches, so a sub-project under any of them stays open.
+    if is_windows:
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            candidates.append(Path(la))
+    candidates.append(Path.home() / ".hermes")
+    candidates = tuple(str(c) for c in candidates)
     if is_windows:
         want = target.replace("/", "\\").lower()
         for cand in candidates:
