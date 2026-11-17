@@ -49,6 +49,37 @@ L2.3c (`PARSER_GENERATION` stamp, commit 8f2a4b9) re-parsed all 5 confirmed targ
 
 Caliber: single kernel probe (agent venv, the tree-sitter-python 0.25.0 build), snapshot-locked source; the exact writer of the original 58 phantom rows is unidentifiable (the grammar build that produced them is no longer resolvable) — the stamp makes the class unreproducible in future generations regardless.
 
+## L2.7.2 (2026-11-18): L2.4c def-side heat — T-B 2/5 → 5/5
+
+Mechanism (one ORDER term, query layer only — no reparse, no schema
+change): `ORDER BY ... CASE WHEN defmark=0 THEN -occ ELSE occ END`.
+Def-side candidates rank by cross-file heat (occ DESC); usage-side-only
+candidates keep the L2.4 rarity direction (occ ASC). Disclosure synced
+on all three recall faces (payload / tool schema / fuzzy text).
+Contract update in-suite: `test_fuzzy_prefix_tier_ranked_by_rarity`
+→ `test_fuzzy_prefix_def_side_ranked_by_heat` (the old pin WAS the
+inversion); new `tests/test_concept_ranking_heat.py` (3 tests:
+def-side heat lead, usage-side rarity kept, degraded gate-④ path
+untouched). Full-suite comm vs stash baseline: **0 new failures**.
+
+Live T-B (filemem, same 5 concepts as L2.7):
+
+| concept | L2.7 top-1 | L2.7.2 top-1 |
+|---|---|---|
+| stale | `is_stale` ✓ | `_graph_pull_if_stale` (occ 18) ✓ |
+| draft | `draft` ✓ | `draft` (tier-1 exact still wins) ✓ |
+| bringback | half (gate at #2) | `_bringback_choice_path` (occ 48) — clean |
+| supersede | **miss** (test names) | `_supersede_confirm_candidates` (occ 42), `confirm_supersede` #2 — clean |
+| consolidation | **miss** (fixture/param) | `_spawn_llm_consolidation` (occ 43) — clean |
+
+**Clean top-1 hits: 2/5 → 5/5.** Both ranking-layer misses (the
+L2.7 test-name inversion) are gone; every top-1 is a def-side
+production name. Cold probe latencies 200-250 ms (fresh-process +
+WAL warmup included); the new term is a plain expression over
+existing aggregates, so hot in-gate numbers are unchanged
+(L2.7.1 warm 77-86 ms stands). L2.4c-perf remains WATCH (re-measure
+gate④ under load only).
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path

@@ -58,8 +58,9 @@ def _seed(root: str, rows_by_path: dict) -> None:
     rootreg.write_confirmed_root(root)
 
 
-# one shared fixture shape: 'rebuild' is COMMON (3 rows), 'rebuild_dirty'
-# is RARE (1 row) -> rarity must rank rebuild_dirty above plain rebuild.
+# one shared fixture shape: 'rebuild' is HOT (3 def rows), 'rebuild_dirty'
+# is UNIQUE (1 def row) -> L2.4c def-side heat ranks rebuild above
+# rebuild_dirty (pre-2.4c this pinned the inverted rarity order).
 ROWS = {
     "a.py": [
         ("rebuild", "function", 1, "def rebuild(x)"),
@@ -99,7 +100,7 @@ def test_exact_path_unchanged_without_fuzzy(tmp_path, monkeypatch):
 
 
 # ── tier semantics ─────────────────────────────────────────────────────────
-def test_fuzzy_prefix_tier_ranked_by_rarity(tmp_path, monkeypatch):
+def test_fuzzy_prefix_def_side_ranked_by_heat(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
     root = str(tmp_path / "proj")
     _seed(root, ROWS)
@@ -114,8 +115,13 @@ def test_fuzzy_prefix_tier_ranked_by_rarity(tmp_path, monkeypatch):
                for s in p["symbols"] if s["name"] == "rebuild"), p["symbols"]
     # all tier 2 (prefix) — no exact, no substring for this token
     assert all(t == 2 for t in tiers), list(zip(names, tiers))
-    # rarity: rebuild_dirty (1 row) ranks ABOVE rebuild (3 rows)
-    assert names[0] == "rebuild_dirty", names
+    # L2.4c side-split: both are DEF-side (function decls) → cross-file
+    # heat ranks the hot one (rebuild, occ=3) above the unique one
+    # (rebuild_dirty, occ=1). (Pre-2.4c this test pinned the inversion:
+    # rarity-first put rebuild_dirty above the hot def. Usage-side
+    # rarity is pinned separately in test_concept_ranking_heat.)
+    assert names[0] == "rebuild", names
+    assert names[1] == "rebuild_dirty", names
 
 
 def test_fuzzy_exact_beats_prefix(tmp_path, monkeypatch):

@@ -211,8 +211,15 @@ def _concept_rank_sql(tokens: list, where: str, wparams: list,
     One candidate per distinct NAME (a 6-row call_site family is ONE
     candidate with occ=6 — the T-B drown fix). ORDER: strong hits DESC
     (a name that matches every concept word beats one that matches a
-    single word), then tier ASC, then def-side before usage, then rarity
-    (rare names first — the original L2.4 accuracy guard), then name.
+    single word), then tier ASC, then def-side before usage, then the
+    SIDE-SPLIT 4th term (L2.4c): def-side candidates rank by occ DESC
+    (cross-file heat — a production symbol used across many files is
+    the answer a concept bridge should surface; the L2.7 locked
+    retest proved the pre-2.4c `occ ASC` rarity term inverted this: a
+    unique `test_*` def with occ=1 beat a 28-row production def),
+    while usage-side-only candidates keep occ ASC (rarity — the
+    original L2.4 accuracy guard, still correct on pure usage
+    families), then name.
 
     `rarity=False` is the large-candidate-set path (gate ④,
     CONCEPT_RARITY_MAX_CANDIDATES): the per-name aggregates (occ / hits /
@@ -258,7 +265,8 @@ def _concept_rank_sql(tokens: list, where: str, wparams: list,
             " MIN(c.tier) AS tier, MIN(c.hits) AS hits, COUNT(*) AS occ,"
             f" MIN(CASE WHEN {_DEF_SIDE_SQL}"
             " THEN 0 ELSE 1 END) AS defmark, MIN(c.line) AS minline")
-        order = "ORDER BY hits DESC, tier, defmark, occ, ln"
+        order = ("ORDER BY hits DESC, tier, defmark,"
+                 " CASE WHEN defmark = 0 THEN -occ ELSE occ END, ln")
         tail = (" SELECT root, name, ln, tier, hits, occ, defmark, minline"
                 " FROM ranked " + order + " LIMIT ? OFFSET ?")
         ranked_params = (tparams + wparams + list(_DEF_SIDE_KINDS)
