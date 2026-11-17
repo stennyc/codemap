@@ -17,6 +17,28 @@ Owner-gated performance gates + campaign data. Gate numbers are hard:
   2,700 files) was the G2/WALK_GATE_S origin; see
   `docs/owner_rulings/2026-11-05-walk-gate.md`.
 
+## L2.7 campaign (2026-11-17): 锁源快照 T-B 重测 + T3 回归 + gate 实测
+
+**Snapshot lock (owner ruling "锁源快照重测 T-B"):** filemem source = git `0ce8e63` clean, 132 .py files, 0 files modified in the prior 30 min at lock time. The L2.6 "source drift" excuse (dirty/supersede/bringback families refactored out mid-campaign) is removed: every number below is against this one snapshot. Index arm = disk-side L2.4b+L2.3b+L2.5b code, fresh kernel probe.
+
+**T-B (5 concepts, top-3 hit rate vs AST-computed name families):**
+
+| concept | clean hit | top-3 (tier/defside) | verdict |
+|---|---|---|---|
+| stale | `is_stale` #1 (T2) | is_stale / 2× test_* | HIT |
+| draft | `draft` #1 (T1 exact) | draft / 2× test helpers | HIT (exact; answer family _save/_load_session_drafts not in top-3) |
+| bringback | — | test helper / `_bringback_white_sheet_active` (prod gate) / test helper | PARTIAL (a prod mechanism name in top-3, the choice-setter functions below) |
+| supersede | — | 3× test names | MISS |
+| consolidation | — | test fixture / `consolidation_interval_min` (param, usage-side) / test name | MISS |
+
+Score **2/5 clean** (L2.6 baseline 1/5, but not comparable — drift removed). **Both misses are ranking-only**: every answer name is in the index with heavy coverage (confirm_supersede 28 rows, _tool_supersede 47, _llm_consolidate 55, _observe_consolidate 69, _set_bringback_choice 72 — verified by exact-name query). New defect class: **test-name rarity inversion** — unique `test_*` names (occ=1 → max rarity) outrank hot production names whose many USAGE rows make them "common" under the current rarity signal; the rarity direction inverts the def-side importance signal. Register: **L2.4c-ranking**.
+
+**T3 regression (min_score kwarg_usage, full cursor walk) — FAILED:** index 131 rows vs AST ground truth 76 rows on the 0ce8e63 snapshot. tests/ + tools/ files match the GT per-file distribution EXACTLY; the divergence is confined to `__init__.py` (18,776 lines): index 58 kwarg rows vs GT 3. Phantom profile: all 58 rows carry the identical sig `min_score=self.min_search_score` scattered over L4635–L12974 where the current source holds unrelated code; only L4647/L12886/L12892 contain the real kwarg. Single root string (AppData form), no duplicate (line) groups → not append-without-replace, not root-form contamination: it is parser-generation line corruption on the big file. `staleness=fresh` is BLIND to this (files-table mtime matches disk; the corruption lives in the symbol rows). This is the quantified instance of the L2.6 gap ③ "big-file phantom rows" (previously observed at L10034, unmarked-unverified). Register: **L2.3c-phantom** (detect tree-sitter error nodes / chunk-parse the 18k-line file / flag unverified rows / make staleness see parser generation).
+
+**Gate measurements (payload `query_ms`, the gate-object):** fuzzy full-aggregation (22–57 candidates, 35k-row root): stale 323 / supersede 477 / draft 399 / bringback 314 / consolidation 411 ms — **all breach the 150 ms concept gate**. The 20k-row gate test passes because its fixture trips gate ④ (degraded aggregates); a live root with MODERATE candidate counts keeps full aggregates ON at 35k rows = the untested worst case. Register: **L2.4c-perf** (calibrate gate ④ on table size, or fold the per-name aggregates into one GROUP-BY pass).
+
+Caliber: n=1 arm, kernel probe (no host tool face — the 01:04 gateway predates L2.4b), single snapshot; wall times include per-call connection open (gate-object = `query_ms` only).
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path
