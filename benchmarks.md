@@ -258,12 +258,37 @@ LSP now; ⑤ campaign re-run after the next gateway restart.
   re-enabled). `tests/test_gate2_pitch_off.py` (2: default-off skip +
   opt-in restore via the REAL ledger API — `_post_tool_call` mints the
   row, `on_pre_llm_call` gates it).
-- **Campaign follow-up (pending restart)**: re-run the S/M campaigns
-  with a BRIEF arm — S: with-brief vs without-brief steps + GT coverage
-  (does the frozen map replace exploratory grep?); M: attribution split
-  (how much of the M-INDEX win is attach vs query face vs brief). The
-  no-injection arm needs a plugin-off config + host restart (separate
-  session).
+- **Campaign re-run DONE (2026-11-17 18:51, post-restart + full re-stamp;
+  `deleg_e5db5184`, 5 arms, scored from TRANSCRIPT tool lines — child
+  self-reports undercounted again, e.g. M+brief self-reported 1 call vs
+  34 actual; the no-injection arm remains the only unrun arm and needs
+  the plugin-off config + restart)**: on the RE-STAMPED index (all 5
+  targets 100% current-gen, zero `parser_gen_stale` / `partial`
+  occurrences in any of the 5 logs — the stale-flag disclosure overhead
+  the pre-re-stamp arms carried is gone), M task = `include_superseded`
+  plan (re-verified green pre-launch; GT = 7 must-change faces + DP-1,
+  `cm_campaign_gt2.json`):
+
+  | arm | tool calls | wall | code_map | GT faces |
+  |---|---|---|---|---|
+  | S+brief | **9** | 92 s | 3 | structure GT full (10 modules incl. the 7 GT ones, entry face, 8 dep edges) |
+  | S-plain | 24 | 217 s | 4 | structure GT full |
+  | M+brief | 34 | 362 s | 11 | 7/8 (missed the test-pin file) |
+  | M-plain | 35 | 404 s | 7 | **8/8 + plan artifact written to scratch** |
+  | M-grep | 22 | 235 s | 0 (compliant) | 6/8 (missed dispatch + test pin) |
+
+  Reading: (1) the BRIEF effect in the S regime HOLDS on the clean
+  index (9 vs 24 = −63%, same direction as the 5 vs 17 pre-re-stamp
+  run — the frozen map still replaces exploratory navigation; S+brief
+  used only 3 code_map calls). (2) In the M regime the brief did NOT
+  cut steps this run (34 vs 35 — the prior campaign's 20 vs 29 was
+  run variance at n=1, not a stable brief advantage); M-plain took the
+  GT-completeness crown (8/8 + on-disk artifact) and M-grep the
+  speed crown (22 calls, 6/8). (3) No arm hit the LSP ceiling; the
+  M plans' DP-1 decision point (append-after-scoring vs in-pool)
+  surfaced in all three M arms — the owner's open design choice
+  stands. Host probes this session: exact `min_score` 0 ms / fuzzy
+  `supersede` 55 ms at the current table size (in-gate).
 - Suite comm-diff zero-regression on the 22-failure baseline (full suite
   22 failed / 325+ passed; all 22 = the POSIX-layout environment class).
 
