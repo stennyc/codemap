@@ -41,7 +41,7 @@ Caliber: n=1 arm, kernel probe (no host tool face — the 01:04 gateway predates
 
 ## L2.7.1 (2026-11-17, same day): L2.3c parser-generation stamp — the phantom rows are gone
 
-L2.3c (`PARSER_GENERATION` stamp, commit TBD below) re-parsed all 5 confirmed targets one-shot (legacy `''` stamp = self-heal, no wipe ritual): code_map 51 / filemem 132 / intent-router 5 / kbs 63 / supercompress 106 files, `gen_reparsed` = full set each. Results on the locked `0ce8e63` snapshot:
+L2.3c (`PARSER_GENERATION` stamp, commit 8f2a4b9) re-parsed all 5 confirmed targets one-shot (legacy `''` stamp = self-heal, no wipe ritual): code_map 51 / filemem 132 / intent-router 5 / kbs 63 / supercompress 106 files, `gen_reparsed` = full set each. Results on the locked `0ce8e63` snapshot:
 
 - **T3 regression FIXED**: `min_score` kwarg_usage `__init__.py` 58 → **3** (= AST GT), total 131 → **76** (= GT), per-file distribution exact. `staleness=fresh` now with all files stamped `l2.3c-1`. filemem table 35,000 → 32,011 rows (2,989 stale-generation rows cleared, min_score's 55 phantoms among them).
 - **T-B on the clean db**: clean top-3 hits **4/5** (up from 2/5 on the phantom-burdened db): supersede's `_tool_supersede` climbed into top-3; all three bringback top-3 entries are production mechanism names (`_bringback_fresh` / `_bringback_hydrate_persisted` / `_bringback_white_sheet_active`); stale/draft unchanged (is_stale #1, exact `draft` #1). The test-name rarity inversion (L2.4c-ranking) persists only in its MILDER form: unique test names still beat `confirm_supersede` for top-1 on supersede/consolidation.
