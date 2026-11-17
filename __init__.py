@@ -178,9 +178,12 @@ _ROOT_POLICY_TEXT = (
     "map that may lag the current tree; NEVER source line anchors from "
     "a brief. The fresh layer is every [code_map] attach block and "
     "code_map_query payload: each carries its own 'index: gen ... · N "
-    "rows · fresh|partial|...' stamp — order blocks by stamp and trust "
-    "the NEWEST; a 'partial' stamp means the tree moved since that "
-    "snapshot (re-query or refresh before relying on it)."
+    "rows · fresh|partial|parser_gen_stale' stamp — order blocks by "
+    "stamp and trust the NEWEST; a 'partial' stamp means the tree moved "
+    "since that snapshot (re-query or refresh before relying on it); a "
+    "'parser_gen_stale' stamp means some files were indexed under an "
+    "older parser generation (code_map_refresh re-parses + re-stamps "
+    "them — the flag heals on refresh)."
 )
 
 
@@ -256,8 +259,14 @@ _TOOL_SCHEMAS = {
             "root+path (path relative to root, or an absolute path inside "
             "root) for a single-file outline; a root-only or path-only call "
             "is invalid. Paged; pass cursor to continue. Returns a "
-            "staleness flag: 'partial' means the index may lag in-place "
-            "edits — call code_map_refresh to force a fresh re-scan. "
+            "staleness flag with three values: 'fresh' (in sync), "
+            "'partial' (the index may lag in-place edits), or "
+            "'parser_gen_stale' (some files were indexed under an "
+            "OLDER parser generation — their rows may be phantom). "
+            "On either non-fresh value, call code_map_refresh: the "
+            "re-scan catches up in-place edits AND re-parses + "
+            "re-stamps generation-drifted files, so the flag heals "
+            "on refresh. "
             "Responses are byte-capped: 'count' is rows on this page, "
             "'total' is ALL matching rows — always follow 'cursor' until "
             "a page returns count=0 before treating a set as complete. "
@@ -347,7 +356,9 @@ _TOOL_SCHEMAS = {
             "Authoritative re-scan of a CONFIRMED index target. Pass the "
             "same (root, path) pair used at confirm time, or root_path as "
             "the full stored target. Unconfirmed targets are rejected. "
-            "Async, non-blocking."
+            "Also clears parser-generation drift: files indexed under an "
+            "older parser generation are re-parsed and re-stamped, so a "
+            "parser_gen_stale flag heals on refresh. Async, non-blocking."
         ),
         "parameters": {
             "type": "object",

@@ -334,3 +334,40 @@ def test_fuzzy_param_doc_carries_l24c_split(monkeypatch, tmp_path):
         "fuzzy"]["description"]
     assert "heat" in doc, doc  # the def-side term must be visible
     assert "defside->rarity" not in doc, doc  # the stale flat-rarity wording is gone
+
+
+# ── Recall-surface sync pins (L2.8i era, 2026-11-18) ──────────────────────
+
+def test_staleness_doc_names_three_values_and_refresh_heal():
+    """The model-facing query description must name ALL THREE staleness
+    values (the pre-sync face knew only 'partial' — the model would meet
+    parser_gen_stale stamps without a legend) and state the L2.8i
+    remedy semantics (refresh re-parses + re-stamps the drift, so the
+    flag heals on refresh). Same F2 discipline: read the LIVE schema
+    surface so a rewrite cannot silently regress the contract."""
+    _fresh_imports()
+    import code_map
+    qdoc = code_map._TOOL_SCHEMAS["code_map_query"]["description"]
+    for val in ("'fresh'", "'partial'", "'parser_gen_stale'"):
+        assert val in qdoc, f"staleness value {val} missing from the query face"
+    assert "parser_gen_stale" in qdoc and "heal" in qdoc.lower(), \
+        "the refresh-remedy semantics must be visible on the query face"
+    assert "force a fresh re-scan" not in qdoc, \
+        "the stale two-value-era wording must be gone"
+    rdoc = code_map._TOOL_SCHEMAS["code_map_refresh"]["description"]
+    assert "parser-generation drift" in rdoc, \
+        "the refresh face must state what it ALSO clears (L2.8i)"
+    assert "re-stamped" in rdoc
+
+
+def test_root_policy_legend_names_parser_gen_stale():
+    """The frozen root-policy legend (injected at session start) must
+    carry the three-valued stamp legend — the pre-sync ellipsis
+    'fresh|partial|...' left the third value unexplained."""
+    _fresh_imports()
+    import code_map
+    legend = code_map._ROOT_POLICY_TEXT
+    assert "parser_gen_stale" in legend, \
+        "the legend must name the third staleness value"
+    assert "fresh|partial|..." not in legend, \
+        "the ellipsis form must be gone (all values spelled out)"
