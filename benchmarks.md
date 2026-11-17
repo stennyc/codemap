@@ -80,6 +80,56 @@ existing aggregates, so hot in-gate numbers are unchanged
 (L2.7.1 warm 77-86 ms stands). L2.4c-perf remains WATCH (re-measure
 gate④ under load only).
 
+## L2.7.3 (2026-11-18): L2.4d name-vocabulary pre-filter — idle 214ms → 73ms
+
+Table growth (35k → 61,761 rows on the live filemem db while the source
+kept moving) had taken the fuzzy path back OUTSIDE the 150 ms gate at
+IDLE (no load at all — p50 214 / max 303; the L2.7.1 warm 77–86 ms
+numbers were measured at 32k rows). Stage decomposition: count_concept
+125 ms + rank 109+62 ms (after the vocab pre-filter) + rep — the
+concentration point was the pre-L2.4d plan walking the root's WHOLE
+symbols prefix via the PK (`SEARCH s USING INDEX sqlite_autoindex_
+symbols_1 (root=?)`, 61,761 rows) with a per-row vocab probe.
+
+L2.4d (query layer only, no reparse):
+1. `name_vocab(root, lname)` table — the distinct-name vocabulary
+   (~2,990 rows here): the tier-3 substring net pre-filters over
+   O(distinct names) instead of O(symbol rows); maintained by
+   `insert_symbols` (INSERT OR IGNORE, per-batch dedupe) + one-shot
+   `init_db` backfill (gate: vocab empty). Orphaned rows after a full
+   rescan are JOIN-excluded (bounded, harmless).
+2. `idx_symbols_root_lname ON symbols(root, lower(name))` — flips the
+   rank leg's plan to per-name index ranges (rank 109 → 62 ms) and
+   makes the representative-row IN index-driven (rep 62 → ~0 ms).
+
+Measured on the 61,761-row live db (isolated copy, warm):
+
+| stage | pre-L2.4d | post |
+|---|---|---|
+| count_concept | 125 ms | **0 ms** (vocab leg) |
+| rank sql | 109 ms (plan: whole-root PK walk) | **62 ms** (plan: per-name ranges) |
+| rep sql | 62 ms | **~0 ms** (index-driven IN) |
+| full idle p50 / max | 214 / 303 ms (BREACH) | **73 / 114 ms (compliant)** |
+
+T-B byte-identity: all 5 top-1s UNCHANGED vs the L2.4c era
+(`_graph_pull_if_stale` / `draft` / `_bringback_choice_path` /
+`_supersede_confirm_candidates` / `_spawn_llm_consolidation`) — the
+candidate set is provably identical (vocabulary is an exact distinct-
+name projection; the per-name aggregates run over the same row
+families via the JOIN). The filtered leg (path/kind set) stays on the
+symbols scan (the vocabulary has no path/kind columns).
+
+Test suite: `tests/test_name_vocab.py` (7: backfill / maintenance /
+EXPLAIN fast-leg shape / two-leg byte-identity / stale-row harmlessness
+/ predicate byte-identical / index-exists). Full-suite comm vs stash
+baseline: zero new failures (the two gate-timing tests that fail in
+batch runs pass standalone — the documented load-flake class).
+
+Effect rule: DDL is `CREATE ... IF NOT EXISTS` — the live dbs pick up
+name_vocab + the composite index on the next `init_db` open by CURRENT
+code (the running gateway's stale in-memory module creates nothing; the
+query DATA face stays on the old plan until the next restart).
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path

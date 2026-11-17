@@ -43,6 +43,27 @@ CREATE INDEX IF NOT EXISTS idx_symbols_lname ON symbols(lower(name));
 -- (equality prefix + ordered tail, no sort at 35k-row scale) and the
 -- subtree LIKE path-prefix leg (index range scan inside the kind).
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind, path, line);
+-- L2.4d concept pre-filter (2026-11-18): the distinct lower-case name
+-- vocabulary per root (~3k rows against a 62k-row symbols table). The
+-- no-path/no-kind concept leg pre-filters the tier-3 substring net over
+-- THIS table (O(distinct names)) instead of scanning every symbol row,
+-- then JOINs back to symbols via idx_symbols_lname (the candidate set
+-- is byte-identical: a name passes the net on the vocabulary iff some
+-- row passes it). Maintained by insert_symbols (INSERT OR IGNORE) and
+-- backfilled by init_db for legacy dbs; orphaned rows left by a full
+-- rescan are JOIN-excluded (bounded, documented — the cost is one
+-- stale row per ever-seen name, not a scan).
+CREATE TABLE IF NOT EXISTS name_vocab (
+    root  TEXT NOT NULL,
+    lname TEXT NOT NULL,
+    PRIMARY KEY (root, lname)
+);
+-- L2.4d composite index: per-name ranges WITHIN a root. Drives the
+-- concept rank leg's vocab->symbols JOIN (the pre-L2.4d plan walked the
+-- root's WHOLE symbols prefix via the PK + a per-row vocab probe —
+-- 109ms at 62k rows) and the representative-row IN (62ms -> ~0ms:
+-- each name is a (root, lower(name)) index range now).
+CREATE INDEX IF NOT EXISTS idx_symbols_root_lname ON symbols(root, lower(name));
 """
 
 
@@ -66,6 +87,16 @@ def init_db(root: str) -> sqlite3.Connection:
     if "parser_gen" not in cols:
         conn.execute(
             "ALTER TABLE files ADD COLUMN parser_gen TEXT NOT NULL DEFAULT ''")
+    # L2.4d one-shot backfill: legacy dbs carry symbols WITHOUT name_vocab
+    # rows; populate them exactly once (gate = vocab still empty).
+    # Fresh/maintained dbs skip (the gate is false), and orphaned vocab
+    # rows from a full rescan stay harmless (JOIN-excluded, schema note).
+    n_vocab = conn.execute("SELECT COUNT(*) FROM name_vocab").fetchone()[0]
+    n_sym = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+    if n_vocab == 0 and n_sym > 0:
+        conn.execute(
+            "INSERT OR IGNORE INTO name_vocab(root, lname)"
+            " SELECT DISTINCT root, lower(name) FROM symbols")
     conn.commit()
     return conn
 
@@ -95,6 +126,14 @@ def insert_symbols(conn: sqlite3.Connection, root: str, path: str,
             "INSERT OR REPLACE INTO symbols(name, kind, line, sig, path, root)"
             " VALUES(?, ?, ?, ?, ?, ?)",
             (name, kind, line, sig, path, root),
+        )
+    # L2.4d: keep the distinct-name vocabulary current (INSERT OR IGNORE —
+    # idempotent across batches and rebuilds; deduped per batch).
+    if rows:
+        distinct = sorted({r[0] for r in rows})
+        conn.executemany(
+            "INSERT OR IGNORE INTO name_vocab(root, lname) VALUES (?, lower(?))",
+            [(root, n) for n in distinct],
         )
     if commit:
         conn.commit()
@@ -176,6 +215,11 @@ def _concept_predicate(root: str, tokens: list,
     the symbol name (case-insensitive substring — the widest tier; the
     per-name tier / strong-hit count are computed separately in the
     SELECT, not the WHERE).
+
+    L2.4d: UNCHANGED — the filtered leg (path/kind set) and the legacy
+    symbols-scan leg keep this exact fragment (byte-identical output);
+    the unfiltered leg pre-filters over name_vocab via
+    _concept_vocab_predicate instead.
     """
     ors: list = []
     params: list = [root]
@@ -192,6 +236,23 @@ def _concept_predicate(root: str, tokens: list,
     return frag, params
 
 
+def _concept_vocab_predicate(root: str, tokens: list) -> tuple:
+    """L2.4d: the concept pre-filter fragment over name_vocab — the same
+    per-token widest-net OR shape as _concept_predicate, evaluated on
+    v.lname (already lower-case). Used ONLY when path/kind are None
+    (the filtered leg cannot run on the vocabulary — it has no
+    path/kind columns). Candidate set is byte-identical: a name passes
+    the net on the vocabulary iff some symbol row passes it."""
+    ors: list = []
+    params: list = [root]
+    for t in tokens:
+        ors.append("v.lname LIKE ?")
+        params.append(f"%{t}%")
+    # v.root (NOT bare root): the leg JOINs name_vocab v against symbols s —
+    # both carry a root column; bare `root` is an ambiguous-column error.
+    return "v.root = ? AND (" + " OR ".join(ors) + ")", params
+
+
 # L2.4b declaration-side kinds: a candidate row on one of these kinds is the
 # SYMBOL ITSELF (where the thing is declared / what it is named after);
 # every other kind (call_site / kwarg_usage / import / extends) is a USAGE
@@ -203,7 +264,8 @@ _DEF_SIDE_SQL = "kind IN (" + ", ".join("?" for _ in _DEF_SIDE_KINDS) + ")"
 
 
 def _concept_rank_sql(tokens: list, where: str, wparams: list,
-                     limit: int, offset: int, rarity: bool = True) -> tuple:
+                      limit: int, offset: int, rarity: bool = True,
+                      col: str = "lower(name)", vocab: bool = False) -> tuple:
     """L2.4b candidate SQL: DISTINCT-NAME ranking (aggregation only — no
     c0 re-JOIN; the representative row is fetched by query_concept's
     second, index-driven query).
@@ -237,15 +299,20 @@ def _concept_rank_sql(tokens: list, where: str, wparams: list,
     strong_flags = []
     tier_params: list = []
     strong_params: list = []
+    # L2.4d: the tier/strong CASEs are template-bound to `col` —
+    # "lower(name)" on the symbols-scan leg, "v.lname" on the
+    # name_vocab pre-filter leg (byte-identical expressions otherwise).
+    tier_tpl = (
+        "(CASE WHEN {col} = ? THEN 1"
+        " WHEN {col} LIKE ? OR {col} GLOB ?"
+        " OR {col} GLOB ? THEN 2 ELSE 3 END)")
+    strong_tpl = (
+        "(CASE WHEN {col} = ? THEN 1"
+        " WHEN {col} LIKE ? OR {col} GLOB ?"
+        " OR {col} GLOB ? THEN 1 ELSE 0 END)")
     for t in tokens:
-        tier_cases.append(
-            "(CASE WHEN lower(name) = ? THEN 1"
-            " WHEN lower(name) LIKE ? OR lower(name) GLOB ?"
-            " OR lower(name) GLOB ? THEN 2 ELSE 3 END)")
-        strong_flags.append(
-            "(CASE WHEN lower(name) = ? THEN 1"
-            " WHEN lower(name) LIKE ? OR lower(name) GLOB ?"
-            " OR lower(name) GLOB ? THEN 1 ELSE 0 END)")
+        tier_cases.append(tier_tpl.format(col=col))
+        strong_flags.append(strong_tpl.format(col=col))
         for p in (t, t + "%", "_" + t + "*", "*_" + t):
             tier_params.append(p)
             strong_params.append(p)
@@ -285,11 +352,23 @@ def _concept_rank_sql(tokens: list, where: str, wparams: list,
         tail = (" SELECT root, name, ln, tier, hits, occ, defmark, minline"
                 " FROM ranked " + order + " LIMIT ? OFFSET ?")
         ranked_params = tier_params + wparams + [limit, offset]
+    if vocab:
+        # L2.4d fast leg: pre-filter the tier-3 net over name_vocab
+        # (O(distinct names)), JOIN back to symbols via the lower(name)
+        # expression index — the candidate SET is byte-identical to the
+        # symbols scan (the caller only takes this branch with
+        # path/kind None; the WHERE is _concept_vocab_predicate).
+        from_clause = (
+            "FROM name_vocab v JOIN symbols s"
+            " ON s.root = v.root AND lower(s.name) = v.lname"
+            f" WHERE {where}")
+    else:
+        from_clause = f"FROM symbols s WHERE {where}"
     ranked_sql = (
         "WITH c0 AS ("
         " SELECT s.root, s.path, s.name, s.kind, s.line, s.sig,"
         f" {least} AS tier, {hits_sum}"
-        f" FROM symbols s WHERE {where}"
+        f" {from_clause}"
         "), ranked AS ("
         " SELECT c.root, lower(c.name) AS ln, c.name AS name,"
         + ranked_core
@@ -339,11 +418,22 @@ def query_concept(conn: sqlite3.Connection, root: str, tokens: list,
     ranking degrades to (tier, name) — dedup-by-name stays; the caller
     discloses the degraded payload.
 
+    L2.4d: with path/kind both None the pre-filter runs over the
+    distinct-name vocabulary (name_vocab, O(distinct names)) instead of
+    the whole symbols table — the candidate set is byte-identical;
+    filtered queries keep the symbols-scan leg.
+
     Rows: (root, path, name, kind, line, sig, tier, occ, hits, defmark).
     """
-    where, wparams = _concept_predicate(root, tokens, path, kind)
-    ranked_sql, ranked_params = _concept_rank_sql(
-        tokens, where, wparams, limit, offset, rarity)
+    if path is None and kind is None:
+        where, wparams = _concept_vocab_predicate(root, tokens)
+        ranked_sql, ranked_params = _concept_rank_sql(
+            tokens, where, wparams, limit, offset, rarity,
+            col="v.lname", vocab=True)
+    else:
+        where, wparams = _concept_predicate(root, tokens, path, kind)
+        ranked_sql, ranked_params = _concept_rank_sql(
+            tokens, where, wparams, limit, offset, rarity)
     ranked = conn.execute(ranked_sql, ranked_params).fetchall()
     # (root, name, ln, tier, hits, occ, defmark, minline)
     if not ranked:
@@ -368,7 +458,15 @@ def query_concept(conn: sqlite3.Connection, root: str, tokens: list,
 def count_concept(conn: sqlite3.Connection, root: str, tokens: list,
                   path: Optional[str] = None, kind: Optional[str] = None) -> int:
     """All-candidate DISTINCT-NAME count for a concept query (feeds
-    'total' — L2.4b: total is names, not rows)."""
+    'total' — L2.4b: total is names, not rows).
+
+    L2.4d: unfiltered (path/kind None) counts run over name_vocab
+    (one row per distinct name — the count IS the vocabulary size of the
+    net-matching names); filtered counts stay on the symbols scan."""
+    if path is None and kind is None:
+        where, params = _concept_vocab_predicate(root, tokens)
+        q = f"SELECT COUNT(*) FROM name_vocab v WHERE {where}"
+        return conn.execute(q, params).fetchone()[0]
     where, params = _concept_predicate(root, tokens, path, kind)
     q = f"SELECT COUNT(DISTINCT lower(name)) FROM symbols WHERE {where}"
     return conn.execute(q, params).fetchone()[0]
