@@ -83,6 +83,31 @@ def _find_hermes_managed_venv(hermes_home: str) -> str | None:
     return None
 
 
+def _install_home_fallback() -> str:
+    """F-B (owner 2026-11-17): OS-canonical hermes INSTALL home — the dir that
+    holds installs/ for the managed venv. The HERMES_HOME fallback when the
+    env var is unset.
+
+    Windows: %LOCALAPPDATA%\\hermes (the real install home; NEVER the phantom
+    home-dir ~/.hermes — that second tree never holds installs/ on this host).
+    POSIX: ~/.hermes.
+
+    Deliberately NOT config.hermes_home() (that is the PROFILE home, a
+    different layer; see the F5 ruling note in ensure_dep_paths)."""
+    return _install_home_for(os.name)
+
+
+def _install_home_for(os_name: str) -> str:
+    """Pure, testable platform branch of :func:`_install_home_fallback`
+    (the env-reading wrapper). `os_name` is "nt" or "posix"."""
+    if os_name == "nt":
+        la = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+        return os.path.join(la, "hermes")
+    return str(Path.home() / ".hermes")
+
+
 def ensure_dep_paths() -> List[str]:
     """Splice resolved site-packages onto ``sys.path``.
 
@@ -96,8 +121,7 @@ def ensure_dep_paths() -> List[str]:
     """
     import sys
 
-    # F5 ruling (owner 2026-11-17, option C — "record the intentional
-    # divergence, do NOT change behaviour"): this resolution is DELIBERATELY
+    # F5 ruling (owner 2026-11-17, option C): this resolution is DELIBERATELY
     # different from config.hermes_home().
     #   - config.hermes_home() returns the PROFILE home (where the profile's
     #     data dir lives, e.g. .../hermes/profiles/<name> on this host).
@@ -106,10 +130,12 @@ def ensure_dep_paths() -> List[str]:
     #     %LOCALAPPDATA%\hermes on Windows) so _find_hermes_managed_venv can
     #     resolve the canonical venv. Pointing it at the profile home would
     #     break the lookup (there is no installs/ under a profile home).
-    # So keep HERMES_HOME-env > ~/.hermes here; do NOT "dedup" to
-    # config.hermes_home() — that is a different layer (owner ruling).
+    # F-B (owner 2026-11-17): the fallback default is now the OS-canonical
+    # install home (_install_home_fallback): Windows -> %LOCALAPPDATA%\hermes
+    # (was the phantom home-dir ~/.hermes), POSIX -> ~/.hermes. Still do NOT
+    # "dedup" to config.hermes_home() — that is a different layer (owner ruling).
     hermes_home = os.environ.get(
-        "HERMES_HOME", str(Path.home() / ".hermes")
+        "HERMES_HOME", _install_home_fallback()
     )
 
     candidates: List[str] = []
