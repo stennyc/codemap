@@ -328,3 +328,22 @@ def test_ledger_skips_bare_hermes_home_container(tmp_path, monkeypatch):
     ledger = tmp_path / "hh" / "plugins" / "code_map" / "data" / "_unindexed_read_ledger"
     text = ledger.read_text().strip() if ledger.exists() else ""
     assert text == "", f"the bare HERMES_HOME container must not mint a row: {text!r}"
+
+
+# ── 10. skill-dir "不再问" name-marker (same class as hermes-file-memory-plugin) ──
+def test_is_transient_dir_blocks_hermes_code_map_skill_dir(tmp_path):
+    """'不再问' for the hermes-code-map SKILL dir (owner 2026-11-17 clarify):
+    its leaf name is a transient marker -> a boundary under it is never
+    proposed for indexing (it is a markdown skill doc, not a source project)."""
+    from code_map import config
+    p = str(tmp_path / "hh" / "profiles" / "coder" / "skills" / "hermes-code-map")
+    assert config.is_transient_dir(p, True) is True
+
+
+def test_is_transient_dir_does_not_block_code_map_plugin(tmp_path):
+    """Over-suppression guard: the actual code_map PLUGIN dir (leaf 'code_map',
+    underscore) is a DIFFERENT name from the skill-dir marker ('hermes-code-map',
+    hyphen) -> the plugin must stay indexable / confirmable."""
+    from code_map import config
+    p = str(tmp_path / "hh" / "plugins" / "code_map")
+    assert config.is_transient_dir(p, True) is False

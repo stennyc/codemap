@@ -160,6 +160,8 @@ def is_system_tree(root: str, is_windows: bool) -> bool:
 TRANSIENT_DIR_NAMES = frozenset({
     "cache", ".cache", "scratch", "spillover", "handoffs", "__pycache__",
     "hermes-file-memory-plugin",
+    "hermes-code-map",  # skill-dir "不再问" (owner 2026-11-17); distinct from the
+                       # code_map PLUGIN (leaf 'code_map', underscore) — no false veto
 })
 
 
