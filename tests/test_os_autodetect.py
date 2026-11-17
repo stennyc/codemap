@@ -347,3 +347,39 @@ def test_is_transient_dir_does_not_block_code_map_plugin(tmp_path):
     from code_map import config
     p = str(tmp_path / "hh" / "plugins" / "code_map")
     assert config.is_transient_dir(p, True) is False
+
+
+# ── 11. hermes_home() pure base accessor (F1/F2 refactor, owner 2026-11-17) ──
+def test_hermes_home_is_pure_no_mkdir(tmp_path, monkeypatch):
+    """F1: hermes_home() returns the live base WITHOUT creating it (the old
+    data_dir().parent^3 path mkdir'd; the pure accessor must not)."""
+    from code_map import config
+    target = tmp_path / "no_such_home"
+    assert not target.exists()
+    monkeypatch.setenv("HERMES_HOME", str(target))
+    assert config.hermes_home() == target
+    assert not target.exists(), "hermes_home() must not mkdir (F1 purity)"
+
+
+def test_data_dir_still_rooted_under_hermes_home(tmp_path, monkeypatch):
+    """Behavior-preserved: data_dir() == hermes_home()/plugins/code_map/data,
+    and the mkdir side-effect now lives ONLY in data_dir (not in the
+    hermes_home / is_container_root predicates)."""
+    from code_map import config
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    home = config.hermes_home()
+    assert home == tmp_path / "hh"
+    assert config.data_dir() == home / "plugins" / "code_map" / "data"
+    assert config.data_dir().exists(), "data_dir() still mkdirs"
+
+
+def test_is_container_root_no_longer_mkdirs(tmp_path, monkeypatch):
+    """F1 end-to-end: calling is_container_root against a NON-EXISTENT
+    HERMES_HOME must not create the tree (the old _hermes_home_base ->
+    data_dir().mkdir path is gone); the predicate stays pure."""
+    from code_map import config
+    target = tmp_path / "no_such_home2"
+    monkeypatch.setenv("HERMES_HOME", str(target))
+    assert not target.exists()
+    assert config.is_container_root(str(target), True) is True
+    assert not target.exists(), "is_container_root must not mkdir (F1)"

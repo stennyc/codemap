@@ -183,15 +183,6 @@ def is_transient_dir(path: str, is_windows: bool = False) -> bool:
     return any(c in TRANSIENT_DIR_NAMES for c in comps)
 
 
-def _hermes_home_base() -> Path:
-    """The hermes home base that data_dir() is rooted under (HERMES_HOME).
-    data_dir() = <base>/plugins/code_map/data, so the base sits three levels
-    up. Honors the live HERMES_HOME env (which data_dir() resolves), so the
-    result tracks the host/profile — never a hardcoded path. (owner
-    2026-11-17 '从 HERMES_HOME 推导,不硬编码' ruling.)"""
-    return data_dir().parent.parent.parent
-
-
 def is_container_root(proj: str, is_windows: bool = False) -> bool:
     """True when `proj` is EXACTLY one of the hermes-internal BARE container
     roots — HERMES_HOME itself, or HERMES_HOME/profiles — the 'never propose
@@ -200,13 +191,12 @@ def is_container_root(proj: str, is_windows: bool = False) -> bool:
     (exact, separator/case-normalized comparison on Windows); a sub-project
     UNDER the container (e.g. .../hermes/plugins/filemem) is NOT a container
     root and stays indexable. The roots are DERIVED from the live HERMES_HOME
-    (via _hermes_home_base / data_dir), never hardcoded. Note: unlike the
-    other pure-string predicates here, this one derives the roots via
-    data_dir() (an idempotent mkdir, harmless in prod and tests)."""
+    via the pure hermes_home() base accessor (no mkdir side-effect, no
+    3-level layout coupling — owner 2026-11-17 F1/F2), never hardcoded."""
     target = (proj or "").strip()
     if not target:
         return False
-    base = _hermes_home_base()
+    base = hermes_home()
     candidates = (str(base), str(base / "profiles"))
     if is_windows:
         want = target.replace("/", "\\").lower()
@@ -319,6 +309,36 @@ HOP_FRONTIER_CAP = 500      # per-stage IN-list cap
 BUILD_COMMIT_BATCH = 32
 
 
+def hermes_home() -> Path:
+    """The live hermes home base (HERMES_HOME) — the directory that data_dir()
+    is rooted under (<home>/plugins/code_map/data). SINGLE SOURCE OF TRUTH for
+    'where is the hermes home': data_dir() and is_container_root both derive
+    from it, so the base can't drift. Resolves the same way as the old inline
+    data_dir() resolution but returns the base WITHOUT the plugins/code_map/
+    data suffix and WITHOUT the mkdir side-effect (owner 2026-11-17 F1: the
+    predicate path is now pure; F2: no 3-level layout coupling). Precedence:
+    HERMES_HOME env > hermes_constants.get_hermes_home() > per-OS canonical
+    data dir."""
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        return Path(home)
+    try:
+        # Hermes resolves its own home (per-profile).
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home())
+    except Exception:
+        if IS_WINDOWS:
+            # OS auto-detect (owner 2026-11-16): the canonical Windows data dir
+            # is %LOCALAPPDATA%\hermes. Windows must NEVER fall back to a
+            # home-dir .hermes (the POSIX ~/.hermes fallback created a phantom
+            # second tree on this host — C:\Users\user\.hermes forensics).
+            local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
+                os.path.expanduser("~"), "AppData", "Local"
+            )
+            return Path(local_appdata) / "hermes"
+        return Path.home() / ".hermes"
+
+
 def data_dir() -> Path:
     """Where per-root SQLite DBs live. Honors HERMES_HOME so tests isolate.
 
@@ -332,29 +352,7 @@ def data_dir() -> Path:
     since the last register. A broken hardlink (e.g. a copy instead of a
     link) silently defeats the whole lock scheme — that warning is the
     deploy's only alarm."""
-    home = os.environ.get("HERMES_HOME")
-    if home:
-        base = Path(home)
-    else:
-        try:
-            # Hermes resolves its own home (per-profile). Fall back to the
-            # per-OS canonical data dir.
-            from hermes_constants import get_hermes_home  # type: ignore
-            base = Path(get_hermes_home())
-        except Exception:
-            if IS_WINDOWS:
-                # OS auto-detect (owner 2026-11-16): the canonical Windows
-                # data dir is %LOCALAPPDATA%\hermes. The old POSIX
-                # ~/.hermes fallback created a phantom second tree on this
-                # host (C:\Users\user\.hermes forensics, 2026-11-16) —
-                # Windows must NEVER fall back to a home-dir .hermes.
-                local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
-                    os.path.expanduser("~"), "AppData", "Local"
-                )
-                base = Path(local_appdata) / "hermes"
-            else:
-                base = Path.home() / ".hermes"
-    d = base / "plugins" / "code_map" / "data"
+    d = hermes_home() / "plugins" / "code_map" / "data"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
