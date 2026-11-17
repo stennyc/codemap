@@ -174,12 +174,17 @@ def test_on_pre_llm_call_skips_projects_under_a_confirmed_target(tmp_path):
     assert out is None, f"row under a confirmed target must be skipped: {out}"
 
 
-def test_purge_is_noop_for_genuinely_pending_project(tmp_path):
+def test_purge_is_noop_for_genuinely_pending_project(tmp_path, monkeypatch):
     """Owner-awareness (reviewer round 1, P2): the purge must NOT clear a
     row for a project that is still genuinely pending (unconfirmed, not
     under a confirmed target, no db record) — the '不要 = keep asking'
-    semantics require the row to survive its own re-read."""
-    from code_map import hook
+    semantics require the row to survive its own re-read.
+
+    L2.8h gate-②: the final 'question still offered' assertion pins the
+    pitch face, which is default-OFF — flipped on explicitly here (the
+    LEDGER assertions above are flag-agnostic: the row survives either
+    way)."""
+    from code_map import config, hook
     proj = _make_unconfirmed_project(tmp_path, name="projQ")
     f = proj / "core.py"
     hook._post_tool_call("read_file", {"path": str(f)}, None,
@@ -190,7 +195,9 @@ def test_purge_is_noop_for_genuinely_pending_project(tmp_path):
                          status="ok", session_id="s1")
     assert _pending_rows() == [f"{proj}\ts1"], \
         "purge must be a no-op for a genuinely pending project"
-    # The question must still be offered next turn.
+    # The question must still be offered next turn (L2.8h gate-②: the
+    # pitch face is opt-in — enable it to pin the delivery contract).
+    monkeypatch.setattr(config, "BRIEF_BUILD_PITCH", True, raising=False)
     out = hook.on_pre_llm_call(session_id="s1", user_message="hi",
                                conversation_history=[], model="m",
                                platform="tui")
@@ -225,8 +232,13 @@ def test_write_side_tools_do_not_log(tmp_path):
 
 # ── 读什么：pre_llm_call 交付 = 三条固定选项的 clarify 指令 ──────────────
 
-def test_pre_llm_call_delivers_three_option_clarify(tmp_path):
-    from code_map import hook
+def test_pre_llm_call_delivers_three_option_clarify(tmp_path, monkeypatch):
+    """L2.8h gate-②: the pitch is default-OFF (owner decision ③) — this
+    test pins the DELIVERY contract under an EXPLICIT opt-in (flip
+    BRIEF_BUILD_PITCH back on), so the delivery shape stays verified
+    while the default stays silent."""
+    from code_map import config, hook
+    monkeypatch.setattr(config, "BRIEF_BUILD_PITCH", True, raising=False)
     proj = _make_unconfirmed_project(tmp_path)
     hook._post_tool_call("read_file", {"path": str(proj / "core.py")}, None,
                          status="ok", session_id="s1")

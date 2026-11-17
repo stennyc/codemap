@@ -293,6 +293,13 @@ READ_SYMBOL_MAX_BYTES = 1500
 # O(files) and would be too hot on big targets at read frequency). Above
 # the cap the stamp degrades to "unknown(large target)" instead of lying.
 ATTACH_STALENESS_WALK_MAX_FILES = 50_000
+
+# L2.8h (owner decision ③, 2026-11-18): the turn-boundary "build an index?"
+# pitch is DEFAULT-OFF — it is a per-turn variable injection (prefix-cache
+# enemy under the stable-injection premise: stable injection > token cost).
+# The never-ask ledger guard machinery stays as the safety net for when it
+# is re-enabled; flipping this True is an explicit opt-in.
+BRIEF_BUILD_PITCH = False
 # 档 2 terminal read-signal (owner 2026-10-15): a one-line pointer appended
 # to terminal stdout when a single-file cat/less of a confirmed-target
 # source file is detected. Deliberately a POINT (byte-capped), NOT a full

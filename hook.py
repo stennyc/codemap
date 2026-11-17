@@ -842,6 +842,12 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
     try:
         if not session_id:
             return None
+        # L2.8h gate-② (owner decision ③, default OFF): the pitch is a
+        # per-turn variable injection — the stable-injection premise (prefix
+        # cache) says turn-boundary noise is the real cost, so the pitch
+        # is an explicit opt-in via config.BRIEF_BUILD_PITCH.
+        if not config.BRIEF_BUILD_PITCH:
+            return None
         projects = [p for p in _pending_projects(session_id)
                     if _needs_index_build_question(p)]
         if not projects:

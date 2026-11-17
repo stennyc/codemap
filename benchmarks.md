@@ -210,55 +210,62 @@ Both shipped in one atomic commit `e04d81f` ("feat(l2.3b+l2.5b)
 root-level kind aggregation + multi-hop seed face"); tool-schema
 descriptions synced in `249f75d`.
 
-## L2.8h (2026-11-18): project brief — frozen project map + stamp/attach alignment
+## L2.8h (2026-11-18): project brief + attach/stamp alignment + gate-② off
 
-Owner decisions this session: ① the session-start frozen section becomes a
-per-target project BRIEF (map the model uses BEFORE first navigation);
-② the attach-block staleness stamp and the cross-folder signal line align
-to the brief's data layer; ③ the "build an index?" turn-boundary pitch
-default-OFF (stable injection > token cost — prefix-cache premise, gate-5
-`wv_423a8d1b`); ④ no LSP now; campaign re-run after restart.
+Owner decisions this session: ① the session-start frozen section becomes
+a per-target project BRIEF (the map the model works FROM before first
+navigation — "先给地图"); ② the attach-block staleness stamp + the
+cross-folder signal line align to the brief's data layer; ③ the "build an
+index?" turn-boundary pitch default-OFF (stable-injection premise: a
+per-turn variable injection is a prefix-cache enemy; opt-in flag); ④ no
+LSP now; ⑤ campaign re-run after the next gateway restart.
 
-- **Brief renderer** (`brief.py` `_render_root_brief`): ≤8 data lines + 1
-  map legend, byte-capped ~900B, FROZEN session-start section (stable
-  prefix, cache-friendly; re-frozen only per session start). Lines: path,
-  parser-gen + freshness, kind distribution, module map (dir, top-N
-  files by symbol count, `path, line` order — the L2.3b stable sort),
-  public face (def-side top-N by cross-file heat — the L2.4c ranking
-  product), top cross-folder pairs (import edges; `0 cross-folder edges`
-  for a flat module — no fabricated signal), entry surface (`__init__`
-  exports; `n/a` otherwise). Zero-signal lines are OMITTED (brief is a
-  compressed project map, not a fixed 8-line card). `build_briefs_payload`
-  emits `{target, bytes, lines, content, truncated}` per target, 8KB
-  total cap, 1280B single-line cap; non-confirmed dirs raise
-  `ValueError` (fail-loud, not fail-soft); `hermes_home()` excluded
-  from the section (no self-pollution).
-- **Live filemem render (acceptance sample)**: gen fresh · 32k rows · 1
-  module (filemem, 133 files) · top files db/schema/staleness/facts ·
-  public face top `_utcnow`/`_render`/`load_graph` · 0 cross-folder edges
-  (flat single-package, honest) · no `__init__` export face (n/a).
-- **Attach alignment** (hook.py): the staleness stamp line (fresh /
-  gen partial N rows / stale) now rides on the O(1) files-table count
-  (`n_files > max(0, READ_HEAL_MAX_FILES)` → trust the stamp, skip the
-  O(N) disk walk) instead of a forced walk; a dirty target's stamp says
-  partial WITH row count. The cross-folder signal line renders only when
-  `n_files > 0` (files table authoritative, O(1)) — a zero-signal root
-  omits it (no fabricated `0 edges`).
-- **Gate-② off**: `config.BRIEF_BUILD_PITCH = False` — the pitch is now
-  an explicit opt-in flag (stable-injection premise; the ledger guard
-  machinery stays as the safety net when re-enabled).
-- **Tests**: `tests/test_brief.py` (14, incl. the 8KB/line cap,
-  non-confirmed ValueError, hermes_home exclusion, live filemem smoke);
-  `tests/test_attach_staleness.py` (+2: O(1) skip-walk, dirty partial
-  stamp); `tests/test_cross_folder_signal.py` pin updated (the signal
-  line now requires n_files > 0 — its fixture seeds the files table).
+- **Brief** (`brief.py`, owner's converged API — the section is a host
+  CALLABLE rendered ONCE per session and frozen, byte-stable within the
+  session = prefix-cache stable, token cost irrelevant): per-target
+  blocks carry the slow variables only (entry face = the `def
+  register(ctx)` host-hook line + `ctx.register_*` counts, module shape
+  with first-docstring-line roles ≤56 chars, dependency skeleton from
+  the import edges, public def-side names) — NO line anchors (those live
+  in the fresh layer: attach blocks + query payloads, each stamped with
+  parser generation + staleness). Q1-Q4 caps: ≤5 targets -> brief all;
+  >5 -> the 3 most recent by db mtime + "+N more"; ≤8 lines/target;
+  fail-soft everywhere (a broken db / unreadable source skips that
+  target, never breaks the section). `section_content(session_info)` is
+  the registered callable (`_register_prompt_section` in `__init__.py`);
+  the static root-policy legend stays in `__init__._ROOT_POLICY_TEXT`.
+  Tests: `tests/test_brief.py` (9).
+- **Attach alignment** (hook.py): the staleness stamp line (one line,
+  OUTSIDE the byte cap, appended after the cross-folder signal) rides on
+  `query._staleness` — the SAME function the code_map_query payloads
+  report, so the two faces never disagree — under the Q3 cap: the
+  indexed-file count (O(1) files-table read) ≤
+  `config.ATTACH_STALENESS_WALK_MAX_FILES` (50k) -> run the walk; above
+  it the walk is SKIPPED and the stamp degrades to
+  `unknown(large target)` (fail-soft, never a lie about freshness).
+  Every block carries its OWN stamp (append-only context: old blocks
+  stay; the newest stamp is authoritative). A dirty target's stamp says
+  `partial N rows` (owner parallel saves that miss the write-side stamp
+  surface as partial). `tests/test_attach_staleness.py` (+2: O(1)
+  skip-walk budget test, dirty-partial-stamp test). The cross-folder
+  signal line renders only when `n_files > 0` (files table
+  authoritative, O(1)) — a zero-signal root omits it (no fabricated
+  `0 edges`); `tests/test_cross_folder_signal.py` fixture seeds the
+  files table (pin updated to the n_files>0 contract).
+- **Gate-② off**: `config.BRIEF_BUILD_PITCH = False` — `on_pre_llm_call`
+  returns None up front unless the flag is flipped (explicit opt-in;
+  the never-ask ledger guard machinery stays as the safety net when
+  re-enabled). `tests/test_gate2_pitch_off.py` (2: default-off skip +
+  opt-in restore via the REAL ledger API — `_post_tool_call` mints the
+  row, `on_pre_llm_call` gates it).
 - **Campaign follow-up (pending restart)**: re-run the S/M campaigns
-  with a BRIEF arm — S: with-brief vs without-brief steps + GT
-  coverage; M: with/without brief attribution split. The no-injection
-  arm needs a plugin-off config + host restart (separate session).
-
-Shipped in `L2.8h` (brief + alignment + gate-②, atomic); suite comm-diff
-zero-regression on the 22-failure baseline.
+  with a BRIEF arm — S: with-brief vs without-brief steps + GT coverage
+  (does the frozen map replace exploratory grep?); M: attribution split
+  (how much of the M-INDEX win is attach vs query face vs brief). The
+  no-injection arm needs a plugin-off config + host restart (separate
+  session).
+- Suite comm-diff zero-regression on the 22-failure baseline (full suite
+  22 failed / 325+ passed; all 22 = the POSIX-layout environment class).
 
 ## L2.4 gate + live probe
 
