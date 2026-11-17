@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .config import root_db_path, WAL_BUSY_TIMEOUT_MS
+from .config import root_db_path, WAL_BUSY_TIMEOUT_MS, PARSER_GENERATION
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -491,19 +491,50 @@ def stale_paths(conn: sqlite3.Connection, root: str,
 
 
 def remove_paths(conn: sqlite3.Connection, paths: set,
-                 commit: bool = True) -> None:
+                 commit: bool = True, prune_vocab: bool = True) -> None:
     for p in paths:
         conn.execute("DELETE FROM symbols WHERE path = ?", (p,))
         conn.execute("DELETE FROM files WHERE path = ?", (p,))
     # L2.4d prune (reviewer finding F1, 2026-11-18): vocab rows whose
     # names lost their LAST symbol row become orphans — harmless to the
     # ranked leg (JOIN-excluded) but they inflate count_concept's total.
-    # Prune at the API boundary (the heal path for vanished files); the
-    # correlated delete is ~vocab-size index probes (cheap, and this
-    # path only runs on file deletions).
-    conn.execute(
-        "DELETE FROM name_vocab WHERE NOT EXISTS"
-        " (SELECT 1 FROM symbols s"
-        "  WHERE s.root = name_vocab.root AND lower(s.name) = name_vocab.lname)")
+    # Prune at the API boundary (the heal path for vanished files).
+    # L2.8j (2026-11-18): the prune is a SINGLE-PASS set op
+    # (prune_orphan_vocab — the old correlated NOT EXISTS planned as
+    # O(vocab x root_symbols), ~15 s/file at the live 32k-row scale) and
+    # callers that delete many files in one build pass prune_vocab=False
+    # and prune ONCE after the loop (amortization — the L2.3c
+    # generation-mismatch re-parse loop used to pay it per file).
+    if prune_vocab:
+        prune_orphan_vocab(conn)
     if commit:
         conn.commit()
+
+
+def prune_orphan_vocab(conn: sqlite3.Connection) -> None:
+    """Drop name_vocab rows whose name lost its LAST symbol row.
+
+    L2.8j: single-pass index-driven set op — the surviving-name set is
+    ONE DISTINCT projection over symbols (idx_symbols_lname-driven,
+    streamed) materialized once; the 3k-row vocab table is then a plain
+    membership scan. O(root_rows + vocab), NOT the old
+    O(vocab x root_symbols) correlated plan (15 s/file measured at the
+    live scale). No commit — the caller owns the transaction.
+    """
+    conn.execute(
+        "DELETE FROM name_vocab WHERE lname NOT IN"
+        " (SELECT DISTINCT lower(name) FROM symbols)")
+
+
+def gen_stale_paths(conn: sqlite3.Connection, root: str) -> set:
+    """L2.8i: indexed files stamped under an OLDER parser generation.
+
+    The caller intersects with on_disk (a gen-stale file that was also
+    deleted is handled by the disk-missing path, not the re-parse set).
+    Legacy '' rows (pre-L2.3c, unknown generation) are re-parsed by
+    design, so `!= PARSER_GENERATION` is the right shape.
+    """
+    rows = conn.execute(
+        "SELECT path FROM files WHERE path LIKE ? AND parser_gen != ?",
+        (f"{root}{os.sep}%", PARSER_GENERATION)).fetchall()
+    return {r[0] for r in rows}

@@ -13,7 +13,8 @@ from typing import List, Set
 
 from .config import BUILD_COMMIT_BATCH, INDEXED_EXTENSIONS
 from . import config
-from .db import init_db, insert_symbols, upsert_file, remove_paths
+from .db import (init_db, insert_symbols, upsert_file, remove_paths,
+                prune_orphan_vocab, gen_stale_paths)
 from .fingerprint import file_fingerprint, invalidate_cache, on_disk_files
 from .parser import parse_file, available, available_for
 from .registry import EXT_TO_LANG, available_languages
@@ -45,8 +46,9 @@ class BuildScanner:
         added, removed = diff_indexed(self.root, on_disk)
 
         if removed:
-            remove_paths(conn, removed)
+            remove_paths(conn, removed, commit=False, prune_vocab=False)
             self._stats["removed"] = len(removed)
+        did_remove = bool(removed)
 
         lang_set = set(available_languages())
         # L2.3c: files indexed under an OLDER parser generation must be
@@ -58,10 +60,7 @@ class BuildScanner:
         # generation) — re-parsed by design (one-shot self-heal). The
         # re-parse clears the file's rows FIRST (an older generation's
         # orphan rows are not overwritten by INSERT OR REPLACE).
-        gen_stale = {r[0] for r in conn.execute(
-            "SELECT path FROM files WHERE path LIKE ? AND parser_gen != ?",
-            (f"{self.root}{os.sep}%", config.PARSER_GENERATION))
-            if r[0] in on_disk}
+        gen_stale = gen_stale_paths(conn, self.root) & on_disk
         batch: List[tuple] = []
         for fpath in sorted(added | gen_stale):
             ext = os.path.splitext(fpath)[1].lower()
@@ -70,7 +69,12 @@ class BuildScanner:
                 self._stats["skipped"] += 1
                 continue
             if fpath in gen_stale:
-                remove_paths(conn, {fpath})
+                # L2.8j: no per-call vocab prune here — amortized to ONE
+                # index-driven set op after the loop (the old correlated
+                # prune per gen-re-parsed file was ~15 s/file at the live
+                # 32k-row scale; 136 files ≈ 34 min).
+                remove_paths(conn, {fpath}, commit=False, prune_vocab=False)
+                did_remove = True
                 self._stats["gen_reparsed"] += 1
             rows = parse_file(fpath)
             mtime, size = file_fingerprint(Path(fpath))
@@ -82,6 +86,8 @@ class BuildScanner:
             if len(batch) >= BUILD_COMMIT_BATCH:
                 conn.commit()
                 batch = []
+        if did_remove:
+            prune_orphan_vocab(conn)
         conn.commit()
         self._stats["added"] = len(added)
 

@@ -14,7 +14,10 @@ import uuid
 from typing import Any, Dict, Optional
 
 from .config import BUILD_COMMIT_BATCH, PARSER_GENERATION, data_dir, root_db_path, ROOT_MARKERS
-from .db import init_db, insert_symbols, upsert_file, remove_paths
+from .db import (
+    init_db, insert_symbols, remove_paths, upsert_file,
+    prune_orphan_vocab, gen_stale_paths,
+)
 from .fingerprint import file_fingerprint, invalidate_cache, on_disk_files
 from .parser import parse_file, available
 from .rootdetect import detect_root, find_root_candidates
@@ -299,12 +302,23 @@ def _run_build(root: str) -> None:
     try:
         on_disk = on_disk_files(root)
         added, removed = _diff_and_sync(conn, root, on_disk, build_id)
-        # Remove stale entries
+        # Remove stale entries (no per-call vocab prune — amortized below).
+        did_remove = bool(removed)
         if removed:
-            remove_paths(conn, removed)
+            remove_paths(conn, removed, commit=False, prune_vocab=False)
+        # L2.8i: a parser-generation drift is NOT a disk event —
+        # diff_indexed stays disk-only (owner design); the drifted files are
+        # re-parsed HERE so the host refresh surface (code_map_refresh /
+        # confirm build) clears the L2.3c staleness flag instead of
+        # re-manufacturing it on every refresh (the kernel BuildScanner
+        # already had this; the host path did not — task_95 / L2.8i).
+        gen_stale = gen_stale_paths(conn, root) & on_disk
+        did_remove = did_remove or bool(gen_stale)
+        if gen_stale:
+            remove_paths(conn, gen_stale, commit=False, prune_vocab=False)
         # Parse new/changed files in batches
         batch: list = []
-        for fpath in sorted(added):
+        for fpath in sorted(added | gen_stale):
             rows = _parse_safe(fpath)
             lang = _guess_lang(fpath)
             mtime, size = file_fingerprint(
@@ -315,6 +329,13 @@ def _run_build(root: str) -> None:
                 batch = []
         if batch:
             _commit_batch(conn, root, build_id, batch)
+        # L2.8j: amortized orphan-vocab prune — ONE index-driven set op per
+        # build pass (the old per-file correlated prune was ~15 s/file at
+        # the live 32k-row scale; a generation bump re-parsing 136 files
+        # would have taken ~34 min).
+        if did_remove:
+            prune_orphan_vocab(conn)
+            conn.commit()
         # Invalidate cache so the next query re-walks (contract ②)
         invalidate_cache(root)
     finally:
