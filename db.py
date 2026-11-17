@@ -38,6 +38,10 @@ CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
 -- lower(name) LIKE 'tok%' off it; leading-wildcard substring legs
 -- remain scan-bound by design).
 CREATE INDEX IF NOT EXISTS idx_symbols_lname ON symbols(lower(name));
+-- L2.3b kind aggregation: drives WHERE kind=? ORDER BY path,line
+-- (equality prefix + ordered tail, no sort at 35k-row scale) and the
+-- subtree LIKE path-prefix leg (index range scan inside the kind).
+CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind, path, line);
 """
 
 
@@ -86,14 +90,23 @@ def query_symbols(conn: sqlite3.Connection, root: str,
                   path: Optional[str] = None,
                   kind: Optional[str] = None,
                   limit: int = 200,
-                  offset: int = 0) -> list:
+                  offset: int = 0,
+                  path_prefix: Optional[str] = None,
+                  order: str = "line") -> list:
     """Query symbol rows for `root`. `path` must be an ABSOLUTE file path —
     it matches EXACTLY one indexed file (the symbols table stores absolute
     paths, see insert_symbols / _reindex_single_file_sync). A relative or
     suffix-style path used to under-match or over-match sibling files with
     the same basename (the b-1 attach contamination: `__init__.py` pulled
     in every subpackage's __init__ symbols); exact match removes both.
-    """
+
+    L2.3b: `path_prefix` (an absolute directory + os.sep, built by the
+    caller) selects the SUBTREE via LIKE — the kind-aggregation branch's
+    directory narrowing. Never set together with `path` (exact + subtree
+    are mutually exclusive). `order` is an INTERNAL ordering hint
+    (never user input): cross-file kind aggregation passes "path, line"
+    (line-only ordering ties across files make OFFSET paging unstable);
+    the legacy paths keep "line" byte-identical."""
     query = "SELECT root, path, name, kind, line, sig FROM symbols WHERE root = ?"
     params: list = [root]
     if name:
@@ -102,10 +115,13 @@ def query_symbols(conn: sqlite3.Connection, root: str,
     if path:
         query += " AND path = ?"
         params.append(os.path.abspath(path))
+    if path_prefix:
+        query += " AND path LIKE ?"
+        params.append(path_prefix + "%")
     if kind:
         query += " AND kind = ?"
         params.append(kind)
-    query += " ORDER BY line LIMIT ? OFFSET ?"
+    query += f" ORDER BY {order} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     return conn.execute(query, params).fetchall()
 
@@ -113,12 +129,13 @@ def query_symbols(conn: sqlite3.Connection, root: str,
 def count_symbols(conn: sqlite3.Connection, root: str,
                   name: Optional[str] = None,
                   path: Optional[str] = None,
-                  kind: Optional[str] = None) -> int:
+                  kind: Optional[str] = None,
+                  path_prefix: Optional[str] = None) -> int:
     """Total matching rows across ALL pages (same filters as
     query_symbols, without LIMIT/OFFSET). Feeds the query-response
     'total' field so a consumer can tell '22-row page of a 76-row
-    set' (byte-capped page) from 'all 22 rows'.
-    """
+    set' (byte-capped page) from 'all 22 rows'. `path_prefix` = the
+    L2.3b subtree arm (directory + os.sep, LIKE)."""
     query = "SELECT COUNT(*) FROM symbols WHERE root = ?"
     params: list = [root]
     if name:
@@ -127,6 +144,9 @@ def count_symbols(conn: sqlite3.Connection, root: str,
     if path:
         query += " AND path = ?"
         params.append(os.path.abspath(path))
+    if path_prefix:
+        query += " AND path LIKE ?"
+        params.append(path_prefix + "%")
     if kind:
         query += " AND kind = ?"
         params.append(kind)

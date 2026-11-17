@@ -776,13 +776,22 @@ _HOP_DEF_KINDS = ("function", "method", "class")
 
 def _query_hops(conn, root: str, seed: str, depth: int):
     """Walk `depth` frontier stages from `seed`. Returns (rows, total,
-    frontier_capped). rows carry a `hop` key; dedup is global over
-    (name, path, line) with the MIN hop winning (stages ascend)."""
+    frontier_capped, seed_face). rows carry a `hop` key; dedup is global
+    over (name, path, line) with the MIN hop winning (stages ascend).
+
+    L2.5b: seed_face=True when the seed's own def files (files carrying
+    def-side rows for the seed name) contributed their def-side public
+    surface at the FIRST even hop — the seed's own def row is re-emitted
+    there as an entry candidate (its consumer-hop exclusion is unchanged)
+    plus the sibling module-level defs in those files. Seeds with no
+    def-side rows (e.g. a parameter name) get no seed face: the output is
+    the pre-L2.5b shape."""
     rows: List[Dict[str, Any]] = []
     seen = set()
     frontier_names = [seed]
     frontier_files: List[str] = []
     frontier_capped = False
+    seed_face_emitted = False
 
     def _stage(consumer: bool, keys: List[str]) -> List[tuple]:
         ph = ", ".join("?" * len(keys))
@@ -797,6 +806,12 @@ def _query_hops(conn, root: str, seed: str, depth: int):
             params.append(seed)
         return conn.execute(sql, params).fetchall()
 
+    # L2.5b: the seed's def files (over-approximated, name-level — a name
+    # defined in several files contributes each of them, disclosed).
+    seed_def_paths = [r[0] for r in conn.execute(
+        "SELECT DISTINCT path FROM symbols WHERE root = ? AND name = ? AND "
+        "kind IN ('function','method','class')", (root, seed)).fetchall()]
+
     for hop in range(1, depth + 1):
         if hop % 2 == 1:
             keys = frontier_names[:HOP_FRONTIER_CAP]
@@ -810,6 +825,22 @@ def _query_hops(conn, root: str, seed: str, depth: int):
             if not keys:
                 break
             stage = _stage(False, keys)
+            # L2.5b: at the FIRST even hop, merge the seed's own def
+            # files' def-side public surface (module-level entries). The
+            # seed's own def row is deliberately re-emitted HERE (the
+            # consumer-stage exclusion above is unchanged); rows already
+            # emitted (consumer-file defs shared with a seed file) are
+            # deduped by the global (name, path, line) seen-set below.
+            if hop == 2 and seed_def_paths:
+                kph = ", ".join("?" * len(seed_def_paths))
+                dph = ", ".join("?" * len(_HOP_DEF_KINDS))
+                face = conn.execute(
+                    "SELECT name, path, line, kind, sig FROM symbols "
+                    f"WHERE root = ? AND path IN ({kph}) AND kind IN ({dph})",
+                    [root, *seed_def_paths, *_HOP_DEF_KINDS]).fetchall()
+                if face:
+                    seed_face_emitted = True
+                stage = list(stage) + face
         fresh = []
         for r in stage:  # (name, path, line, kind, sig)
             key = (r[0], r[1], r[2])
@@ -828,22 +859,27 @@ def _query_hops(conn, root: str, seed: str, depth: int):
             frontier_names = sorted({s["name"] for s in fresh})
             if not frontier_names:
                 break
-    return rows, len(rows), frontier_capped
+    return rows, len(rows), frontier_capped, seed_face_emitted
 
 
 def _serialize_hops(rows: list, staleness: str, root: str,
                     depth: int, depth_effective: int, total: int,
-                    frontier_capped: bool) -> str:
-    """Byte-capped hop payload: over budget, the DEEPEST hops are dropped
-    first (least-certain propagation); `total` keeps counting ALL rows."""
+                    frontier_capped: bool, seed_face: bool = False) -> str:
+    """Byte-capped hop payload: over budget, the SHALLOWEST hops are
+    dropped first (hop 1 ≡ the exact-name query, redundant; deep hops
+    carry the NEW propagation); `total` keeps counting ALL rows."""
     disclosure = (
         "L2.5 multi-hop impact propagation from the seed name: odd hops = "
         "consumer rows (call_site/kwarg_usage/import), even hops = def-side "
         "symbols (function/method/class) inside those consumer files. "
-        "NAME-LEVEL over-approximation: aliases/overloads merge; the seed's "
-        "own def is not re-emitted; positional-argument consumers are NOT "
-        "covered (grep for those). Deduped by (name,path,line), min hop "
-        "wins. No cursor paging in depth mode: over the byte budget the "
+        "NAME-LEVEL over-approximation: aliases/overloads merge; positional-"
+        "argument consumers are NOT covered (grep for those). L2.5b seed "
+        "face: when seed_face=true, the first even hop ALSO carries the "
+        "seed's own def files' def-side public surface (module-level "
+        "entries; the seed's own def row re-emitted there as an entry "
+        "candidate — it is still excluded from consumer hops). "
+        "Deduped by (name,path,line), min hop wins. No cursor paging in "
+        "depth mode: over the byte budget the "
         "SHALLOWEST hops are dropped first (hop 1 is the exact-name query "
         "redundant; deep hops carry the NEW propagation); total still "
         "counts all rows — re-query a frontier name for a layer's detail. "
@@ -858,6 +894,7 @@ def _serialize_hops(rows: list, staleness: str, root: str,
             "total": total,
             "depth": depth,
             "depth_effective": depth_effective,
+            "seed_face": seed_face,
             "hops_returned": max((r["hop"] for r in out_rows), default=0),
             "truncated": truncated,
             "frontier_capped": frontier_capped,
@@ -909,6 +946,10 @@ def code_map_query(args: Dict[str, Any]) -> str:
     limit = args.get("limit", PAGE_MAX_SYMBOLS)
     cursor = args.get("cursor", "0")
     fuzzy = bool(args.get("fuzzy"))  # L2.4 concept bridge (owner 2026-11-16)
+    # L2.3b: the kinds the parser can emit (single source mirrored in the
+    # tool-schema `kind` description — keep both in sync when a kind lands).
+    _QUERYABLE_KINDS = ("function", "class", "method", "import", "call_site",
+                        "parameter", "kwarg_usage", "extends", "decorator")
 
     # --- root gate: required + confirmed (registry is the single source) ---
     root = args.get("root") or ""
@@ -922,11 +963,22 @@ def code_map_query(args: Dict[str, Any]) -> str:
             f"root '{root}' is not confirmed; call code_map_confirm_root "
             "first", limit)
 
-    # --- name/path gate: at least one, and path must stay in-root ---
-    if not name and not path:
+    # --- name/path gate: at least one of name/path/kind, path stays in-root ---
+    if not name and not path and not kind:
         return _invalid(
-            "nothing to locate: provide name, path, or both "
-            "(a root-only call is invalid)", limit)
+            "nothing to locate: provide name, path, kind, or any combination "
+            "(a root-only call is invalid); kind alone (no name) aggregates "
+            "that kind's rows across the whole target (L2.3b)", limit)
+    # L2.3b: kind WITHOUT a name = the aggregation branch — validate the
+    # kind up front (an unknown kind must fail loudly with the valid list,
+    # not silently return 0 rows); kind WITH a name keeps the legacy
+    # exact-name filter (an unknown kind there stays a 0-row result,
+    # pre-L2.3b behavior, byte-identical).
+    kind_only = bool(kind) and not name
+    if kind_only and kind not in _QUERYABLE_KINDS:
+        return _invalid(
+            f"kind '{kind}' is not an indexable kind; valid: "
+            + "|".join(_QUERYABLE_KINDS), limit)
 
     path_filter: Optional[str] = None
     if path:
@@ -936,6 +988,14 @@ def code_map_query(args: Dict[str, Any]) -> str:
                 f"path '{path}' does not lie within root '{root}'; "
                 "out-of-root and system-dir paths are rejected", limit)
         path_filter = resolved
+    # L2.3b subtree arm: a DIRECTORY path under kind aggregation narrows
+    # to the subtree (LIKE prefix — the b72fb30 os.sep discipline, the
+    # files table stores native separators, a slash prefix would match
+    # zero on Windows); a FILE path keeps the exact-file semantics.
+    path_prefix: Optional[str] = None
+    if kind_only and path_filter and os.path.isdir(path_filter):
+        path_prefix = path_filter + os.sep
+        path_filter = None
 
     db_path = root_db_path(root)
     if not db_path.exists():
@@ -973,9 +1033,11 @@ def code_map_query(args: Dict[str, Any]) -> str:
                     "bridge candidates are word-surface, not propagation "
                     "seeds — resolve the exact name first", limit)
             depth_eff = min(max(depth_req, 1), HOP_MAX_DEPTH)
-            hrows, htotal, hcap = _query_hops(conn, root, name, depth_eff)
+            hrows, htotal, hcap, hseedface = _query_hops(
+                conn, root, name, depth_eff)
             result = _serialize_hops(hrows, staleness, root,
-                                     depth_req, depth_eff, htotal, hcap)
+                                     depth_req, depth_eff, htotal, hcap,
+                                     hseedface)
             payload = json.loads(result)
             payload["query_ms"] = int((time.perf_counter() - t0) * 1000)
             return json.dumps(payload, ensure_ascii=False)
@@ -989,9 +1051,11 @@ def code_map_query(args: Dict[str, Any]) -> str:
         # reading count<=limit stops early and undercounts (L2.2 bench:
         # a 22-row page of a 76-row set was read as 'complete').
         total = count_symbols(conn, root, name=name, path=path_filter,
-                              kind=kind)
+                              kind=kind, path_prefix=path_prefix)
         rows = query_symbols(conn, root, name=name, path=path_filter,
-                             kind=kind, limit=limit, offset=offset)
+                             kind=kind, limit=limit, offset=offset,
+                             path_prefix=path_prefix,
+                             order=("path, line" if kind_only else "line"))
         page = rows[:PAGE_MAX_SYMBOLS]
         elapsed_ms = int((time.perf_counter() - t0) * 1000)  # L90
 
@@ -1022,6 +1086,16 @@ def code_map_query(args: Dict[str, Any]) -> str:
 
         payload = json.loads(result)
         payload["query_ms"] = elapsed_ms
+        if kind_only:
+            # L2.3b payload marker: the model must know it is reading an
+            # aggregation (rows of one kind across the whole target /
+            # subtree), not a locate result for a named symbol.
+            payload["kind_aggregation"] = True
+            payload["disclosure"] += (
+                " L2.3b kind aggregation: rows of one kind across the "
+                "whole target"
+                + (" (subtree of the path directory)" if path_prefix else "")
+                + "; page via cursor; total = all matching rows.")
         return json.dumps(payload, ensure_ascii=False)
     finally:
         conn.close()

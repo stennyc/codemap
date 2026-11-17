@@ -109,13 +109,17 @@ def test_depth_2_rows(tmp_path, monkeypatch):
     assert p["status"] != "invalid"
     got = {(r["name"], r["path"].split(os.sep)[-1], r["line"], r["kind"], r["hop"])
            for r in p["symbols"]}
+    # L2.5b: the seed-face layer re-emits the seed's own def row
+    # (min_score, core.py L1) at the first even hop as an entry
+    # candidate (its consumer-hop exclusion is unchanged).
     expect = {
         ("min_score", "a.py", 1, "import", 1),
         ("min_score", "a.py", 3, "call_site", 1),
         ("entry_a", "a.py", 2, "function", 2),
+        ("min_score", "core.py", 1, "function", 2),
     }
     assert got == expect, f"depth=2 mismatch:\n got={sorted(got)}"
-    assert p["total"] == 3 and p["count"] == 3
+    assert p["total"] == 4 and p["count"] == 4
     assert p["truncated"] is False
     assert p["hops_returned"] == 2
     assert p["depth"] == 2
@@ -128,7 +132,10 @@ def test_depth_3_adds_consumers_of_hop2(tmp_path, monkeypatch):
     got = {(r["name"], r["path"].split(os.sep)[-1], r["line"], r["kind"], r["hop"])
            for r in p["symbols"]}
     assert ("entry_a", "b.py", 2, "call_site", 3) in got
-    assert p["total"] == 4 and p["hops_returned"] == 3
+    # L2.5b: +1 row for the seed-face layer (min_score def, core.py,
+    # hop 2); hop-3 frontier now includes min_score but its consumer
+    # rows (a.py import/call) were already emitted at hop 1 (dedup).
+    assert p["total"] == 5 and p["hops_returned"] == 3
 
 
 # ── 3. depth clamps to HOP_MAX_DEPTH ────────────────────────────────────────
@@ -190,7 +197,9 @@ def test_truncation_drops_shallowest_hops(tmp_path, monkeypatch):
     p = json.loads(qm.code_map_query(
         {"root": root, "name": "min_score", "depth": 3}))
     assert p["truncated"] is True
-    assert p["total"] == 4, "total must count ALL rows, truncated or not"
+    # L2.5b: total counts ALL rows including the seed-face layer
+    # (min_score def, core.py, hop 2) — the pre-L2.5b set was 4.
+    assert p["total"] == 5, "total must count ALL rows, truncated or not"
     assert p["hops_returned"] < 3 or p["count"] < p["total"]
 
 
@@ -214,9 +223,13 @@ def test_cycle_terminates(tmp_path, monkeypatch):
     finally:
         conn.close()
     p2 = _q(root, monkeypatch, name="entry_c", depth=3)
-    # hop1: the self call_site row; the seed's own def is never re-emitted,
-    # so hop2 is empty and propagation stops — total must be exactly 1.
-    assert p2["total"] == 1, p2
+    # hop1: the self call_site row (1). L2.5b: the seed-face layer
+    # re-emits the seed's OWN def row (entry_c, c.py L1) at the first
+    # even hop — so hop2 carries that 1 row (no longer "empty").
+    # hop3: the frontier name entry_c's consumer rows are the same
+    # call_site (deduped) — propagation still TERMINATES: total is
+    # exactly 2, no runaway.
+    assert p2["total"] == 2, p2
 
 
 # ── 10. single-hop truncation must KEEP rows (never zero them out) ────────
