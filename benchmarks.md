@@ -130,6 +130,34 @@ name_vocab + the composite index on the next `init_db` open by CURRENT
 code (the running gateway's stale in-memory module creates nothing; the
 query DATA face stays on the old plan until the next restart).
 
+## L2.7.4 (2026-11-18): 复盘 follow-ups F1/F2/F3
+
+Reviewer post-mortem of dc981ed/32273fa found three follow-ups, all
+shipped in one atomic commit:
+
+- **F1 (med)**: orphaned `name_vocab` rows (a file's removal via
+  `remove_paths` left the names that lived ONLY there) inflated
+  `count_concept`'s total (probe: total=1 vs reachable=0). Fixed by a
+  correlated `NOT EXISTS` prune inside `remove_paths` (the heal path
+  for vanished files — the only API boundary that deletes symbol
+  rows; cost = ~vocab-size index probes, paid only on deletions).
+- **F2 (med)**: the `fuzzy` PARAMETER-level schema description still
+  carried the pre-L2.4c flat "defside->rarity" contract (the L2.4c
+  delivery synced the long description + payload but missed this
+  face). Fixed: side-split wording + a test pinning the new marker
+  (`test_fuzzy_param_doc_carries_l24c_split`) so a rewrite cannot
+  silently regress.
+- **F3 (low)**: the degraded(vocab) + rarity=False SQL-branch combo
+  had no suite pin (only an ad-hoc probe verified it). Pinned:
+  binding invariant (`count('?') == len(params)`) + clean execution +
+  placeholder-aggregate shape (`test_degraded_vocab_binding_invariant`).
+
+Verification: the sealed-20k exact-gate test that flaked during the
+batch run FAILED 4/4 on the STASHED BASELINE (pre-L2.4d code) under
+the same machine load — the flake is load-driven and PRE-EXISTING,
+zero regression from this batch. Full-suite comm: no new-side
+failures beyond the two documented load-flake gate timings.
+
 ## L2.4 gate + live probe
 
 - `QUERY_FUZZY_GATE_MS=150` (owner-gated, looser than G1: the fuzzy path

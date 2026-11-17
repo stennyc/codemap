@@ -488,5 +488,15 @@ def remove_paths(conn: sqlite3.Connection, paths: set,
     for p in paths:
         conn.execute("DELETE FROM symbols WHERE path = ?", (p,))
         conn.execute("DELETE FROM files WHERE path = ?", (p,))
+    # L2.4d prune (reviewer finding F1, 2026-11-18): vocab rows whose
+    # names lost their LAST symbol row become orphans — harmless to the
+    # ranked leg (JOIN-excluded) but they inflate count_concept's total.
+    # Prune at the API boundary (the heal path for vanished files); the
+    # correlated delete is ~vocab-size index probes (cheap, and this
+    # path only runs on file deletions).
+    conn.execute(
+        "DELETE FROM name_vocab WHERE NOT EXISTS"
+        " (SELECT 1 FROM symbols s"
+        "  WHERE s.root = name_vocab.root AND lower(s.name) = name_vocab.lname)")
     if commit:
         conn.commit()

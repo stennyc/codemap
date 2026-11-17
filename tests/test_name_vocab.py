@@ -268,3 +268,69 @@ def test_root_lname_index_created_on_open(monkeypatch, tmp_path):
         assert "idx_symbols_root_lname" in idx, idx
     finally:
         conn.close()
+
+
+# ── reviewer-findings follow-ups (2026-11-18 复盘 F1/F2/F3) ────────────────
+
+def test_remove_paths_prunes_vocab(monkeypatch, tmp_path):
+    """F1: a file removal via the REAL API (remove_paths — the heal path
+    for vanished source files) must prune the vocab rows whose names no
+    longer have ANY symbol row, so count_concept's total stays exact.
+    (A raw DELETE of symbol rows still leaves orphans by design — the
+    JOIN-exclusion test above; the prune rides on the API boundary.)"""
+    root = _seed_root(monkeypatch, tmp_path)
+    _fresh_imports()
+    from code_map import db as cdb
+    conn = cdb.init_db(root)
+    try:
+        a = str(Path(root) / "a.py")
+        # rare_helper exists ONLY in a.py → its vocab row must die
+        assert cdb.count_concept(conn, root, ["rare"]) == 1
+        cdb.remove_paths(conn, {a})
+        assert cdb.count_concept(conn, root, ["rare"]) == 0, \
+            "orphaned vocab row inflates total after the file is gone"
+        # names still living in other files survive the prune
+        assert cdb.count_concept(conn, root, ["widget"]) >= 1
+        assert cdb.count_concept(conn, root, ["hot"]) == 1
+    finally:
+        conn.close()
+
+
+def test_degraded_vocab_binding_invariant(monkeypatch, tmp_path):
+    """F3: the degraded (rarity=False) + vocab leg is a distinct SQL
+    branch with a distinct parameter list (tier CASEs only — the
+    strong-flag CASEs and the def-side kinds are absent). The branch's
+    classic failure mode is a binding shift (ProgrammingError or a
+    silent parameter drift): pin count('?') == len(params) AND a clean
+    execution with the placeholder aggregates."""
+    root = _seed_root(monkeypatch, tmp_path)
+    _fresh_imports()
+    from code_map import db as cdb
+    conn = cdb.init_db(root)
+    try:
+        where, wparams = cdb._concept_vocab_predicate(root, ["widget"])
+        sel, sp = cdb._concept_rank_sql(["widget"], where, wparams, 200, 0,
+                                        rarity=False, col="v.lname",
+                                        vocab=True)
+        assert sel.count("?") == len(sp), \
+            f"binding shift on the degraded+vocab branch: {sel.count('?')} vs {len(sp)}"
+        rows = conn.execute(sel, sp).fetchall()
+        assert rows, "the degraded leg must still return candidates"
+        # placeholder aggregates: hits=0, occ=0, defmark=1 (usage-shaped)
+        assert all(r[5] == 0 and r[6] == 1 for r in rows), rows
+    finally:
+        conn.close()
+
+
+def test_fuzzy_param_doc_carries_l24c_split(monkeypatch, tmp_path):
+    """F2: the `fuzzy` PARAMETER-level schema description (the face the
+    model reads via tool_describe) must carry the L2.4c side-split
+    contract — the pre-L2.4c wording pinned 'defside->rarity' for ALL
+    candidates, which inverts on the def-side. Pin the NEW marker so a
+    future rewrite cannot silently regress to the stale contract."""
+    _fresh_imports()
+    import code_map
+    doc = code_map._TOOL_SCHEMAS["code_map_query"]["parameters"]["properties"][
+        "fuzzy"]["description"]
+    assert "heat" in doc, doc  # the def-side term must be visible
+    assert "defside->rarity" not in doc, doc  # the stale flat-rarity wording is gone
