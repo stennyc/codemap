@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS files (
     size          INTEGER NOT NULL,
     lang          TEXT NOT NULL,
     build_id      TEXT NOT NULL,
-    fingerprint_epoch INTEGER NOT NULL DEFAULT 0
+    fingerprint_epoch INTEGER NOT NULL DEFAULT 0,
+    parser_gen    TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS symbols (
     name  TEXT NOT NULL,
@@ -57,17 +58,31 @@ def init_db(root: str) -> sqlite3.Connection:
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(db)
     conn.executescript(_SCHEMA)
+    # L2.3c in-place migration: pre-L2.3c dbs lack files.parser_gen
+    # (CREATE TABLE IF NOT EXISTS cannot add a column to an existing
+    # table); the legacy '' stamp = unknown generation, always re-parsed
+    # on the next build (self-healing, no wipe ritual needed).
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(files)")]
+    if "parser_gen" not in cols:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN parser_gen TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
 
 def upsert_file(conn: sqlite3.Connection, path: str, mtime: float,
                 size: int, lang: str, build_id: str,
-                commit: bool = True) -> None:
+                commit: bool = True, parser_gen: str = "") -> None:
+    """L2.3c: `parser_gen` stamps the PARSER GENERATION that parsed this
+    file (config.PARSER_GENERATION) — a mismatch with the current
+    generation forces a re-parse (scanner) and surfaces as
+    staleness="parser_gen_stale" (queries). Default '' = legacy/unknown
+    (pre-L2.3c rows): always treated as stale by the build."""
     conn.execute(
-        "INSERT OR REPLACE INTO files(path, mtime, size, lang, build_id, fingerprint_epoch)"
-        " VALUES(?, ?, ?, ?, ?, 0)",
-        (path, mtime, size, lang, build_id),
+        "INSERT OR REPLACE INTO files(path, mtime, size, lang, build_id, "
+        "fingerprint_epoch, parser_gen)"
+        " VALUES(?, ?, ?, ?, ?, 0, ?)",
+        (path, mtime, size, lang, build_id, parser_gen),
     )
     if commit:
         conn.commit()

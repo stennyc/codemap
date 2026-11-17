@@ -1031,13 +1031,29 @@ def _reindex_single_file_sync(root: str, file_path: str) -> None:
         lang = EXT_TO_LANG.get(ext, "unknown")
         if lang == "unknown":
             return  # not an indexable source file
+        # L2.3c: no grammar for this language = parse_file would return []
+        # and the upsert would FAKE a fresh fingerprint over
+        # stale-generation rows (the L2.7 incident's persistence
+        # mechanism: the 58 phantom rows survived because no-grammar
+        # reindexes kept stamping the files row "current"). Leave the db
+        # UNTOUCHED; a later build with the grammar available re-parses.
+        from . import config
+        from .registry import available_languages
+        if lang not in available_languages():
+            return
         with _heal_lock:
             with write_lock(nowait=True, what="single-file reindex"):
                 conn = init_db(root)
                 try:
                     rows = parse_file(file_path) or []
                     mtime, size = file_fingerprint(p)
-                    upsert_file(conn, file_path, mtime, size, lang, "hook")
+                    # L2.3c: clear this file's prior rows first — an older
+                    # generation's orphan rows would survive the pure
+                    # INSERT OR REPLACE below (the phantom-row class).
+                    from .db import remove_paths
+                    remove_paths(conn, {file_path})
+                    upsert_file(conn, file_path, mtime, size, lang, "hook",
+                                parser_gen=config.PARSER_GENERATION)
                     insert_symbols(conn, root, file_path, rows, commit=True)
                     invalidate_cache(root)
                 finally:

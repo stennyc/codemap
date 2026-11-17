@@ -38,8 +38,11 @@ def _seed(root: str, rows_by_path: dict) -> None:
 
     Confirms the root in the (env-isolated) registry — the query gate
     rejects unconfirmed roots, so seeding without confirming would make
-    every concept query bounce off the root gate, not the candidate SQL."""
-    from code_map import rootreg
+    every concept query bounce off the root gate, not the candidate SQL.
+    L2.3c: the files rows are stamped with the CURRENT parser generation
+    — an unstamped ('' legacy) row reads as parser_gen_stale on the
+    staleness face and would flip freshness assertions."""
+    from code_map import rootreg, config
     conn = init_db(root)
     try:
         for rel, rows in rows_by_path.items():
@@ -47,7 +50,8 @@ def _seed(root: str, rows_by_path: dict) -> None:
             os.makedirs(os.path.dirname(fpath), exist_ok=True)
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write("\n".join(r[3] for r in rows) + "\n")
-            upsert_file(conn, fpath, time.time(), 0, "python", "concept-test")
+            upsert_file(conn, fpath, time.time(), 0, "python", "concept-test",
+                        parser_gen=config.PARSER_GENERATION)
             insert_symbols(conn, root, fpath, rows)
     finally:
         conn.close()
@@ -223,8 +227,10 @@ def test_20k_rows_within_query_gate(tmp_path, monkeypatch):
         f.write("x = 1\n")
     conn = init_db(root)
     try:
+        from code_map import config
         upsert_file(conn, os.path.join(root, "x.py"), time.time(), 0, "python",
-                    "gate-test", commit=False)
+                    "gate-test", commit=False,
+                    parser_gen=config.PARSER_GENERATION)
         rows = [(f"sym_{i:05d}_mod", "function", i, f"def sym_{i:05d}_mod()")
                 for i in range(20_000)]
         conn.executemany(
@@ -270,8 +276,10 @@ def test_exact_path_stays_within_sealed_gate_at_20k(tmp_path, monkeypatch):
         f.write("x = 1\n")
     conn = init_db(root)
     try:
+        from code_map import config
         upsert_file(conn, os.path.join(root, "x.py"), time.time(), 0, "python",
-                    "gate-test", commit=False)
+                    "gate-test", commit=False,
+                    parser_gen=config.PARSER_GENERATION)
         rows = [(f"sym_{i:05d}_mod", "function", i, f"def sym_{i:05d}_mod()")
                 for i in range(20_000)]
         conn.executemany(

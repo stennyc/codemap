@@ -25,6 +25,7 @@ from .db import (init_db, count_symbols, count_concept, query_symbols,
                 query_concept, stale_paths)
 from .fingerprint import diff_indexed, invalidate_cache, on_disk_files
 from . import rootreg
+from . import config
 
 # ── transcript 兜底 (Q3, owner policy 2026-10-11) ─────────────────────────
 # 宿主 clarify 工具是原生单选卡；其应答在 transcript（session 持久层）里
@@ -576,17 +577,41 @@ def _resolve_query_path(root: str, path: str) -> Optional[str]:
 def _staleness(root: str, conn) -> str:
     """Check if the index for `root` is stale (files changed since last build).
 
-    Returns 'fresh' | 'partial'. Exception -> 'fresh' (non-blocking disclosure,
-    not a rescan signal).
+    Returns 'fresh' | 'partial' | 'parser_gen_stale' (L2.3c: some files
+    were parsed under an OLDER parser generation — their symbol rows may
+    be stale (phantom rows); re-parse with code_map_refresh). Exception
+    -> 'fresh' (non-blocking disclosure, not a rescan signal).
     """
     try:
         on_disk = on_disk_files(root)
         added, removed = diff_indexed(root, on_disk)
         if added or removed:
             return "partial"
+        # L2.3c: source UNCHANGED on disk, but some files carry an older
+        # parser-generation stamp (files.parser_gen != the current one;
+        # '' = pre-L2.3c legacy) — an mtime diff cannot see a parser
+        # upgrade, the L2.7 phantom-row incident's blind spot.
+        n = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE ? AND parser_gen != ?",
+            (f"{root}{os.sep}%", config.PARSER_GENERATION)).fetchone()[0]
+        if n:
+            return "parser_gen_stale"
         return "fresh"
     except Exception:
         return "fresh"
+
+
+def _attach_gen_stale_note(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """L2.3c: when staleness surfaces the parser-generation mismatch, pin
+    the meaning in the payload so a consumer does not read
+    stale-generation rows as current (the 131-vs-76 min_score misread)."""
+    if payload.get("staleness") == "parser_gen_stale":
+        payload["note"] = (
+            "staleness=parser_gen_stale: one or more files were indexed "
+            "under an OLDER parser generation; their symbol rows may be "
+            "stale (phantom rows). Re-parse with code_map_refresh — the "
+            "re-parse clears each stale file's rows and re-stamps them.")
+    return payload
 
 
 def _serialize(page: list, staleness: str, root: str,
@@ -756,6 +781,7 @@ def _run_fuzzy_branch(conn, root: str, name, path_filter, kind,
             str(offset + len(rows)), total, rarity_on, truncated=True)
     payload = json.loads(result)
     payload["query_ms"] = elapsed_ms
+    payload = _attach_gen_stale_note(payload)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1040,6 +1066,7 @@ def code_map_query(args: Dict[str, Any]) -> str:
                                      hseedface)
             payload = json.loads(result)
             payload["query_ms"] = int((time.perf_counter() - t0) * 1000)
+            payload = _attach_gen_stale_note(payload)
             return json.dumps(payload, ensure_ascii=False)
         if fuzzy:
             # L2.4: word-surface candidates (the exact path below stays
@@ -1096,6 +1123,7 @@ def code_map_query(args: Dict[str, Any]) -> str:
                 "whole target"
                 + (" (subtree of the path directory)" if path_prefix else "")
                 + "; page via cursor; total = all matching rows.")
+        payload = _attach_gen_stale_note(payload)
         return json.dumps(payload, ensure_ascii=False)
     finally:
         conn.close()

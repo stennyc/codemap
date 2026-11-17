@@ -22,6 +22,18 @@ PAGE_MAX_SYMBOLS = 200          # structural backstop
 # scandir diff cost.
 QUERY_GATE_MS = 50
 
+# L2.3c (2026-11-17): parser-generation stamp. Cross-generation phantom
+# rows (the L2.7 campaign: 55 phantom kwarg rows in an 18k-line file
+# written by an EARLIER parser/grammar generation, invisible to the
+# source-mtime fingerprint, reported "fresh" by staleness) are killed by
+# stamping every files-table row with the generation that parsed it:
+# scanner re-parses on mismatch, _staleness surfaces "parser_gen_stale",
+# a no-grammar hook reindex leaves the files row untouched. BUMP THIS
+# ON EVERY PARSER-OR-GRAMMAR CHANGE (parser.py, grammar installs) so the
+# next build re-parses; the legacy '' stamp (pre-L2.3c dbs) is always
+# stale by design — the first post-upgrade build self-heals them.
+PARSER_GENERATION = "l2.3c-1"
+
 # Walk / estimation gate (contract ⑤): pure stat-only walk of a candidate root
 # must complete <2s; above 20k files we warn + invite free-input narrowing.
 WALK_ESTIMATE_BUDGET_S = 2.0

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Set
 
 from .config import BUILD_COMMIT_BATCH, INDEXED_EXTENSIONS
+from . import config
 from .db import init_db, insert_symbols, upsert_file, remove_paths
 from .fingerprint import file_fingerprint, invalidate_cache, on_disk_files
 from .parser import parse_file, available, available_for
@@ -25,7 +26,8 @@ class BuildScanner:
     def __init__(self, root: str, build_id: str):
         self.root = os.path.abspath(root)
         self.build_id = build_id
-        self._stats = {"added": 0, "removed": 0, "parsed": 0, "skipped": 0}
+        self._stats = {"added": 0, "removed": 0, "parsed": 0, "skipped": 0,
+                       "gen_reparsed": 0}
 
     def run(self) -> dict:
         """Execute the build. Returns a stats dict. Non-blocking (call in thread)."""
@@ -47,17 +49,34 @@ class BuildScanner:
             self._stats["removed"] = len(removed)
 
         lang_set = set(available_languages())
+        # L2.3c: files indexed under an OLDER parser generation must be
+        # re-parsed even when their SOURCE is unchanged — a parser/grammar
+        # upgrade silently no-ops on mtime equality and the stale-generation
+        # symbol rows stay visible (the L2.7 phantom-row incident: 55
+        # older-generation kwarg rows in an 18k-line file, reported
+        # "fresh" by staleness). '' = pre-L2.3c legacy row (unknown
+        # generation) — re-parsed by design (one-shot self-heal). The
+        # re-parse clears the file's rows FIRST (an older generation's
+        # orphan rows are not overwritten by INSERT OR REPLACE).
+        gen_stale = {r[0] for r in conn.execute(
+            "SELECT path FROM files WHERE path LIKE ? AND parser_gen != ?",
+            (f"{self.root}{os.sep}%", config.PARSER_GENERATION))
+            if r[0] in on_disk}
         batch: List[tuple] = []
-        for fpath in sorted(added):
+        for fpath in sorted(added | gen_stale):
             ext = os.path.splitext(fpath)[1].lower()
             lang = EXT_TO_LANG.get(ext, "unknown")
             if lang not in lang_set:
                 self._stats["skipped"] += 1
                 continue
+            if fpath in gen_stale:
+                remove_paths(conn, {fpath})
+                self._stats["gen_reparsed"] += 1
             rows = parse_file(fpath)
             mtime, size = file_fingerprint(Path(fpath))
             upsert_file(conn, fpath, mtime, size, lang,
-                        self.build_id, commit=False)
+                        self.build_id, commit=False,
+                        parser_gen=config.PARSER_GENERATION)
             insert_symbols(conn, self.root, fpath, rows, commit=False)
             self._stats["parsed"] += 1
             if len(batch) >= BUILD_COMMIT_BATCH:
