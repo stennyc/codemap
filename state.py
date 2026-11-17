@@ -13,7 +13,7 @@ import threading
 import uuid
 from typing import Any, Dict, Optional
 
-from .config import BUILD_COMMIT_BATCH, data_dir, root_db_path, ROOT_MARKERS
+from .config import BUILD_COMMIT_BATCH, PARSER_GENERATION, data_dir, root_db_path, ROOT_MARKERS
 from .db import init_db, insert_symbols, upsert_file, remove_paths
 from .fingerprint import file_fingerprint, invalidate_cache, on_disk_files
 from .parser import parse_file, available
@@ -346,6 +346,12 @@ def _commit_batch(conn, root: str, build_id: str,
                   batch: list) -> None:
     """Upsert files + insert symbols, one commit per batch."""
     for fpath, mtime, size, lang, rows in batch:
-        upsert_file(conn, fpath, mtime, size, lang, build_id, commit=False)
+        # F7 (restart-acceptance 2026-11-17): the L2.3c stamp must ride on
+        # EVERY files-upsert path — this one (the host refresh / L3 build
+        # commit batches) slipped through 8f2a4b9 with the default '',
+        # re-manufacturing parser_gen_stale rows on every host-side
+        # refresh of changed files.
+        upsert_file(conn, fpath, mtime, size, lang, build_id, commit=False,
+                    parser_gen=PARSER_GENERATION)
         insert_symbols(conn, root, fpath, rows, commit=False)
     conn.commit()
