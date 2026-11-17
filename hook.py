@@ -143,6 +143,36 @@ def _extract_clarify_qr(args: Any, result: Any) -> tuple[Optional[str], str]:
     return q, (reply or "").strip()
 
 
+_LIVE_SESSION_FILE = "_live_session.json"
+
+
+def _touch_live_session(session_id: Optional[str]) -> None:
+    """Refresh the live-session heartbeat file (data/_live_session.json)
+    that query._clarify_evidence reads as a third C-lite live identity.
+
+    Why: the host passes the per-call session kwarg to HOOKS (this face)
+    but NOT to plugin tool handlers (plugins_context.py:335 calls the
+    handler with dict(arguments) only), so the transcript-evidence gate
+    inside code_map_check_root(yes=true) can only see the GATEWAY PROCESS
+    env — which in a multiplexed desktop gateway differs from the live
+    chat session that minted the evidence line (2026-11-17 kbs
+    blocked_by_policy incident). The heartbeat is the plugin-side
+    channel. Fail-soft: never blocks the dispatcher; an empty/None
+    session leaves any good heartbeat untouched."""
+    if not session_id:
+        return
+    try:
+        from .config import data_dir
+        p = data_dir() / _LIVE_SESSION_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "session_id": session_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        }))
+    except Exception:
+        pass
+
+
 def _record_clarify_evidence(args: Any, result: Any, status: Any,
                              session_id: Optional[str] = None) -> None:
     """Record a host clarify call as transcript evidence for the code_map
@@ -857,6 +887,11 @@ def _post_tool_call(tool_name: str = "", args: Any = None,
     callers that don't pass status).
     """
     try:
+        # Live-session heartbeat (C-lite gate, 2026-11-17): refresh
+        # data/_live_session.json so the transcript-evidence gate — which
+        # runs in the tool-handler surface that never sees per-call
+        # session kwargs — knows THIS process's live chat session.
+        _touch_live_session(_.get("session_id"))
         # Read-side ledger: a read_file/search_files landing OUTSIDE any
         # confirmed target logs the file's enclosing DIRECTORY (project
         # boundary) into the session-scoped ledger. The turn-boundary

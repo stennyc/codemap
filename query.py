@@ -14,6 +14,7 @@ import os
 import re
 import time
 import uuid
+import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -230,6 +231,34 @@ def _evidence_log() -> Path:
     return data_dir() / _EVIDENCE_FILE
 
 
+_LIVE_SESSION_FILE = "_live_session.json"
+_LIVE_SESSION_MAX_AGE_S = 600.0
+
+
+def _live_session_id(max_age_s: float = _LIVE_SESSION_MAX_AGE_S) -> Optional[str]:
+    """Live-session heartbeat written by hook._touch_live_session on every
+    post_tool_call that carries the per-call session kwarg. The host passes
+    session kwargs to HOOKS but not to plugin tool handlers
+    (plugins_context.py:335: handler(dict(arguments)) only), so the gate
+    caller cannot see the live chat session itself — the heartbeat is the
+    only plugin-side channel. Fresh (<=max_age_s) -> its session id;
+    absent/stale/corrupt -> None (a stale heartbeat must NOT authorize:
+    the live session has moved on, fail-closed)."""
+    try:
+        p = data_dir() / _LIVE_SESSION_FILE
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        sid = d.get("session_id") or None
+        ts = d.get("ts") or ""
+        if not sid or not ts:
+            return None
+        age = time.time() - datetime.datetime.fromisoformat(ts).timestamp()
+        return sid if age <= max_age_s else None
+    except Exception:
+        return None
+
+
 def _path_segments(target: str):
     return [s for s in target.replace("\\", "/").split("/") if s]
 
@@ -376,8 +405,19 @@ def _clarify_evidence(target: str, root: str, path: str,
     to keep existing tests green; a production call always passes the
     live ``HERMES_SESSION_ID`` so the check is active."""
     target = os.path.abspath(target)
-    if session_id is None:
-        session_id = os.environ.get("HERMES_SESSION_ID")
+    # C-lite live identities (2026-11-17): the mint side stamps the LIVE
+    # CHAT session (per-call host kwargs, visible ONLY to hooks), while the
+    # gate caller historically saw just the GATEWAY PROCESS env — in a
+    # multiplexed desktop gateway the two differ and the live evidence
+    # dead-ended (kbs blocked_by_policy). Accept a line stamped with ANY
+    # live identity: explicit param, process env, or the fresh hook-side
+    # heartbeat. An empty set = the pre-C-lite degrade face (no session
+    # check), back-compatible with sessionless runners.
+    live = {s for s in (
+        session_id,
+        os.environ.get("HERMES_SESSION_ID"),
+        _live_session_id(),
+    ) if s}
     # C-mid: load the signing key once. Acceptance policy:
     #   - record has NO "sig" key at all -> pre-C-mid back-compat line,
     #     falls through to the C-lite session check below only.
@@ -457,9 +497,9 @@ def _clarify_evidence(target: str, root: str, path: str,
             #   legacy row we are trying to block.
             # When session_id is None (unit tests / session-less runner) the
             # check is skipped, preserving the pre-C-lite behavior.
-            if session_id:
+            if live:
                 rec_sid = rec.get("session_id")
-                if rec_sid != session_id:
+                if rec_sid not in live:
                     continue
             rows.append(rec)
         if not rows:
