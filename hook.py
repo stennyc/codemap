@@ -856,10 +856,17 @@ def on_pre_llm_call(session_id: str = "", user_message: str = "",
 def _needs_index_build_question(proj: str) -> bool:
     """True only when the project genuinely needs the '要 / 不要 / 不再问'
     build question. False when the project is already a confirmed target,
-    sits under one (refresh case), or has a db record (refresh case).
-    Mirrors the write-side skip guards in _log_unindexed_read so a stale
-    ledger row can't turn a refresh case into a redundant build question
-    (owner 2026-10-19)."""
+    sits under one (refresh case), has a db record (refresh case), or no
+    longer exists on disk. The last case matters because the confirm /
+    under-confirmed / db guards are all silent about DELETION: a folder
+    removed after the read (the owner's deleted 3rd-copy shape) is not
+    confirmed, sits under no confirmed target, and has no db — so without
+    the existence guard a stale ledger row would ask '是否建索引' forever
+    on a dead directory (owner 2026-11-17). Mirrors the write-side skip
+    guards in _log_unindexed_read so a stale row can't turn a refresh case
+    into a redundant build question (owner 2026-10-19)."""
+    if not os.path.isdir(proj):
+        return False  # folder deleted since the read -> dead row, never ask
     if rootreg.is_confirmed_root(proj):
         return False
     confirmed = _confirmed_roots()

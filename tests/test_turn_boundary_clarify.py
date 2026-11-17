@@ -582,3 +582,40 @@ def test_search_files_relative_pattern_does_not_log(tmp_path):
     hook._post_tool_call("search_files", {"pattern": "core.py"}, None,
                          status="ok", session_id="s1")
     assert _pending_rows() == before, "relative pattern must not mint a row"
+
+
+# ── deleted-directory guard (2026-11-17): a dead folder is not "pending" ──
+
+def test_pre_llm_call_deleted_project_does_not_ask(tmp_path):
+    """A pending ledger row whose project folder was DELETED after the read
+    must not fire a build question. Deletion is invisible to the
+    confirm / under-confirmed / db guards (a deleted dir is not confirmed,
+    sits under no confirmed target, and has no db record), so without the
+    existence guard a stale row would ask '是否建索引' forever on a folder
+    that no longer exists (the owner's deleted 3rd-copy shape)."""
+    import shutil
+    from code_map import hook
+    proj = _make_unconfirmed_project(tmp_path, name="projDeleted")
+    hook._post_tool_call("read_file", {"path": str(proj / "core.py")}, None,
+                         status="ok", session_id="s1")
+    assert len(_pending_rows()) == 1, "row is pending while the dir is alive"
+    # The folder is deleted (owner's 3rd-copy discipline).
+    shutil.rmtree(proj, ignore_errors=True)
+    out = hook.on_pre_llm_call(session_id="s1", user_message="hi",
+                               conversation_history=[], model="m",
+                               platform="tui")
+    assert out is None, f"deleted project must not fire a build question: {out}"
+
+
+def test_needs_index_build_question_dead_dir_false_live_true(tmp_path):
+    """_needs_index_build_question is the single 'genuinely pending' gate:
+    a folder that no longer exists on disk must return False (no question);
+    a live unconfirmed, no-db project must still return True (no
+    over-suppression of a real pending project)."""
+    from code_map import hook
+    live = _make_unconfirmed_project(tmp_path, name="projLive")
+    dead = str(tmp_path / "proj_gone")  # never created
+    assert hook._needs_index_build_question(str(live)) is True, \
+        "a live unconfirmed, no-db project must remain genuinely pending"
+    assert hook._needs_index_build_question(dead) is False, \
+        "a folder that does not exist must not be asked about"
