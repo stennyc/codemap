@@ -243,6 +243,8 @@ def test_is_transient_dir_windows():
         "C:\\Users\\me\\proj\\__pycache__",
         "C:\\Users\\me\\x\\CACHE",          # case-insensitive on Windows
         "C:/Users/me/.venv/cache",          # mixed separators
+        "C:\\Users\\me\\AppData\\Local\\hermes\\profiles\\coder\\skills\\"
+        "autonomous-ai-agents\\hermes-file-memory-plugin",  # owner never-propose skill dir
     ):
         assert config.is_transient_dir(spell, True) is True, spell
     # a real owner source project / plugin is NOT transient:

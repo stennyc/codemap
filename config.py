@@ -150,14 +150,16 @@ def is_system_tree(root: str, is_windows: bool) -> bool:
 # Never-log transient markers (owner 2026-11-17 "临时目录永不再问" ruling):
 # directory names that, anywhere on a resolved boundary path, mark a
 # transient / non-source location code_map must NEVER propose for indexing —
-# caches, scratch space, handoff data, pyc caches. Distinct from
-# DEFAULT_PRUNE_BLACKLIST (the scanner's "skip this subtree INSIDE a confirmed
-# root"): that prunes a walk; this vetoes the clarify-ledger path outright for
-# a boundary that is a cache/data tree, not a source project. Marker match is
-# case-insensitive on Windows (dirs are case-insensitive there), mirroring
-# is_system_tree.
+# caches, scratch space, handoff data, pyc caches, plus the specific
+# hermes-file-memory-plugin skill dir the owner ruled "never propose".
+# Distinct from DEFAULT_PRUNE_BLACKLIST (the scanner's "skip this subtree
+# INSIDE a confirmed root"): that prunes a walk; this vetoes the clarify-ledger
+# path outright for a boundary that is a cache/data/skill tree, not a source
+# project. Marker match is case-insensitive on Windows (dirs are
+# case-insensitive there), mirroring is_system_tree.
 TRANSIENT_DIR_NAMES = frozenset({
     "cache", ".cache", "scratch", "spillover", "handoffs", "__pycache__",
+    "hermes-file-memory-plugin",
 })
 
 
