@@ -275,3 +275,27 @@ paged all 5 pages and matched disk 76 exactly.
 - grep arms beat index arms on small targets (3–4 s whole-tree scans);
   index wins reserved for the 30k-file regime and name/parameter regime
   (L2.2 proved the parameter side on the 127-file filemem target).
+
+## W1/W2 closing (2026-11-17): exact-branch plan fix + by-design verification
+
+- **W1** (exact name+kind steady 363-385ms on the 32k-row live filemem db):
+  two-part root cause. (a) query_ms t0 started BEFORE the staleness
+  fingerprint walk (on_disk_files + diff_indexed over 133 files) — under a
+  busy host the walk dominated the gated metric. Moved t0 after the walk:
+  query_ms now measures the query layer only (the walk still runs;
+  staleness reporting unchanged). (b) EXPLAIN showed the equality
+  predicate `root=? AND name=? AND kind=?` planning onto the root-prefix
+  of `idx_symbols_root_lname` = a full 32k-row root scan (180-230ms): the
+  case-SENSITIVE `name = ?` cannot use the lower(name) composite. New
+  `idx_symbols_root_name_kind ON symbols(root, name, kind)` → COVERING
+  point probe, EXPLAIN `SEARCH ... COVERING INDEX (root=? AND name=? AND
+  kind=?)`, 0.0/0.2ms raw SQL; host-path exact probe **query_ms=1**
+  (was 197ms steady) on the live 32,300-row db, total=76 (min_score
+  kwarg_usage GT). Suite: baseline-comm clean (one flake is the
+  pre-existing Linux-layout class, reproduces on stash).
+- **W2** (`min_search_score` 0 kwarg rows): verified BY DESIGN, not a
+  miss — the symbol survives in source as an attribute assignment
+  (`p.min_search_score = 0.0`) and a config-key string literal
+  (`key="min_search_score"`); name-level indexing never captures value
+  literals or attribute targets. Value-layer lookups stay grep's
+  territory (disclosed upper bound). No code change.

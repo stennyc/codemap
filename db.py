@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS name_vocab (
 -- 109ms at 62k rows) and the representative-row IN (62ms -> ~0ms:
 -- each name is a (root, lower(name)) index range now).
 CREATE INDEX IF NOT EXISTS idx_symbols_root_lname ON symbols(root, lower(name));
+-- W1 (2026-11-17): equality probe for the EXACT branch (root=? AND name=?
+-- AND kind=?). The case-SENSITIVE `name = ?` predicate cannot use the
+-- lower(name) composite, so the planner fell back to the root-prefix of
+-- idx_symbols_root_lname = a full-root row scan (32k rows ~ 180-230ms on
+-- the live filemem db). This composite makes the equality probe O(log);
+-- idempotent backfill on next init_db open (zero migration, F5 pattern).
+CREATE INDEX IF NOT EXISTS idx_symbols_root_name_kind ON symbols(root, name, kind);
 """
 
 

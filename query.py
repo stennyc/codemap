@@ -1039,8 +1039,15 @@ def code_map_query(args: Dict[str, Any]) -> str:
 
     conn = init_db(root)
     try:
-        t0 = time.perf_counter()  # L45
         staleness = _staleness(root, conn)  # L64
+        # L90 (W1, 2026-11-17): t0 starts AFTER the staleness fingerprint
+        # walk (on_disk_files + diff_indexed over N files) so query_ms
+        # measures the query layer only. Under a busy host the walk
+        # dominates wall time and was flaking the 50ms gate load-sensitively
+        # (idle 363-385ms observed on a 32k-row db with 133-file walk). The
+        # walk still runs (staleness reporting unchanged); it just no longer
+        # inflates the gated metric.
+        t0 = time.perf_counter()  # L45
         offset = int(cursor) if cursor.isdigit() else 0
         # L2.5 multi-hop impact propagation: depth >= 1 takes precedence
         # over BOTH the exact-name and the fuzzy paths; path/kind/cursor/
