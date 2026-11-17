@@ -43,8 +43,8 @@ from typing import Any, Dict, Optional
 from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
-                    READ_SYMBOL_MAX_BYTES, data_dir, is_system_tree,
-                    is_transient_dir, IS_WINDOWS)
+                    READ_SYMBOL_MAX_BYTES, data_dir, is_container_root,
+                    is_system_tree, is_transient_dir, IS_WINDOWS)
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
@@ -553,6 +553,8 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         # class.
         if is_transient_dir(proj_abs, IS_WINDOWS):
             return
+        if is_container_root(proj_abs, IS_WINDOWS):
+            return  # bare HERMES_HOME / profiles container -> never a row (owner 2026-11-17)
         if rootreg.is_confirmed_root(proj):
             return
         from .config import root_db_path
@@ -877,6 +879,8 @@ def _needs_index_build_question(proj: str) -> bool:
         return False  # folder deleted since the read -> dead row, never ask
     if is_transient_dir(proj, IS_WINDOWS):
         return False  # transient cache/data tree -> never offered (owner 2026-11-17)
+    if is_container_root(proj, IS_WINDOWS):
+        return False  # bare HERMES_HOME / profiles container -> never offered (owner 2026-11-17)
     if rootreg.is_confirmed_root(proj):
         return False
     confirmed = _confirmed_roots()

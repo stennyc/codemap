@@ -635,3 +635,24 @@ def test_needs_index_build_question_transient_is_false(tmp_path):
         "a live transient cache dir must not be offered for indexing"
     assert hook._needs_index_build_question(str(live)) is True, \
         "a live real source project must remain genuinely pending"
+
+
+def test_needs_index_build_question_container_root_false_subdir_true(tmp_path):
+    """Owner 2026-11-17 '子目录安全的容器根屏蔽': the ASK gate must treat the
+    BARE HERMES_HOME container as not genuinely pending (never proposed — it
+    exists, so this proves the container guard fires, not the isdir one),
+    while a sub-project UNDER the container stays pending (indexable). The
+    autouse fixture sets HERMES_HOME to tmp_path/hermes_home (which exists)."""
+    from code_map import hook
+    home = tmp_path / "hermes_home"
+    assert home.exists(), "the fixture must create the isolated HERMES_HOME"
+    # the bare container root: exists, so if the gate returns False it is the
+    # container guard (not the isdir guard) firing:
+    assert hook._needs_index_build_question(str(home)) is False, \
+        "the bare HERMES_HOME container must never be offered for indexing"
+    # a sub-project UNDER the container is still genuinely pending (indexable):
+    sub = home / "plugins" / "filemem"
+    (sub / ".git").mkdir(parents=True)
+    (sub / "e.py").write_text("def e(): pass\n", encoding="utf-8")
+    assert hook._needs_index_build_question(str(sub)) is True, \
+        "a sub-project under the container must stay indexable (subdir-safe)"

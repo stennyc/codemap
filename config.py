@@ -180,6 +180,44 @@ def is_transient_dir(path: str, is_windows: bool = False) -> bool:
         comps = [c.lower() for c in comps]
     return any(c in TRANSIENT_DIR_NAMES for c in comps)
 
+
+def _hermes_home_base() -> Path:
+    """The hermes home base that data_dir() is rooted under (HERMES_HOME).
+    data_dir() = <base>/plugins/code_map/data, so the base sits three levels
+    up. Honors the live HERMES_HOME env (which data_dir() resolves), so the
+    result tracks the host/profile — never a hardcoded path. (owner
+    2026-11-17 '从 HERMES_HOME 推导,不硬编码' ruling.)"""
+    return data_dir().parent.parent.parent
+
+
+def is_container_root(proj: str, is_windows: bool = False) -> bool:
+    """True when `proj` is EXACTLY one of the hermes-internal BARE container
+    roots — HERMES_HOME itself, or HERMES_HOME/profiles — the 'never propose
+    indexing the whole container' case (owner 2026-11-17 '子目录安全的容器根
+    屏蔽'). Subdirectory-safe by construction: only the bare root matches
+    (exact, separator/case-normalized comparison on Windows); a sub-project
+    UNDER the container (e.g. .../hermes/plugins/filemem) is NOT a container
+    root and stays indexable. The roots are DERIVED from the live HERMES_HOME
+    (via _hermes_home_base / data_dir), never hardcoded. Note: unlike the
+    other pure-string predicates here, this one derives the roots via
+    data_dir() (an idempotent mkdir, harmless in prod and tests)."""
+    target = (proj or "").strip()
+    if not target:
+        return False
+    base = _hermes_home_base()
+    candidates = (str(base), str(base / "profiles"))
+    if is_windows:
+        want = target.replace("/", "\\").lower()
+        for cand in candidates:
+            if want == cand.replace("/", "\\").lower():
+                return True
+        return False
+    for cand in candidates:
+        if target == cand:
+            return True
+    return False
+
+
 # SQLite tuning (contract ⑦): WAL + busy_timeout + per-file single-writer lock.
 WAL_BUSY_TIMEOUT_MS = 5000
 # Tier-1 save-hook debounce: agent writes N files in a burst -> one parse job.

@@ -292,3 +292,39 @@ def test_ledger_still_logs_real_project_with_cache_subdir(tmp_path, monkeypatch)
     text = ledger.read_text() if ledger.exists() else ""
     assert str(proj) in text, \
         "a real project with a cache subdir must still be offered (boundary = the project)"
+
+
+# ── 9. container-root never-propose guard (subdir-safe, owner 2026-11-17) ──
+def test_is_container_root_blocks_bare_home_and_profiles(tmp_path, monkeypatch):
+    """is_container_root: the BARE HERMES_HOME and HERMES_HOME/profiles are
+    container roots (never proposed as an index target). Derived from the
+    live HERMES_HOME, not hardcoded — so it tracks host/profile."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    from code_map import config
+    assert config.is_container_root(str(tmp_path / "hh"), True) is True
+    assert config.is_container_root(str(tmp_path / "hh" / "profiles"), True) is True
+
+
+def test_is_container_root_is_subdir_safe(tmp_path, monkeypatch):
+    """A sub-project UNDER the container is NOT a container root (the owner's
+    'plugins 下个别文件夹也许需要索引' ruling) — it must stay indexable. Only
+    the bare root matches, never a subfolder."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    from code_map import config
+    assert config.is_container_root(str(tmp_path / "hh" / "plugins" / "filemem"), True) is False
+    assert config.is_container_root(str(tmp_path / "hh" / "profiles" / "coder"), True) is False
+    assert config.is_container_root(str(tmp_path / "myproj"), True) is False
+
+
+def test_ledger_skips_bare_hermes_home_container(tmp_path, monkeypatch):
+    """Write side: a read whose boundary resolves to the bare HERMES_HOME
+    container must not mint a ledger row (subdir-safe: a sub-project under
+    the home still logs, as test_ledger_still_logs_real_project shows)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    f = tmp_path / "hh" / "topfile.py"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("x = 1\n", encoding="utf-8")
+    _log_unindexed_read("read_file", {"path": str(f)}, "s1")
+    ledger = tmp_path / "hh" / "plugins" / "code_map" / "data" / "_unindexed_read_ledger"
+    text = ledger.read_text().strip() if ledger.exists() else ""
+    assert text == "", f"the bare HERMES_HOME container must not mint a row: {text!r}"
