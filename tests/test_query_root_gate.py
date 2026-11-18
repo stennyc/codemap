@@ -36,7 +36,7 @@ from code_map import rootreg
 from code_map.db import init_db, insert_symbols, upsert_file
 from code_map.fingerprint import file_fingerprint
 from code_map.parser import parse_file
-from code_map.query import code_map_confirm_root, code_map_query
+from code_map.query import code_map_confirm_root, code_map_query, record_clarify_evidence
 from code_map.state import confirm_root
 
 _ctr = itertools.count()
@@ -134,9 +134,15 @@ def test_gate_oracle(root: str, path: str, expect: str, monkeypatch):
 
 
 def test_gate_owner_examples_exact(monkeypatch):
-    """The owner's four worked examples, asserted verbatim."""
+    """The owner's four worked examples, asserted verbatim.
+
+    NEW-target case (example 3) mints clarify evidence the way the host
+    hook does (record_clarify_evidence, mirroring test_check_root), since
+    the 2026-11-16 evidence gate requires an affirmative clarify line for
+    a truly new target before confirm_root will start the build."""
     d = _Dir("owner4")
     monkeypatch.setenv("HERMES_HOME", str(d.home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)  # sessionless: evidence gate in isolation
     try:
         # 1. root=/root path="" -> not passing (mapped: boundary, empty path)
         r1 = _confirm("/tmp/cm_owner4", "")
@@ -147,6 +153,7 @@ def test_gate_owner_examples_exact(monkeypatch):
         # 3. root=/root path=.hermes/plugins/filemem -> passing
         d.proj.mkdir(exist_ok=True)
         (d.proj / "a.py").write_text("def fa(): pass\n")
+        record_clarify_evidence(str(d.proj), "确认")  # the host-clarify transcript line
         r3 = _confirm(str(d.boundary), "proj")
         assert r3["status"] == "build_started", r3
         assert rootreg.is_confirmed_root(str(d.proj)) is True
@@ -225,8 +232,10 @@ def test_confirm_needs_both_fields(monkeypatch):
 def test_confirm_writes_registry_and_starts_build(monkeypatch):
     d = _Dir("confbuild")
     monkeypatch.setenv("HERMES_HOME", str(d.home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)  # sessionless: evidence gate in isolation
     try:
         (d.proj / "a.py").write_text("def fa(): pass\n")
+        record_clarify_evidence(str(d.proj), "确认")  # evidence gate: new target needs the clarify line
         res = _confirm(str(d.boundary), "proj")
         assert res["status"] == "build_started", res
         assert res["root"] == str(d.proj)

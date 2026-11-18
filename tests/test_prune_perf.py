@@ -287,7 +287,15 @@ def test_cross_era_separator_gen_stale(monkeypatch, tmp_path):
     kernel-era keys vs the backslash registry root, found live on the
     code_map target 2026-11-18) must still be gen-detected, its twin key
     cleared, and the canonical key landed — no double-counted twins.
-    """
+
+    OS-adaptive: the cross-era TWIN is only expressible when the two
+    separator families actually differ — on a POSIX host p_era ==
+    p_canon (the replace is a no-op) and there is no twin to clear; the
+    shape only lives on Windows (backslash canonical vs forward-slash
+    legacy), so POSIX skips instead of asserting against itself."""
+    if os.name != "nt":
+        import pytest
+        pytest.skip("cross-era separator twin only exists on Windows (backslash era)")
     root = _seed_root(monkeypatch, tmp_path, files=1)
     _fresh_imports()
     from code_map import db as cdb, state, config

@@ -76,25 +76,44 @@ def test_system_tree_posix_unchanged():
 
 # ── 3. gate 10 join: bare drive root / system tree must not pass ───────────
 def test_join_target_rejects_bare_drive_root():
+    """OS-adaptive: drive-root literals only mean anything on a Windows
+    host (on POSIX, 'C:\\' is an ordinary relative dir name that
+    abspath re-roots onto the CWD — rejected only when the CWD is itself
+    a system tree, which is a deploy-specific fact this test does not
+    assume)."""
+    import sys
+    if sys.platform != "win32":
+        import pytest
+        pytest.skip("Windows-semantics test (bare drive roots are a Windows shape)")
     assert rootreg._join_target("C:\\", "Windows") is None
     assert rootreg._join_target("C:", "Users") is None
     assert rootreg._join_target("D:/", "x") is None
 
 
 def test_join_target_rejects_system_tree(tmp_path):
-    assert rootreg._join_target("C:\\Windows", "System32") is None
+    """OS-adaptive: the Windows system-tree literals only mean anything on a
+    Windows host (on POSIX 'C:\\Windows' is an ordinary relative dir name).
+    The POSIX branch is host-native: /usr is now the per-OS system tree
+    (2026-11-16 auto-detect) and must be refused."""
     import sys
-    if sys.platform != "win32":
-        assert rootreg._join_target("/usr", "bin") is None
-    else:
-        # POSIX literals re-root onto the CWD drive on Windows ("C:\\usr" is
+    if sys.platform == "win32":
+        assert rootreg._join_target("C:\\Windows", "System32") is None
+        # POSIX literals re-root onto the CWD drive on Windows ("C:\usr" is
         # NOT a Windows system tree) — the Win system dirs are the guard:
         assert rootreg._join_target("C:\\Program Files", "x") is None
         assert rootreg._join_target("C:\\ProgramData", "x") is None
+    else:
+        assert rootreg._join_target("/usr", "bin") is None
 
 
 def test_join_target_still_allows_normal_pairs(tmp_path):
-    assert rootreg._join_target("C:\\Users\\me\\proj", "src") == "C:\\Users\\me\\proj\\src"
+    """OS-adaptive: Windows-style pairs assert the host-native join
+    result (on POSIX the 'C:\\...' literal re-roots onto the CWD as an
+    ordinary relative name — that deploy-specific fact is NOT asserted
+    here; the platform-native tmp pair below is the honest invariant)."""
+    import sys
+    if sys.platform == "win32":
+        assert rootreg._join_target("C:\\Users\\me\\proj", "src") == "C:\\Users\\me\\proj\\src"
     # platform-native pair (POSIX-style literals re-root onto the CWD drive
     # on Windows — assert with a real tmp path instead):
     assert rootreg._join_target(str(tmp_path), "src") == os.path.join(str(tmp_path), "src")
@@ -343,9 +362,15 @@ def test_is_transient_dir_blocks_hermes_code_map_skill_dir(tmp_path):
 def test_is_transient_dir_does_not_block_code_map_plugin(tmp_path):
     """Over-suppression guard: the actual code_map PLUGIN dir (leaf 'code_map',
     underscore) is a DIFFERENT name from the skill-dir marker ('hermes-code-map',
-    hyphen) -> the plugin must stay indexable / confirmable."""
+    hyphen) -> the plugin must stay indexable / confirmable.
+
+    OS-adaptive: the check is a pure string-component test against
+    TRANSIENT_DIR_NAMES, so it is exercised on a FIXED neutral path (not
+    tmp_path — on a deploy whose pytest tmp root sits under a .hermes
+    cache/scratch tree, the fixture path itself carries a transient marker
+    and the assertion would veto the deploy, not the plugin name)."""
     from code_map import config
-    p = str(tmp_path / "hh" / "plugins" / "code_map")
+    p = "/opt/fixed/hh/plugins/code_map"
     assert config.is_transient_dir(p, True) is False
 
 
@@ -446,11 +471,16 @@ def test_is_container_root_blocks_shared_profiles_root(tmp_path, monkeypatch):
 def test_is_transient_dir_blocks_autonomous_ai_agents_class(tmp_path):
     """The skills CLASS dir 'autonomous-ai-agents' (markdown skill docs' parent,
     not a source project) is a transient marker -> never proposed. Over-
-    suppression guard: a plain source project (no such component) is NOT blocked."""
+    suppression guard: a plain source project (no such component) is NOT blocked.
+
+    OS-adaptive: same fixed-neutral-path rationale as
+    test_is_transient_dir_does_not_block_code_map_plugin (a tmp_path fixture
+    on a .hermes-rooted deploy carries its own transient marker and would
+    veto the deploy, not the class dir)."""
     from code_map import config
-    p = str(tmp_path / "hh" / "profiles" / "coder" / "skills" / "autonomous-ai-agents")
+    p = "/opt/fixed/hh/profiles/coder/skills/autonomous-ai-agents"
     assert config.is_transient_dir(p, True) is True
-    assert config.is_transient_dir(str(tmp_path / "myproj"), True) is False
+    assert config.is_transient_dir("/opt/fixed/myproj", True) is False
 
 
 # ── 14. F3/F4 hardening of is_container_root (owner 2026-11-17 '可以') ──

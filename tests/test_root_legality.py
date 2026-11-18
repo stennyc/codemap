@@ -43,11 +43,29 @@ def test_gate10_boundary_root_always_legal_with_path(root, tmp_path, monkeypatch
     test_gate10_bare_slash_root_refused.)
 
     HERMES_HOME is redirected so the confirm does NOT pollute the
-    production data/ dir; the gate is syntactic, no project dir needed."""
+    production data/ dir; the gate is syntactic, no project dir needed.
+
+    2026-11-16 OS auto-detect: /usr, /etc, /opt are now the PER-OS
+    system-tree guard (gate-⑩ incident shape — never indexable, never
+    offered), so on POSIX they are REFUSED as boundary roots (the
+    is_system_tree branch of _join_target, reported as the generic
+    'escapes the boundary' reason). The inversion still holds for the
+    non-system prefixes /root and /home (owner workspaces,
+    deliberately unguarded). On Windows the POSIX literals re-root onto
+    the CWD drive and NONE of them are system trees there, so all five
+    are build_started. The assertion below follows the live host OS."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     res = confirm_root(root, "some/real/project")
-    assert res["status"] == "build_started", f"{root}: {res}"
-    assert res["root"] == root + "/some/real/project"
+    from code_map import config
+    if config.IS_WINDOWS:
+        assert res["status"] == "build_started", f"{root}: {res}"
+        assert res["root"] == root + "/some/real/project"
+    elif config.is_system_tree(root, False):
+        # system-tree branch: refused, never a legal index boundary
+        assert res["status"] == "invalid", f"{root}: {res}"
+    else:
+        assert res["status"] == "build_started", f"{root}: {res}"
+        assert res["root"] == root + "/some/real/project"
 
 
 def test_gate10_bare_slash_root_refused():

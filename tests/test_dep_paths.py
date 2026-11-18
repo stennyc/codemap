@@ -20,9 +20,18 @@ from code_map import _dep_paths  # noqa: E402
 
 
 def test_install_home_fallback_windows_uses_localappdata(monkeypatch):
-    """F-B: Windows fallback is %LOCALAPPDATA%\\hermes (deterministic fake LA)."""
+    """F-B: Windows fallback is %LOCALAPPDATA%\\hermes (deterministic fake LA).
+
+    The join is os.path.join — host-native separator. On a POSIX host the
+    expected twin is built with the same join so the assertion is exact on
+    every OS; the Windows-native literal (backslash) is what CI on a
+    Windows host asserts."""
     monkeypatch.setenv("LOCALAPPDATA", r"C:\fake\la")
-    assert _dep_paths._install_home_for("nt") == r"C:\fake\la\hermes"
+    import os
+    expected = os.path.join(r"C:\fake\la", "hermes")
+    assert _dep_paths._install_home_for("nt") == expected
+    if os.name == "nt":
+        assert _dep_paths._install_home_for("nt") == r"C:\fake\la\hermes"
 
 
 def test_install_home_fallback_windows_ignores_home_dot_hermes(monkeypatch):
@@ -30,7 +39,11 @@ def test_install_home_fallback_windows_ignores_home_dot_hermes(monkeypatch):
     ~/.hermes tree); with a home set it still resolves under LOCALAPPDATA."""
     monkeypatch.setenv("LOCALAPPDATA", r"C:\fake\la")
     monkeypatch.setenv("USERPROFILE", r"C:\fake\home")
-    assert _dep_paths._install_home_for("nt") == r"C:\fake\la\hermes"
+    import os
+    expected = os.path.join(r"C:\fake\la", "hermes")
+    assert _dep_paths._install_home_for("nt") == expected
+    if os.name == "nt":
+        assert _dep_paths._install_home_for("nt") == r"C:\fake\la\hermes"
 
 
 def test_install_home_fallback_posix_uses_home_dot_hermes(monkeypatch):
