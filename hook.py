@@ -45,7 +45,8 @@ from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
                     READ_SYMBOL_MAX_BYTES, data_dir, dot_root_silent,
                     is_container_root, is_silent_tree,
-                    is_system_tree, is_transient_dir, IS_WINDOWS)
+                    is_system_tree, is_transient_dir, IS_WINDOWS,
+                    never_ask_file, path_key)
 from . import config
 from . import rootreg
 
@@ -728,6 +729,11 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         from .config import root_db_path
         if root_db_path(proj).exists():
             return  # was indexed before -> refresh case, not "never indexed"
+        # D-never-ask-persist (AUDIT §2.16, mirrors Go ledger.go:249-251):
+        # a store-level persistent marker — never re-log a project the
+        # owner settled as "不再问" in a prior session.
+        if _never_ask_marked(proj):
+            return
         if not session_id:
             return  # no session to scope the row to -> skip, never leak
         line = f"{proj}\t{session_id}"
@@ -778,15 +784,32 @@ def _pending_projects(session_id: str) -> list:
 
 
 def _clear_project_rows(session_id: str, project_dirs) -> None:
-    """Remove this session's ledger rows for `project_dirs` (exact, per-dir
-    settle used by '要'/'不再问')."""
+    """Remove this session's ledger rows for `project_dirs` (per-dir
+    settle used by '要'/'不再问').
+
+    P2-10 ancestor generalisation (aligns Go pathKeyLive subtree
+    semantics): the ledger row keys the BOUNDARY dir (the file's
+    direct parent when no root marker is found — e.g. /tmp/proj/docs),
+    while _clarify_named_projects extracts the TOP-LEVEL project dir
+    from the question text (e.g. /tmp/proj). A row whose boundary sits
+    UNDER a named project is dropped too — mirroring the ancestor rule
+    in _find_confirmed_root.
+    """
     drop = {os.path.abspath(d) for d in project_dirs}
+
+    def _in_subtree(boundary: str) -> bool:
+        """True if `boundary` is `drop` or sits under any dir in `drop`."""
+        b = os.path.abspath(boundary)
+        for d in drop:
+            if b == d or b.startswith(d + os.sep):
+                return True
+        return False
 
     def _drop(current):
         kept = []
         for line in current:
             parts = line.split("\t")
-            if len(parts) == 2 and parts[1] == session_id and parts[0] in drop:
+            if len(parts) == 2 and parts[1] == session_id and _in_subtree(parts[0]):
                 continue
             kept.append(line)
         # None = unchanged (skip the write, matching _ledger_rmw's
@@ -794,6 +817,88 @@ def _clear_project_rows(session_id: str, project_dirs) -> None:
         return None if kept == current else kept
 
     _ledger_rmw(_drop)
+
+
+# ── D-never-ask-persist (AUDIT §2.16, 2026-11-21 owner ruling) ─────────
+# The reference Python's P2 simplification made "不再问" row-deletion only
+# (session-scoped): a new-session re-read re-logs and re-asks. The DSH
+# owner ruling requires the choice to PERSIST: one path_key line per
+# settled project dir in the store-level _never_ask file (same store
+# layout as the registry / ledger files). Mirrors Go AddNeverAsk /
+# NeverAskMarked / NeverAskPath (ledger.go:438-496).
+
+def _add_never_ask(project_dirs) -> None:
+    """Persist '不再问' choice for each named project dir (deduped
+    path_key lines; fail-soft — a marker hiccup never breaks the
+    settle). Mirrors Go AddNeverAsk (ledger.go:448-484).
+
+    The _never_ask file is a store-level marker (not session-scoped,
+    not ledger-scoped): it lives under data/ alongside the registry
+    and ledger files, so all host/profile processes see the same
+    marker (the deploy hardlinks the data dir cross-profile).
+    """
+    if not project_dirs:
+        return
+    p = never_ask_file()
+    try:
+        current = []
+        if p.exists():
+            current = [l for l in p.read_text(encoding="utf-8",
+                                                errors="replace").splitlines()
+                       if l.strip()]
+        seen = set(current)
+        changed = False
+        for d in project_dirs:
+            key = path_key(d)
+            if key not in seen:
+                current.append(key)
+                seen.add(key)
+                changed = True
+        if not changed:
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(current) + "\n", encoding="utf-8")
+    except Exception as exc:
+        _log.debug("code_map _never_ask write fail-soft: %s", exc)
+
+
+def _never_ask_marked(proj: str) -> bool:
+    """True iff the project dir (or any ANCESTOR of it) carries a
+    persistent '不再问' marker. Mirrors Go NeverAskMarked
+    (ledger.go:486-500).
+
+    The ancestor check matters because _clarify_named_projects
+    extracts the top-level project dir from the question text (e.g.
+    /tmp/cm_proj), while _log_unindexed_read logs the BOUNDARY dir
+    (e.g. /tmp/cm_proj/docs — the file's direct parent when no root
+    marker is found). A marker on the parent means the entire subtree
+    is never-ask, exactly like the confirmed-target ancestor rule in
+    _find_confirmed_root.
+    """
+    p = never_ask_file()
+    if not p.exists():
+        return False
+    try:
+        lines = {l.strip() for l in p.read_text(encoding="utf-8",
+                                                 errors="replace").splitlines()
+                 if l.strip()}
+    except Exception:
+        return False
+    if not lines:
+        return False
+    # Walk from the boundary dir UP to the filesystem root, checking
+    # each ancestor against the marker set (mirrors Go's single-level
+    # check but with the Python-side ancestor generalisation).
+    import os as _os
+    d = _os.path.abspath(proj)
+    while True:
+        if path_key(d) in lines:
+            return True
+        parent = _os.path.dirname(d)
+        if parent == d:
+            break  # reached filesystem root
+        d = parent
+    return False
 
 
 # Settle-side session scope is passed EXPLICITLY as a parameter through
@@ -970,18 +1075,27 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
         question_text = _extract_clarify_qr(args, result)[0] or ""
         replies = [r.strip() for r in _clarify_reply_texts(result)]
         for reply in replies:
-            # ① 要-prefix settle (reference semantics: any 要-prefix reply
-            #    settles; "不要" starts with "不" so no collision).
-            if reply.startswith("要"):
+            # ① 要-wordlist settle (P2-10 align, mirrors Go RoleJudge):
+            #    the legacy `startswith("要")` arm settled ANY 要-prefix
+            #    free text (e.g. "看一下要建的"), which RoleJudge reads
+            #    as INCONCLUSIVE. The wordlist `_is_affirmative` already
+            #    covers "要" + all its token variants ("要了", "要建",
+            #    "要建吧", "要建立", "要建索引"); a bare 要-prefix free
+            #    text now falls to ③ (marker/LLM arm), fail-closed.
+            from .query import _is_affirmative
+            if _is_affirmative(reply):
                 projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
                 continue
-            # ② 不再问 (reference: permanent clear).
-            if reply.startswith("不再问"):
+            # ② 不再问 (D-never-ask-persist, AUDIT §2.16 + P2-10 align:
+            #    wordlist `_is_neverask` instead of startswith; free-text
+            #    "不再问了但…" falls to ③, fail-closed).
+            if _is_neverask(reply):
                 projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
+                    _add_never_ask(projs)
                 continue
             # ③ A+C marker/LLM layer: the reply carries a [code_map_roles]
             #    mapping the wordlist didn't catch, or a free-text reply
@@ -991,6 +1105,8 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
                 projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
+                    if role == _ROLE_NEVERASK:
+                        _add_never_ask(projs)
                 continue
             # ④ _ROLE_NO / _ROLE_INCONCLUSIVE / "": settle nothing — the
             #    owner's "不要 = 下次还问" semantics.
@@ -1088,6 +1204,12 @@ def _needs_index_build_question(proj: str) -> bool:
             return False
     except Exception:
         pass
+    # D-never-ask-persist (AUDIT §2.16, mirrors Go ledger.go:403-405):
+    # the store-level marker vetoes the pitch even when a stale row
+    # survived the write-side guard (a session whose settle happened
+    # after the row was logged).
+    if _never_ask_marked(proj):
+        return False
     return True
 
 

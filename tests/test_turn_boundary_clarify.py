@@ -409,21 +409,37 @@ def test_file_mention_under_pending_boundary_settles_the_row(tmp_path):
 
 
 def test_yes_free_text_prefix_settles(tmp_path):
-    """'要建吧' (free-text 要-prefix) settles; '要不要都行' also settles as
-    要 (fail-soft direction: over-settle clears a row that would auto-drop
-    anyway once the project is confirmed — under-settle would re-ask)."""
+    """P2-10 align (Go RoleJudge): the legacy startswith("要") arm
+    settled ANY 要-prefix free text; now the wordlist `_is_affirmative`
+    gates the settle. '要建吧' (token in _AFFIRMATIVE) settles;
+    '要不要都行' (NOT in _AFFIRMATIVE — a bare 要-prefix free text)
+    does NOT settle via the wordlist; it falls to the ③ LLM arm
+    (inconclusive when no LLM host is available)."""
     from code_map import hook
-    for label, reply in (("a", "要建吧"), ("b", "要不要都行")):
-        proj = _make_unconfirmed_project(tmp_path, name=f"proj{label}")
-        hook._post_tool_call("read_file", {"path": str(proj / "core.py")}, None,
-                             status="ok", session_id="s1")
-        hook._post_tool_call("clarify", {"questions": [
-            {"question": f"要 index {proj} 吗？",
-             "choices": ["要", "不要", "不再问"]}]},
-            {"responses": [{"user_response": reply}]},
-            status="ok", session_id="s1")
-        joined = "\n".join(_pending_rows())
-        assert str(proj) not in joined, f"{reply!r} must settle as 要"
+    # wordlist hit: settles
+    proj_a = _make_unconfirmed_project(tmp_path, name="projA")
+    hook._post_tool_call("read_file", {"path": str(proj_a / "core.py")}, None,
+                         status="ok", session_id="s1")
+    hook._post_tool_call("clarify", {"questions": [
+        {"question": f"要 index {proj_a} 吗？",
+         "choices": ["要", "不要", "不再问"]}]},
+        {"responses": [{"user_response": "要建吧"}]},
+        status="ok", session_id="s1")
+    joined = "\n".join(_pending_rows())
+    assert str(proj_a) not in joined, f"'要建吧' must settle via wordlist"
+
+    # P2-10: free 要-prefix NOT in wordlist -> does NOT settle
+    proj_b = _make_unconfirmed_project(tmp_path, name="projB")
+    hook._post_tool_call("read_file", {"path": str(proj_b / "core.py")}, None,
+                         status="ok", session_id="s2")
+    hook._post_tool_call("clarify", {"questions": [
+        {"question": f"要 index {proj_b} 吗？",
+         "choices": ["要", "不要", "不再问"]}]},
+        {"responses": [{"user_response": "要不要都行"}]},
+        status="ok", session_id="s2")
+    joined2 = "\n".join(_ledger_lines("s2"))
+    assert str(proj_b) in joined2, \
+        "P2-10: '要不要都行' must NOT settle via wordlist (falls to LLM arm)"
 
 
 def test_neverask_free_text_suffix_settles(tmp_path):

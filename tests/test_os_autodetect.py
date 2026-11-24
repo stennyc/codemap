@@ -65,10 +65,17 @@ def test_system_tree_windows():
 
 
 def test_system_tree_posix_unchanged():
-    assert config.is_system_tree("/usr/share/x", False) is True
-    assert config.is_system_tree("/etc/x", False) is True
-    assert config.is_system_tree("/opt/x", False) is True
+    # §2.21 (2026-11-21 owner ruling, synced from the DSH port): the
+    # POSIX hard-block core is the device/pseudo trio + bare "/"; the
+    # legacy triple demoted to SILENT prefixes (gate stays open).
+    assert config.is_system_tree("/dev/x", False) is True
+    assert config.is_system_tree("/proc/x", False) is True
+    assert config.is_system_tree("/sys/x", False) is True
     assert config.is_system_tree("/", False) is True
+    for p in ("/usr/share/x", "/etc/x", "/opt/x"):
+        assert config.is_system_tree(p, False) is False  # silent, not hard
+    for p in ("/usr", "/etc", "/opt", "/bin", "/sbin", "/var"):
+        assert config.is_silent_tree(p, False) is True
     # /root and /home deliberately NOT guarded (owner projects, 2026-10-18):
     assert config.is_system_tree("/home/owner/proj", False) is False
     assert config.is_system_tree("/root/proj", False) is False
@@ -93,8 +100,9 @@ def test_join_target_rejects_bare_drive_root():
 def test_join_target_rejects_system_tree(tmp_path):
     """OS-adaptive: the Windows system-tree literals only mean anything on a
     Windows host (on POSIX 'C:\\Windows' is an ordinary relative dir name).
-    The POSIX branch is host-native: /usr is now the per-OS system tree
-    (2026-11-16 auto-detect) and must be refused."""
+    The POSIX branch is host-native: §2.21 (owner ruling 2026-11-21) the
+    device core (/dev, /proc, /sys) must be refused; /usr demoted to a
+    SILENT prefix (the gate stays open)."""
     import sys
     if sys.platform == "win32":
         assert rootreg._join_target("C:\\Windows", "System32") is None
@@ -103,7 +111,10 @@ def test_join_target_rejects_system_tree(tmp_path):
         assert rootreg._join_target("C:\\Program Files", "x") is None
         assert rootreg._join_target("C:\\ProgramData", "x") is None
     else:
-        assert rootreg._join_target("/usr", "bin") is None
+        # §2.21: /usr is a silent prefix now (legal boundary); the
+        # device core is refused.
+        assert rootreg._join_target("/usr", "bin") is not None
+        assert rootreg._join_target("/dev", "x") is None
 
 
 def test_join_target_still_allows_normal_pairs(tmp_path):

@@ -49,14 +49,31 @@ def _mint_ledger_row(tmp_path, session_id="s1"):
     return proj
 
 
-def test_gate_2_default_off_skips_pitch(tmp_path):
-    """Pending ledger row + default-off flag -> on_pre_llm_call returns
-    None even though the project is unindexed (the pitch is off; the
-    ledger guard machinery stays as the safety net when re-enabled)."""
-    assert cm_config.BRIEF_BUILD_PITCH is False, "default must be OFF"
+def test_gate_2_default_off_skips_pitch(tmp_path, monkeypatch):
+    """Pending ledger row + BRIEF_BUILD_PITCH=False (opt-out) ->
+    on_pre_llm_call returns None even though the project is unindexed.
+
+    §2.22 (2026-11-24, aligns Go config.go:110): the default is now
+    True; this test pins the OPT-OUT posture by monkeypatching the
+    flag back to False.
+    """
+    monkeypatch.setattr(cm_config, "BRIEF_BUILD_PITCH", False, raising=False)
     _mint_ledger_row(tmp_path, "s1")
     out = cm_hook.on_pre_llm_call(session_id="s1")
     assert out is None, "the pitch must not fire while the flag is off"
+
+
+def test_gate_2_default_on_surfaces_pitch(tmp_path):
+    """§2.22: BRIEF_BUILD_PITCH default is True — a pending row
+    surfaces as the clarify instruction WITHOUT any monkeypatch.
+    Mirrors Go config.go:110 `const BriefBuildPitch = true`."""
+    assert cm_config.BRIEF_BUILD_PITCH is True, "default must be ON (Go §2.22 align)"
+    _mint_ledger_row(tmp_path, "s3")
+    out = cm_hook.on_pre_llm_call(session_id="s3")
+    assert out is not None, "default-ON pitch must fire"
+    ctx = out.get("context", "")
+    assert "clarify" in ctx
+    assert "不再问" in ctx
 
 
 def test_gate_2_opt_in_restores_pitch(tmp_path, monkeypatch):

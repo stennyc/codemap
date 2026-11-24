@@ -45,27 +45,30 @@ def test_gate10_boundary_root_always_legal_with_path(root, tmp_path, monkeypatch
     HERMES_HOME is redirected so the confirm does NOT pollute the
     production data/ dir; the gate is syntactic, no project dir needed.
 
-    2026-11-16 OS auto-detect: /usr, /etc, /opt are now the PER-OS
-    system-tree guard (gate-⑩ incident shape — never indexable, never
-    offered), so on POSIX they are REFUSED as boundary roots (the
-    is_system_tree branch of _join_target, reported as the generic
-    'escapes the boundary' reason). The inversion still holds for the
-    non-system prefixes /root and /home (owner workspaces,
-    deliberately unguarded). On Windows the POSIX literals re-root onto
-    the CWD drive and NONE of them are system trees there, so all five
-    are build_started. The assertion below follows the live host OS."""
+    §2.21 (2026-11-21 owner ruling, synced from the DSH port): the
+    legacy triple /usr, /etc, /opt demoted to SILENT prefixes (pitch-
+    silent, gate OPEN) — on POSIX they are now LEGAL boundary roots,
+    same as /root and /home. The hard-block core shrank to the
+    device/pseudo trio /dev, /proc, /sys (+ bare '/', see
+    test_gate10_device_core_refused below). On Windows the POSIX
+    literals re-root onto the CWD drive and NONE of them are system
+    trees, so all five are build_started. The assertion follows the
+    live host OS."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     res = confirm_root(root, "some/real/project")
     from code_map import config
-    if config.IS_WINDOWS:
-        assert res["status"] == "build_started", f"{root}: {res}"
-        assert res["root"] == root + "/some/real/project"
-    elif config.is_system_tree(root, False):
-        # system-tree branch: refused, never a legal index boundary
-        assert res["status"] == "invalid", f"{root}: {res}"
-    else:
-        assert res["status"] == "build_started", f"{root}: {res}"
-        assert res["root"] == root + "/some/real/project"
+    assert res["status"] == "build_started", f"{root}: {res}"
+    assert res["root"] == root + "/some/real/project"
+
+
+@pytest.mark.parametrize("root", ["/dev", "/proc", "/sys"])
+def test_gate10_device_core_refused(root, tmp_path, monkeypatch):
+    """§2.21: the device/pseudo filesystem trio is the hard-block core
+    — never a legal index boundary, even with a pinning path (there
+    is no parseable source to index under /dev, /proc or /sys)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    res = confirm_root(root, "some/real/project")
+    assert res["status"] == "invalid", f"{root}: {res}"
 
 
 def test_gate10_bare_slash_root_refused():

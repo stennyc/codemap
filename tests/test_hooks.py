@@ -774,3 +774,73 @@ def test_terminal_read_pipe_no_nudge(tmp_path):
                              result="x")
         assert out is None, f"opaque terminal read must not nudge: {cmd!r} -> {out!r}"
 
+
+# ── D-never-ask-persist (AUDIT §2.16 alignment) ─────────────────────────
+
+def test_never_ask_persist_blocks_new_session(tmp_path):
+    """A '不再问' settle must write the store-level _never_ask marker
+    so that a NEW session's re-read of the same project does NOT
+    re-log a ledger row (the Go D-never-ask-persist ruling, AUDIT
+    §2.16, 2026-11-21: the reference's row-deletion-only P2
+    simplification re-asked on a new-session re-read; the owner
+    requires the choice to persist).
+
+    Uses /tmp (non-transient, non-silent, non-system) for the
+    fixture project dir, same rationale as
+    test_unindexed_read_non_source_file_logs_ledger_row above.
+    """
+    from code_map import hook
+    from code_map.config import data_dir, never_ask_file, path_key
+    import uuid, shutil
+
+    proj = Path("/tmp") / f"cm_neverask_{uuid.uuid4().hex[:8]}"
+    _seed_bases.append(proj)
+    try:
+        (proj / "docs").mkdir(parents=True)
+        md = proj / "docs" / "readme.md"
+        md.write_text("# hi\n", encoding="utf-8")
+
+        # 1. Session A reads the project → logs a ledger row.
+        hook._post_tool_call(
+            tool_name="read_file",
+            args={"path": str(md)},
+            result="", status="ok",
+            session_id="sess_A",
+        )
+        ledger = data_dir() / "_unindexed_read_ledger"
+        assert ledger.exists(), "session A's read must log a ledger row"
+        a_lines = [l for l in ledger.read_text().splitlines() if l.strip()]
+        assert any("sess_A" in l for l in a_lines), \
+            f"session A row missing: {a_lines!r}"
+
+        # 2. Session A settles '不再问' → clears the ledger row AND
+        #    writes the _never_ask marker.
+        hook._settle_clarify_answer(
+            args={"questions": [{"question": f"要不要为 {proj} 建 code_map 索引？"}]},
+            result={"responses": [{"status": "answered", "user_response": "不再问"}]},
+            status="ok",
+            session_id="sess_A",
+        )
+        na = never_ask_file()
+        assert na.exists(), "_never_ask marker file must exist after settle"
+        na_lines = [l for l in na.read_text().splitlines() if l.strip()]
+        proj_key = path_key(str(proj))
+        assert proj_key in na_lines, \
+            f"project key {proj_key!r} missing from _never_ask: {na_lines!r}"
+
+        # 3. Session B (a NEW session) re-reads the same project →
+        #    the _never_ask guard blocks the re-log.
+        hook._post_tool_call(
+            tool_name="read_file",
+            args={"path": str(md)},
+            result="", status="ok",
+            session_id="sess_B",
+        )
+        if ledger.exists():
+            b_lines = [l for l in ledger.read_text().splitlines() if l.strip()]
+            assert not any("sess_B" in l for l in b_lines), \
+                f"session B must NOT re-log a _never_ask-marked project: {b_lines!r}"
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+        _seed_bases.pop()
+

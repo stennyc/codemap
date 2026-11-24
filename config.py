@@ -90,6 +90,11 @@ ROOT_MARKERS = (
 # filesystem / home-dir level, not a project root — the 2026-10-10
 # `/root` mis-confirm (382k files, 4.2GB db) is the recorded incident that
 # motivated this constant.
+# §2.21 sync (2026-11-21, from the DSH port owner rulings): this tuple
+# is now an UNUSED legacy relic — the live semantics live in
+# is_system_tree (the hard-block core: device/pseudo trio) +
+# is_silent_tree (pitch-silent prefixes, gate open). Kept for
+# provenance only; do not re-wire against it.
 BLOCKED_ROOT_PREFIXES = ("/", "/root", "/home", "/usr", "/etc", "/opt")
 
 # OS auto-detection (owner 2026-11-16): the POSIX-only tuple above is dead on
@@ -107,6 +112,19 @@ BLOCKED_ROOT_PREFIXES_WIN = (
 )
 IS_WINDOWS = sys.platform == "win32"
 _BARE_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]?$")
+# §2.22 (2026-11-24, aligns Go osenv.go:144-147 BareUNCRe): the three
+# Windows UNC bare-root forms — the bare current-drive marker `\\`, a
+# whole-server `\\server`, and a whole-share `\\server\share` (both /
+# and \ accepted as the final separator, optional). A sub-tree under
+# the share (`\\server\share\sub`) is NOT bare and stays indexable.
+# Pure string check, host-agnostic (the Windows branch of the gate
+# twins only; on POSIX these literals re-root onto the CWD drive).
+_BARE_UNC_RE = re.compile(
+    r"^(?:"
+    r"\\\\$|"                                            # `\\`  bare current-drive marker
+    r"\\\\[A-Za-z0-9._-]+[/\\]?$|"                      # `\\server`  whole-server
+    r"\\\\[A-Za-z0-9._-]+[/\\][A-Za-z0-9._-]+[/\\]?$"   # `\\server\share`  whole-share
+    r")")
 
 
 def is_bare_fs_root(root: str, is_windows: bool) -> bool:
@@ -119,20 +137,30 @@ def is_bare_fs_root(root: str, is_windows: bool) -> bool:
     """
     r = (root or "").strip()
     if is_windows:
-        return _BARE_DRIVE_RE.match(r) is not None
+        # §2.22: a bare drive root OR a bare UNC marker (the `\\`
+        # current-drive spell + a whole-share `\\server\share` root —
+        # the gate's raw-input check is the only place a bare `\\` is
+        # detectable, since abspath re-roots it onto the CWD drive).
+        return _BARE_DRIVE_RE.match(r) is not None or _BARE_UNC_RE.match(r) is not None
     return r in ("", "/")
 
 
 def is_system_tree(root: str, is_windows: bool) -> bool:
-    """True when `root` is a bare fs root or sits under a per-OS system tree
-    (the gate-⑩ incident shape — never indexable, never offered).
+    """True when `root` is a bare fs root or sits under a per-OS HARD-BLOCK
+    system tree (the gate-⑩ incident shape — never indexable, never
+    offered, even on an explicit owner confirm).
 
     Semantics are the LIVE guard (single source of truth for rootreg's
-    join gate and the hook ledger's skip guard). POSIX keeps the legacy
-    triple ("/usr", "/etc", "/opt" — /root//home deliberately unguarded:
-    owner projects live there, owner 2026-10-18) plus the bare "/";
-    Windows adds its system dirs + bare drive roots. Case- and
-    separator-insensitive on Windows (mixed / and \\ accepted).
+    join gate and the hook ledger's skip guard). §2.21 (2026-11-21 owner
+    ruling, synced from the DSH port): the POSIX hard-block core is the
+    device/pseudo trio ("/dev", "/proc", "/sys") plus the bare "/". The
+    legacy triple ("/usr", "/etc", "/opt") DEMOTED to the silent
+    prefixes (is_silent_tree below: pitch-silent, but the confirm gate
+    stays open — an explicit owner confirm still builds). /root//home
+    remain deliberately unguarded (owner projects live there, owner
+    2026-10-18). Windows is UNCHANGED this pass (owner ruling 2026-11-21:
+    the Windows twin of the split is deferred to a Windows host); case-
+    and separator-insensitive on Windows (mixed / and \\ accepted).
     """
     r = (root or "").strip()
     if is_windows:
@@ -146,10 +174,55 @@ def is_system_tree(root: str, is_windows: bool) -> bool:
         return False
     if r in ("", "/"):
         return True
-    for p in ("/usr", "/etc", "/opt"):
+    for p in ("/dev", "/proc", "/sys"):
         if r == p or r.startswith(p + "/"):
             return True
     return False
+
+
+# §2.21 (2026-11-21 owner ruling "系统路径不问但门开", synced from the
+# DSH port): the SILENT system prefixes — reads under these are never
+# PROPOSED for indexing (pitch-silent), but the confirm gate STAYS
+# OPEN: an explicit owner confirm with the dry-run magnitude preview
+# still builds. POSIX only; the Windows silent list is deferred by
+# owner ruling ("Windows 侧留到在 windows 系统才做"), so Windows is
+# never silent-tree here.
+SILENT_ROOT_PREFIXES = ("/bin", "/sbin", "/etc", "/usr", "/opt", "/var")
+
+
+def is_silent_tree(root: str, is_windows: bool) -> bool:
+    """True when `root` is (or sits under) a §2.21 silent system prefix.
+
+    Pitch-level guard only: the confirm gate is unaffected (an explicit
+    owner confirm still builds — the dry-run preview discloses the
+    magnitude before the build).
+    """
+    if is_windows:
+        return False  # deferred by owner ruling (2026-11-21)
+    r = (root or "").strip()
+    for p in SILENT_ROOT_PREFIXES:
+        if r == p or r.startswith(p + "/"):
+            return True
+    return False
+
+
+def dot_root_silent(proj: str) -> bool:
+    """§2.21 (2026-11-21 owner ruling): a dot-NAMED project dir with NO
+    ROOT_MARKERS member inside it (the cache / venv / config shape) is
+    pitch-silent; a hidden REPO (a marker inside the dir) stays
+    askable. Pitch-level guard only: the confirm gate is unaffected.
+
+    The marker check is LOCAL to the dot dir (NOT the upward
+    detect_root search, whose home fallback would false-clear the
+    predicate).
+    """
+    base = os.path.basename(os.path.normpath(proj))
+    if not base.startswith("."):
+        return False
+    for m in ROOT_MARKERS:
+        if os.path.exists(os.path.join(proj, m)):
+            return False  # a marker inside -> a hidden repo -> askable
+    return True
 
 
 # Never-log transient markers (owner 2026-11-17 "临时目录永不再问" ruling):
@@ -299,7 +372,7 @@ ATTACH_STALENESS_WALK_MAX_FILES = 50_000
 # enemy under the stable-injection premise: stable injection > token cost).
 # The never-ask ledger guard machinery stays as the safety net for when it
 # is re-enabled; flipping this True is an explicit opt-in.
-BRIEF_BUILD_PITCH = False
+BRIEF_BUILD_PITCH = True
 # 档 2 terminal read-signal (owner 2026-10-15): a one-line pointer appended
 # to terminal stdout when a single-file cat/less of a confirmed-target
 # source file is detected. Deliberately a POINT (byte-capped), NOT a full
@@ -421,3 +494,29 @@ def root_db_path(root: str) -> Path:
     import hashlib
     digest = hashlib.sha1(os.path.abspath(root).encode("utf-8")).hexdigest()[:16]
     return data_dir() / f"{digest}.db"
+
+
+def path_key(p: str) -> str:
+    """Cross-OS path normalization key (mirrors Go PathKey, osenv.go:210).
+
+    Windows: case-insensitive, backslash→forward-slash, normpath.
+    POSIX:  exact string (the path IS the key).
+
+    Used by the _never_ask persistent marker (AUDIT §2.16 alignment)
+    and the root_db_path sha1 input.
+    """
+    if IS_WINDOWS:
+        return os.path.normpath(os.path.abspath(p).replace("\\", "/")).lower()
+    return os.path.abspath(p)
+
+
+def never_ask_file() -> Path:
+    """Store-level persistent '不再问' marker file (mirrors Go NeverAskPath,
+    ledger.go:441-443: filepath.Join(storeRoot, "_never_ask")).
+
+    One line per settled project dir, in path_key form. Survives across
+    sessions — the DSH owner ruling (AUDIT §2.16, 2026-11-21) requires
+    the '不再问' choice to persist; the Python reference's row-deletion-
+    only P2 simplification re-asked on a new-session re-read.
+    """
+    return data_dir() / "_never_ask"
