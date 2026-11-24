@@ -513,7 +513,10 @@ def _clarify_evidence(target: str, root: str, path: str,
 
 def record_clarify_evidence(target: str, user_response: str,
                             ts: Optional[str] = None,
-                            session_id: Optional[str] = None) -> None:
+                            session_id: Optional[str] = None,
+                            question: Optional[str] = None,
+                            role: Optional[str] = None,
+                            judge: Optional[str] = None) -> None:
     """Append one clarify-evidence record (called by the post_tool_call
     hook for host clarify calls). Appends ONLY — the gate reads newest.
     Fail-soft: a log write hiccup must never break a tool call.
@@ -522,7 +525,14 @@ def record_clarify_evidence(target: str, user_response: str,
     ``HERMES_SESSION_ID`` env when the caller omitted it). The gate reads
     the SAME env on its side to reject evidence minted in a different
     session — a hand-written line without a matching session_id fails the
-    session-check."""
+    session-check.
+
+    A+C (2026-11-23): ``question``, ``role``, ``judge`` are the role-judge
+    fields (the Go/DSH A+C alignment). ``role`` is the deterministic
+    role (yes/no/neverask/inconclusive), ``judge`` is the layer that
+    decided it (marker/wordlist/llm/pending). Both are optional: legacy
+    callers omit them and the gate treats absent as pre-A+C back-compat.
+    """
     if not target:
         return
     if session_id is None:
@@ -539,6 +549,14 @@ def record_clarify_evidence(target: str, user_response: str,
         "affirmative": _is_affirmative(user_response or ""),
         "session_id": session_id,
     }
+    # A+C role-judge fields (additive; legacy rows without them are
+    # pre-A+C back-compat — the gate's sig verification is unaffected).
+    if question is not None:
+        rec["question"] = question[:400]
+    if role is not None:
+        rec["role"] = role
+    if judge is not None:
+        rec["judge"] = judge
     # C-mid: sign the line before it hits the log so the gate can later
     # distinguish host-minted evidence from a hand-written forgery.
     rec = _mint_evidence_line(rec)

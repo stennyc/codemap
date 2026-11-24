@@ -43,12 +43,168 @@ from typing import Any, Dict, Optional
 from .config import (CROSS_FOLDER_LINE_MAX_BYTES, HOOK_DEBOUNCE_S,
                     READ_HEAL_MAX_ATTEMPTS, READ_HEAL_MAX_FILES,
                     READ_IMPORT_EDGES, READ_SELF_SYMBOLS,
-                    READ_SYMBOL_MAX_BYTES, data_dir, is_container_root,
+                    READ_SYMBOL_MAX_BYTES, data_dir, dot_root_silent,
+                    is_container_root, is_silent_tree,
                     is_system_tree, is_transient_dir, IS_WINDOWS)
 from . import config
 from . import rootreg
 
 _log = logging.getLogger("code_map.hook")
+
+# ── A+C LLM arm (aligns Go/DSH RoleJudge, 2026-11-23 owner ruling) ───────
+# When the deterministic layers (the [code_map_roles] marker mapping + the
+# CJK/ASCII wordlist) are silent, the host LLM classifies the ROLE
+# (language-agnostic). Fail-closed everywhere: absent ctx.llm / an
+# unresolvable route / an undecided verdict / ANY error -> the pending
+# line stands (non-affirmative; the gate stays blocked).
+_HOST_CTX = None  # set by __init__.register(ctx) via set_ctx()
+
+_ROLE_YES = "yes"
+_ROLE_NO = "no"
+_ROLE_NEVERASK = "neverask"
+_ROLE_INCONCLUSIVE = "inconclusive"
+_JUDGE_MARKER = "marker"
+_JUDGE_WORDLIST = "wordlist"
+_JUDGE_LLM = "llm"
+_JUDGE_PENDING = "pending"
+
+_JUDGE_PROMPT = (
+    "You are classifying a user's reply to a confirmation question.\n"
+    "Question:\n{question}\n"
+    "User reply:\n{reply}\n"
+    "Classify the reply's role: yes = the user wants to proceed with "
+    "the asked action; no = the user declines; neverask = the user "
+    "does not want to be asked again; unknown = the reply does not "
+    "decide it.\n"
+    'Reply with ONLY a single JSON object: {{"role": "yes" | "no" | '
+    '"neverask" | "unknown"}}'
+)
+
+_JUDGE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"role": {"type": "string", "enum": ["yes", "no", "neverask", "unknown"]}},
+    "required": ["role"],
+}
+
+_ROLE_PAIR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+_RECOMMENDED_SUFFIX_RE = re.compile(r'\s*[（(]Recommended[)）]\s*')
+
+_NEVERASK_WORDS = frozenset({
+    "不再问", "别问了", "不要问了", "永久不再问",
+    "don't ask again", "dont ask again", "never ask", "stop asking",
+})
+
+
+def set_ctx(ctx: Any) -> None:
+    """Store the host ctx reference for the LLM arm (called by register())."""
+    global _HOST_CTX
+    _HOST_CTX = ctx
+
+
+def _parse_role_mapping(question: str) -> dict:
+    """Extract the [code_map_roles] mapping from the question text.
+    Returns {label: role} or {} when no mapping line is present.
+    Mirrors Go ParseRoleMapping."""
+    m = re.search(r'\[code_map_roles\]\s*(.+)', question or "")
+    if not m:
+        return {}
+    out = {}
+    for pair in _ROLE_PAIR_RE.finditer(m.group(1)):
+        role, label = pair.group(1), pair.group(2)
+        label_norm = _RECOMMENDED_SUFFIX_RE.sub("", label).strip()
+        if label_norm:
+            out[label_norm] = role
+    return out
+
+
+def _normalize_role_label(s: str) -> str:
+    """Trim + recommended-suffix strip (mirrors Go NormalizeRoleLabel)."""
+    s = (s or "").strip()
+    return _RECOMMENDED_SUFFIX_RE.sub("", s).strip()
+
+
+def _is_neverask(text: str) -> bool:
+    """The do-not-ask-again wordlist arm (mirrors Go IsNeverAsk)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return any(w in t for w in _NEVERASK_WORDS)
+
+
+def _parse_judge_role(text: str) -> str:
+    """Parse the LLM verdict (the first well-formed role JSON; "" on
+    anything else — the fail-closed shape, mirrors Go parseJudgeRole)."""
+    m = re.search(r'"role"\s*:\s*"(yes|no|neverask|unknown)"', text or "")
+    return m.group(1) if m else ""
+
+
+def _judge_one_pair(question: str, reply: str) -> str:
+    """Judge ONE (question, reply) pair with the host LLM (the per-item
+    unit — mirrors Go judgeOnePair). Resolves the role ("" = undecided,
+    the fail-closed shape). Never raises."""
+    if _HOST_CTX is None:
+        return ""
+    llm = getattr(_HOST_CTX, "llm", None)
+    if llm is None:
+        return ""
+    try:
+        prompt = _JUDGE_PROMPT.format(question=question, reply=reply)
+        result = llm.complete_structured(
+            instructions="You classify user replies to confirmation questions.",
+            input=[{"type": "text", "text": prompt}],
+            json_schema=_JUDGE_JSON_SCHEMA,
+            json_mode=True,
+            task="code_map_role_judge",
+            temperature=0.1,
+            max_tokens=48,
+            purpose="code_map",
+        )
+        parsed = getattr(result, "parsed", None)
+        if isinstance(parsed, dict):
+            role = str(parsed.get("role", "")).strip()
+            if role in (_ROLE_YES, _ROLE_NO, _ROLE_NEVERASK):
+                return role
+            return ""  # "unknown" or missing -> fail-closed
+        raw = str(getattr(result, "text", "") or "")
+        return _parse_judge_role(raw)
+    except Exception:
+        return ""
+
+
+def _role_judge(question: str, reply: str) -> tuple:
+    """The two-layer judge (C marker -> A wordlist -> LLM arm).
+    Mirrors Go RoleJudge. Returns (role, layer).
+    layer is "marker" / "wordlist" / "llm" / "pending" (inconclusive)."""
+    role_map = _parse_role_mapping(question)
+    if role_map:
+        norm = _normalize_role_label(reply)
+        if norm in role_map:
+            return role_map[norm], _JUDGE_MARKER
+        if ", " in reply:
+            decided, consistent = "", True
+            for part in reply.split(", "):
+                pnorm = _normalize_role_label(part)
+                if pnorm not in role_map:
+                    consistent = False
+                    break
+                prole = role_map[pnorm]
+                if decided == "":
+                    decided = prole
+                elif decided != prole:
+                    consistent = False
+                    break
+            if consistent and decided:
+                return decided, _JUDGE_MARKER
+    from .query import _is_affirmative
+    if _is_neverask(reply):
+        return _ROLE_NEVERASK, _JUDGE_WORDLIST
+    if _is_affirmative(reply):
+        return _ROLE_YES, _JUDGE_WORDLIST
+    llm_role = _judge_one_pair(question, reply)
+    if llm_role:
+        return llm_role, _JUDGE_LLM
+    return _ROLE_INCONCLUSIVE, _JUDGE_PENDING
+
 
 # Re-entrancy guard for the read-side dirty heal: one lock so two concurrent
 # reads of the same target cannot stack two full-walk rebuild workers that
@@ -261,7 +417,9 @@ def _record_clarify_evidence(args: Any, result: Any, status: Any,
         # silently dropping the evidence.
         from .query import _is_affirmative, record_clarify_evidence
         if best is not None:
-            record_clarify_evidence(best, reply, session_id=session_id)
+            role, layer = _role_judge(q, reply)
+            record_clarify_evidence(best, reply, session_id=session_id,
+                                   question=q, role=role, judge=layer)
         # 'Other' free-text correction channel (owner's 2026-10-12 ruling):
         # the host clarify UI auto-appends an 'Other' free-text row; if the
         # user's reply TYPES an absolute path that the QUESTION itself did
@@ -494,8 +652,12 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         path, not the pending path);
       - the project boundary must NOT itself be a real system tree — the
         per-OS system-tree guard (config.is_system_tree, OS auto-detect,
-        owner 2026-11-16) is the gate-⑩ incident shape: /usr, /etc, /opt
-        + bare "/" on POSIX; C:/Windows, C:/Program Files,
+        owner 2026-11-16) is the gate-⑩ incident shape: §2.21 (owner
+        ruling 2026-11-21) narrowed the POSIX hard-block core to the
+        device/pseudo trio /dev, /proc, /sys + bare "/" (the legacy
+        triple /usr, /etc, /opt demoted to the SILENT prefixes —
+        config.is_silent_tree: pitch-silent, but the confirm gate stays
+        open); C:/Windows, C:/Program Files,
         C:/Program Files (x86), C:/ProgramData + bare drive roots on
         Windows. Those trees are never offered for indexing. /root and
         /home (POSIX) and C:/Users (Windows) are deliberately NOT guarded:
@@ -529,10 +691,15 @@ def _log_unindexed_read(tool_name: str, args: Any, session_id: Optional[str]) ->
         proj = _project_boundary(target)
         if proj is None:
             return
-        # System-tree guard (owner 2026-10-18, defect 2): if the resolved
-        # project boundary IS a real system tree we never index (/usr, /etc,
-        # /opt — the gate-⑩ incident shape) OR the bare filesystem root,
-        # skip the row. /root and /home are deliberately NOT guarded here:
+        # System-tree guard (owner 2026-10-18, defect 2; §2.21 owner
+        # ruling 2026-11-21): if the resolved project boundary IS a real
+        # HARD-BLOCK system tree (the device/pseudo core /dev, /proc,
+        # /sys + bare "/" — the gate-⑩ incident shape) skip the row.
+        # The silent prefixes (/usr, /etc, /opt, /bin, /sbin, /var) are
+        # still LOGGED — they are pitch-filtered by
+        # _needs_index_build_question (is_silent_tree / dot_root_silent),
+        # keeping the confirm gate open for an explicit owner confirm.
+        # /root and /home are deliberately NOT guarded here:
         # they are user workspaces (owner's projects like /root/.hermes/
         # plugins/emo live under /root and ARE the indexable case), and a
         # real project under them resolves to ITS OWN marker dir via
@@ -796,23 +963,37 @@ def _settle_clarify_answer(args: Any, result: Any, status: Any,
     if not session_id:
         return
     try:
+        # A+C role judge (aligns Go/DSH settleClarifyAnswer): the legacy
+        # startswith text-match keeps the Python reference's "要-prefix"
+        # semantics (e.g. "要不要都行" settles as 要); the [code_map_roles]
+        # marker layer and the LLM arm cover what the prefix match misses.
+        question_text = _extract_clarify_qr(args, result)[0] or ""
         replies = [r.strip() for r in _clarify_reply_texts(result)]
         for reply in replies:
-            if reply.startswith("不再问"):
-                projs = _clarify_named_projects(args, session_id=session_id)
-                if projs:
-                    _clear_project_rows(session_id, projs)
-                continue
-            # '要'-shaped answer (any 要-prefix: '要', '要了', '要建立'):
-            # settle the named project(s). '不要' does NOT start with
-            # '要' (it starts with '不'), so no collision.
+            # ① 要-prefix settle (reference semantics: any 要-prefix reply
+            #    settles; "不要" starts with "不" so no collision).
             if reply.startswith("要"):
                 projs = _clarify_named_projects(args, session_id=session_id)
                 if projs:
                     _clear_project_rows(session_id, projs)
                 continue
-            # '不要' / free text / anything else: settle nothing — the
-            # owner's "不要 = 下次还问" semantics.
+            # ② 不再问 (reference: permanent clear).
+            if reply.startswith("不再问"):
+                projs = _clarify_named_projects(args, session_id=session_id)
+                if projs:
+                    _clear_project_rows(session_id, projs)
+                continue
+            # ③ A+C marker/LLM layer: the reply carries a [code_map_roles]
+            #    mapping the wordlist didn't catch, or a free-text reply
+            #    the LLM arm can classify (e.g. "OK go ahead" / "let's do it").
+            role, _layer = _role_judge(question_text, reply)
+            if role in (_ROLE_YES, _ROLE_NEVERASK):
+                projs = _clarify_named_projects(args, session_id=session_id)
+                if projs:
+                    _clear_project_rows(session_id, projs)
+                continue
+            # ④ _ROLE_NO / _ROLE_INCONCLUSIVE / "": settle nothing — the
+            #    owner's "不要 = 下次还问" semantics.
     except Exception as exc:
         _log.debug("code_map clarify-answer settle fail-soft: %s", exc)
 
@@ -888,6 +1069,14 @@ def _needs_index_build_question(proj: str) -> bool:
         return False  # transient cache/data tree -> never offered (owner 2026-11-17)
     if is_container_root(proj, IS_WINDOWS):
         return False  # bare HERMES_HOME / profiles container -> never offered (owner 2026-11-17)
+    # §2.21 (2026-11-21 owner ruling "系统路径不问但门开", synced from the
+    # DSH port): silent system prefixes (pitch-silent; the confirm gate
+    # stays open for an explicit owner confirm) and marker-less dot-named
+    # dirs (a hidden repo stays askable).
+    if is_silent_tree(proj, IS_WINDOWS):
+        return False
+    if dot_root_silent(proj):
+        return False
     if rootreg.is_confirmed_root(proj):
         return False
     confirmed = _confirmed_roots()

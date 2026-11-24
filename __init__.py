@@ -434,6 +434,10 @@ def _register_prompt_section(ctx: Any) -> None:
 # ---- hooks ---------------------------------------------------------------
 
 def _register_hooks(ctx: Any) -> None:
+    # Store the host ctx reference for the LLM arm (A+C role judge,
+    # aligns Go/DSH): _judge_one_pair reads ctx.llm.complete_structured.
+    from . import hook as _h
+    _h.set_ctx(ctx)
     # Tier-1 hooks, both fail-soft (gate 9).
     # - transform_tool_result: read-side auto-attach (件 2 + 件 3). The host
     #   prepends the returned string to the tool result; write-side is a
