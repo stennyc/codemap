@@ -576,13 +576,26 @@ def test_symlink_profile_read_matches_shared_confirmed_root(tmp_path):
 def test_unindexed_read_non_source_file_logs_ledger_row(tmp_path):
     """Reading a NON-source file (.md) inside an un-indexed project dir
     must log a ledger row for that project dir (the clarify offer is
-    directory-triggered, not source-file-triggered)."""
+    directory-triggered, not source-file-triggered).
+
+    Uses tmp_path (pytest's per-test dir, under /tmp or the host's
+    TMPDIR) instead of /var/tmp: §2.21 demoted /var to the SILENT
+    prefix (is_silent_tree), and _purge_obsolete_rows (which runs
+    AFTER _log_unindexed_read in _post_tool_call) calls
+    _needs_index_build_question → is_silent_tree → False →
+    _clear_project_rows, wiping the row this test asserts on.
+    tmp_path carries no silent/system/transient component, so the
+    purge keeps the row and the test exercises the real ledger path.
+    """
     from code_map import hook
     from code_map.config import data_dir
-    # A brand-new project dir (NOT under any confirmed target, NOT under
-    # $HOME, NOT a blocked system dir): the /var/tmp/cm_proj_* shape.
+    # A brand-new project dir under /tmp (non-transient, non-silent,
+    # non-system): the host's TMPDIR is /root/.hermes/cache/scratch,
+    # which is a transient tree where _needs_index_build_question's
+    # is_transient_dir guard vetoes the ledger row. /tmp is a real
+    # path outside any confirmed target / marker tree.
     import uuid, shutil
-    proj = Path("/var/tmp") / f"cm_nonsrc_{uuid.uuid4().hex[:8]}"
+    proj = Path("/tmp") / f"cm_nonsrc_{uuid.uuid4().hex[:8]}"
     _seed_bases.append(proj)
     try:
         (proj / "docs").mkdir(parents=True)
